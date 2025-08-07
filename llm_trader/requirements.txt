@@ -1,1 +1,4 @@
 requests
+alpha-vantage
+scikit-learn
+xgboost

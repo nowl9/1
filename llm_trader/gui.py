@@ -3,6 +3,8 @@ from tkinter import ttk
 from api.public_api import PublicAPI
 from api.deepseek_api import DeepseekAPI
 from trading.trader import Trader
+from trading.backtester import Backtester
+import threading
 
 
 class App(tk.Tk):
@@ -15,6 +17,7 @@ class App(tk.Tk):
         self.public_api = PublicAPI()
         self.deepseek_api = DeepseekAPI()
         self.trader = Trader(self, self.public_api, self.deepseek_api)
+        self.backtester = Backtester(self)
 
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(pady=10, expand=True)
@@ -24,6 +27,12 @@ class App(tk.Tk):
         dashboard_frame.pack(fill="both", expand=True)
         self.notebook.add(dashboard_frame, text="Dashboard")
         self.create_dashboard_widgets(dashboard_frame)
+
+        # Backtesting Tab
+        backtesting_frame = ttk.Frame(self.notebook, width=800, height=600)
+        backtesting_frame.pack(fill="both", expand=True)
+        self.notebook.add(backtesting_frame, text="Backtesting")
+        self.create_backtesting_widgets(backtesting_frame)
 
         # Settings Tab
         settings_frame = ttk.Frame(self.notebook, width=800, height=600)
@@ -89,6 +98,50 @@ class App(tk.Tk):
         refresh_button = ttk.Button(
             orders_frame, text="Refresh", command=self.update_dashboard)
         refresh_button.pack(pady=5)
+
+    def create_backtesting_widgets(self, parent_frame):
+        controls_frame = ttk.LabelFrame(parent_frame, text="Backtest Controls")
+        controls_frame.pack(padx=10, pady=10, fill="x")
+
+        ttk.Label(controls_frame, text="Symbol:").grid(
+            row=0, column=0, padx=5, pady=5)
+        self.backtest_symbol = tk.StringVar(value="SPY")
+        ttk.Entry(controls_frame, textvariable=self.backtest_symbol).grid(
+            row=0, column=1, padx=5, pady=5)
+
+        ttk.Label(controls_frame, text="Start Date (YYYY-MM-DD):").grid(
+            row=1, column=0, padx=5, pady=5)
+        self.backtest_start_date = tk.StringVar(value="2023-01-01")
+        ttk.Entry(controls_frame, textvariable=self.backtest_start_date).grid(
+            row=1, column=1, padx=5, pady=5)
+
+        ttk.Label(controls_frame, text="End Date (YYYY-MM-DD):").grid(
+            row=2, column=0, padx=5, pady=5)
+        self.backtest_end_date = tk.StringVar(value="2023-12-31")
+        ttk.Entry(controls_frame, textvariable=self.backtest_end_date).grid(
+            row=2, column=1, padx=5, pady=5)
+
+        ttk.Label(controls_frame, text="Initial Cash:").grid(
+            row=3, column=0, padx=5, pady=5)
+        self.backtest_initial_cash = tk.DoubleVar(value=100000.0)
+        ttk.Entry(
+            controls_frame, textvariable=self.backtest_initial_cash
+        ).grid(row=3, column=1, padx=5, pady=5)
+
+        run_button = ttk.Button(
+            controls_frame, text="Run Backtest",
+            command=self.run_backtest_thread)
+        run_button.grid(row=4, column=0, columnspan=2, pady=10)
+
+        results_frame = ttk.LabelFrame(parent_frame, text="Backtest Results")
+        results_frame.pack(padx=10, pady=10, fill="both", expand=True)
+
+        self.backtest_results_text = tk.Text(results_frame, height=15)
+        self.backtest_results_text.pack(
+            fill="both", expand=True, padx=5, pady=5)
+        self.backtest_results_text.insert(
+            tk.END, "Backtest results will be shown here.")
+        self.backtest_results_text.config(state="disabled")
 
     def create_settings_widgets(self, parent_frame):
         settings_frame = ttk.LabelFrame(parent_frame, text="LLM Settings")
@@ -169,6 +222,21 @@ class App(tk.Tk):
             self.orders_list.delete(0, tk.END)
             self.orders_list.insert(
                 tk.END, "Could not fetch account information.")
+
+    def run_backtest_thread(self):
+        # Run the backtest in a separate thread to avoid freezing the GUI
+        thread = threading.Thread(target=self.run_backtest)
+        thread.daemon = True
+        thread.start()
+
+    def run_backtest(self):
+        symbol = self.backtest_symbol.get()
+        start_date = self.backtest_start_date.get()
+        end_date = self.backtest_end_date.get()
+        initial_cash = self.backtest_initial_cash.get()
+
+        self.backtester.run_backtest(
+            symbol, start_date, end_date, initial_cash)
 
     def toggle_trading(self, *args):
         if self.trading_status.get() == "ON":

@@ -1,8 +1,11 @@
 import threading
 import time
 import json
+import os
 from api.public_api import PublicAPI
 from api.deepseek_api import DeepseekAPI
+from api.alpha_vantage_api import AlphaVantageAPI
+from ml.predictive_model import PredictiveModel
 
 
 class Trader:
@@ -10,6 +13,8 @@ class Trader:
         self.app = app
         self.public_api = public_api
         self.deepseek_api = deepseek_api
+        self.alpha_vantage_api = AlphaVantageAPI()
+        self.models = {}
         self.trading = False
         self.thread = None
         self.daily_trades = []
@@ -50,18 +55,26 @@ class Trader:
                 account_id = accounts[0].get("id")
                 portfolio = self.public_api.get_account_portfolio(account_id)
 
-                # 2. Construct prompt
-                risk_tolerance = self.app.risk_tolerance.get()
-                prompt = self.construct_prompt(portfolio, risk_tolerance)
+                # For now, we will focus on a single symbol for simplicity
+                symbol_to_trade = "SPY"  # Example symbol
 
-                # 3. Get suggestions from LLM
+                # 2. Get ML Prediction
+                prediction = self.get_ml_prediction(symbol_to_trade)
+
+                # 3. Construct prompt
+                risk_tolerance = self.app.risk_tolerance.get()
+                prompt = self.construct_prompt(
+                    portfolio, risk_tolerance, symbol_to_trade, prediction
+                )
+
+                # 4. Get suggestions from LLM
                 model = self.app.llm_model.get()
                 temperature = self.app.temperature.get()
                 suggestions = self.deepseek_api.generate_text(
                     prompt, model=model, temperature=temperature
                 )
 
-                # 4. Parse and execute suggestions
+                # 5. Parse and execute suggestions
                 try:
                     suggestions_data = json.loads(suggestions)
                     if "suggestions" in suggestions_data:
@@ -72,18 +85,50 @@ class Trader:
                           f"{suggestions}")
 
                 # Wait for the next iteration
-                time.sleep(60)  # 1 minute interval
+                time.sleep(3600)  # 1 hour interval
 
             except Exception as e:
                 print(f"An error occurred in the trading loop: {e}")
                 time.sleep(60)
 
-    def construct_prompt(self, portfolio, risk_tolerance):
+    def get_ml_prediction(self, symbol):
+        if symbol not in self.models:
+            self.models[symbol] = PredictiveModel(symbol)
+
+        model = self.models[symbol]
+
+        # Train the model if it doesn't exist
+        if not os.path.exists(model.model_path):
+            print(f"Training model for {symbol}...")
+            historical_data = self.alpha_vantage_api.get_daily_prices(symbol)
+            if historical_data is not None and not historical_data.empty:
+                model.train(historical_data)
+            else:
+                print(f"Could not fetch historical data for {symbol}.")
+                return None
+
+        # Make a prediction
+        historical_data = self.alpha_vantage_api.get_daily_prices(symbol)
+        if historical_data is not None and not historical_data.empty:
+            return model.predict(historical_data)
+        else:
+            return None
+
+    def construct_prompt(self, portfolio, risk_tolerance, symbol, prediction):
+        prediction_text = "not available"
+        if prediction is not None:
+            prediction_text = f"{prediction:.4f}"
+
         prompt = f"""
         You are an expert options trading LLM. Your goal is to maximize profit
         while managing risk.
         Your stated risk tolerance is: {risk_tolerance}. Please tailor your
         suggestions accordingly.
+
+        We are currently analyzing {symbol}.
+        Our machine learning model predicts a return of {prediction_text} for
+        the next trading day. A positive value suggests a price increase, and a
+        negative value suggests a price decrease.
 
         Here is the current portfolio status:
         - Total Value: ${portfolio.get('total_value', 'N/A')}
@@ -100,32 +145,18 @@ class Trader:
         else:
             prompt += "- No open positions.\n"
 
-        prompt += """
-        Based on the current market conditions and the portfolio, what is your
-        analysis and what specific, actionable options trading suggestions do
-        you have for the next hour?
+        prompt += f"""
+        Based on the current market conditions, the portfolio, and the ML
+        prediction, what is your analysis and what specific, actionable
+        options trading suggestions do you have for {symbol}?
 
         Please provide your response as a JSON object with a single key
         "suggestions" which is a list of trade objects.
         Each trade object should have the following keys: "ticker",
         "strategy" (e.g., "buy_call", "sell_put"), "strike_price",
-        "expiration_date" (in YYYY-MM-DD format), "quantity", and "reasoning".
+        "expiration_date" (in YYYY-MM-DD format), "quantity", and
+        "reasoning".
         If you have no suggestions, return an empty list.
-        Example:
-        {
-          "suggestions": [
-            {
-              "ticker": "AAPL",
-              "strategy": "buy_call",
-              "strike_price": 150.0,
-              "expiration_date": "2025-12-31",
-              "quantity": 1,
-              "reasoning": "Based on recent positive news and bullish market
-                           sentiment, a call option on AAPL is likely to be
-                           profitable."
-            }
-          ]
-        }
         """
         return prompt
 
@@ -134,30 +165,6 @@ class Trader:
         # This is where you would map the LLM suggestion to the Public.com API
         # order format. This is a complex step and requires careful handling
         # of different strategies. For now, we will just log the trade.
-
-        # Example of what the order data might look like for a single leg
-        # option
-        # order_data = {
-        #     "account_id": account_id,
-        #     "symbol": trade["ticker"],
-        #     "side": "buy",  # or "sell"
-        #     "quantity": trade["quantity"],
-        #     "order_type": "market",  # or "limit"
-        #     "time_in_force": "day",
-        #     "legs": [
-        #         {
-        #             "side": "buy",  # or "sell"
-        #             "option_symbol":
-        #                 f"{trade['ticker']}"
-        #                 f"{trade['expiration_date'].replace('-', '')}"
-        #                 f"C{str(int(trade['strike_price']*1000)).zfill(8)}",
-        #             "quantity": trade["quantity"]
-        #         }
-        #     ]
-        # }
-        # result = self.public_api.place_order(order_data)
-        # print(f"Order result: {result}")
-
         self.daily_trades.append(trade)
         self.recursive_learning_step(trade, "simulated_success")  # Placeholder
 
