@@ -1,0 +1,385 @@
+"""Tests for signals/filters.py — SignalFilter.
+
+Key scenarios:
+  - Clear arbitrage (10 %+ edge) passes all criteria → ArbitrageSignal emitted.
+  - Marginal edge (< 3 % conservative threshold) is rejected.
+  - Each individual criterion can be triggered in isolation.
+  - Stale data (options or PM older than max_data_age_seconds) is rejected.
+  - PM spread too wide → rejected.
+  - Vol fit RMSE too high → rejected when surface provided.
+  - Passing signals are sorted by adjusted_edge descending.
+  - explains() returns None for passing edges and a reason string for rejected ones.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from unittest.mock import MagicMock
+
+import pytest
+
+from btc_pm_arb.models import DataSource, PredictionMarketTick, ProbabilityQuote
+from btc_pm_arb.pricing.cache import CacheEntry
+from btc_pm_arb.signals.edge import EdgeResult
+from btc_pm_arb.signals.filters import FilterConfig, SignalFilter
+from btc_pm_arb.signals.matcher import MatchResult
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+_NOW = datetime.now(timezone.utc)
+_EXPIRY = _NOW + timedelta(days=27)   # ~27 days out (always in the future)
+
+
+def _pm_tick(
+    strike: float = 100_000.0,
+    yes_bid: float = 0.40,
+    yes_ask: float = 0.44,
+    ts: datetime | None = None,
+    expiry: datetime | None = None,
+) -> PredictionMarketTick:
+    return PredictionMarketTick(
+        source=DataSource.POLYMARKET,
+        contract_id=f"pm-btc-{int(strike)}",
+        question=f"BTC above ${int(strike):,}?",
+        strike=strike,
+        expiry=expiry or _EXPIRY,
+        yes_bid=yes_bid,
+        yes_ask=yes_ask,
+        timestamp=ts or _NOW,
+    )
+
+
+def _pm_quote(yes_bid: float = 0.40, yes_ask: float = 0.44, ts: datetime | None = None) -> ProbabilityQuote:
+    return ProbabilityQuote(
+        source=DataSource.POLYMARKET,
+        contract_id="pm-btc-100000",
+        strike=100_000.0,
+        expiry=_EXPIRY,
+        bid_prob=yes_bid,
+        ask_prob=yes_ask,
+        mid_prob=(yes_bid + yes_ask) / 2,
+        direction="above",
+        settlement_type="polymarket_spot",
+        timestamp=ts or _NOW,
+    )
+
+
+def _options_entry(
+    bid: float = 0.55,
+    ask: float = 0.59,
+    ts: datetime | None = None,
+) -> CacheEntry:
+    return CacheEntry(
+        strike=100_000.0,
+        expiry=_EXPIRY,
+        bid_prob=bid,
+        ask_prob=ask,
+        mid_prob=(bid + ask) / 2,
+        source=DataSource.DERIBIT,
+        timestamp=ts or _NOW,
+    )
+
+
+def _match(
+    options_bid: float = 0.55,
+    options_ask: float = 0.59,
+    pm_yes_bid: float = 0.40,
+    pm_yes_ask: float = 0.44,
+    quality: float = 1.0,
+    options_ts: datetime | None = None,
+    pm_ts: datetime | None = None,
+    expiry: datetime | None = None,
+) -> MatchResult:
+    pm = _pm_tick(
+        yes_bid=pm_yes_bid,
+        yes_ask=pm_yes_ask,
+        ts=pm_ts,
+        expiry=expiry,
+    )
+    return MatchResult(
+        pm_tick=pm,
+        pm_quote=_pm_quote(yes_bid=pm_yes_bid, yes_ask=pm_yes_ask, ts=pm_ts),
+        options_entry=_options_entry(bid=options_bid, ask=options_ask, ts=options_ts),
+        matched_strike=100_000.0,
+        matched_expiry=expiry or _EXPIRY,
+        strike_gap_pct=0.0,
+        expiry_gap_hours=0.0,
+        match_quality=quality,
+        is_interpolated=False,
+    )
+
+
+def _edge(
+    match: MatchResult | None = None,
+    best_side: str = "buy_yes",
+    conservative_edge: float = 0.11,
+    adj_yes: float = 0.11,
+    adj_no: float = -0.02,
+    mid_yes: float = 0.15,
+    mid_no: float = 0.05,
+) -> EdgeResult:
+    m = match or _match()
+    return EdgeResult(
+        match=m,
+        edge_yes_mid=mid_yes,
+        edge_no_mid=mid_no,
+        edge_yes_conservative=conservative_edge,
+        edge_no_conservative=adj_no,
+        adjusted_edge_yes=adj_yes,
+        adjusted_edge_no=adj_no,
+        best_side=best_side,  # type: ignore[arg-type]
+        best_conservative_edge=conservative_edge,
+        edge_history_mean=conservative_edge,
+        edge_history_std=0.01,
+        edge_persistence=0.8,
+        timestamp=_NOW,
+    )
+
+
+# ── Clear arbitrage passes ────────────────────────────────────────────────────
+
+def test_clear_arb_passes_filter():
+    """10 %+ edge should survive all default criteria."""
+    e = _edge(conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
+    filt = SignalFilter()
+    signals = filt.filter([e])
+    assert len(signals) == 1
+
+
+def test_clear_arb_signal_fields():
+    e = _edge(conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15, best_side="buy_yes")
+    filt = SignalFilter()
+    signals = filt.filter([e])
+    sig = signals[0]
+    assert sig.trade_side == "buy_yes"
+    assert sig.adjusted_edge == pytest.approx(0.10)
+    assert 0.0 <= sig.confidence <= 1.0
+
+
+# ── Marginal edge filtered out ────────────────────────────────────────────────
+
+def test_marginal_edge_below_threshold_rejected():
+    """2 % conservative edge < 3 % default threshold → rejected."""
+    e = _edge(conservative_edge=0.02, adj_yes=0.02, mid_yes=0.05)
+    filt = SignalFilter()
+    signals = filt.filter([e])
+    assert len(signals) == 0
+
+
+def test_explains_gives_reason_for_marginal_edge():
+    e = _edge(conservative_edge=0.02, adj_yes=0.02, mid_yes=0.05)
+    filt = SignalFilter()
+    reason = filt.explains(e)
+    assert reason is not None
+    assert "conservative_edge" in reason
+
+
+def test_explains_returns_none_for_passing_edge():
+    e = _edge(conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
+    filt = SignalFilter()
+    assert filt.explains(e) is None
+
+
+# ── No positive edge ──────────────────────────────────────────────────────────
+
+def test_no_positive_edge_rejected():
+    e = _edge(best_side=None, conservative_edge=0.0)  # type: ignore[arg-type]
+    e = EdgeResult(
+        match=_match(),
+        edge_yes_mid=-0.05,
+        edge_no_mid=-0.03,
+        edge_yes_conservative=-0.05,
+        edge_no_conservative=-0.03,
+        adjusted_edge_yes=-0.05,
+        adjusted_edge_no=-0.03,
+        best_side=None,
+        best_conservative_edge=0.0,
+        timestamp=_NOW,
+    )
+    filt = SignalFilter()
+    assert filt.filter([e]) == []
+    assert "no_positive_edge" in filt.explains(e)
+
+
+# ── Mid edge criterion ────────────────────────────────────────────────────────
+
+def test_low_mid_edge_rejected():
+    """Conservative edge passes but mid edge is below min_mid_edge."""
+    e = _edge(conservative_edge=0.05, adj_yes=0.05, mid_yes=0.005)
+    filt = SignalFilter(FilterConfig(min_conservative_edge=0.03, min_mid_edge=0.01))
+    assert filt.filter([e]) == []
+
+
+def test_mid_edge_exactly_at_threshold_passes():
+    e = _edge(conservative_edge=0.05, adj_yes=0.05, mid_yes=0.01)
+    filt = SignalFilter(FilterConfig(min_conservative_edge=0.03, min_mid_edge=0.01))
+    assert len(filt.filter([e])) == 1
+
+
+# ── Expiry bounds ─────────────────────────────────────────────────────────────
+
+def test_near_expiry_rejected(monkeypatch):
+    """Contract expiring in 12 hours should be rejected (min 1 day)."""
+    soon = _NOW + timedelta(hours=12)
+    m = _match(expiry=soon)
+    e = _edge(match=m)
+    filt = SignalFilter()
+    signals = filt.filter([e])
+    assert len(signals) == 0
+    assert "days_to_expiry" in filt.explains(e)
+
+
+def test_far_expiry_rejected():
+    """Contract expiring in 120 days > 90 day max → rejected."""
+    far = _NOW + timedelta(days=120)
+    m = _match(expiry=far)
+    e = _edge(match=m)
+    filt = SignalFilter()
+    assert filt.filter([e]) == []
+    assert "days_to_expiry" in filt.explains(e)
+
+
+def test_acceptable_expiry_passes():
+    good = _NOW + timedelta(days=14)
+    m = _match(expiry=good)
+    e = _edge(match=m, conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
+    filt = SignalFilter()
+    assert len(filt.filter([e])) == 1
+
+
+# ── PM spread ─────────────────────────────────────────────────────────────────
+
+def test_wide_pm_spread_rejected():
+    """Yes spread of 20 % > 12 % max → rejected."""
+    m = _match(pm_yes_bid=0.30, pm_yes_ask=0.50)
+    e = _edge(match=m, conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
+    filt = SignalFilter()
+    assert filt.filter([e]) == []
+    assert "pm_spread" in filt.explains(e)
+
+
+def test_tight_pm_spread_passes():
+    m = _match(pm_yes_bid=0.42, pm_yes_ask=0.44)
+    e = _edge(match=m, conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
+    filt = SignalFilter()
+    assert len(filt.filter([e])) == 1
+
+
+# ── Match quality ─────────────────────────────────────────────────────────────
+
+def test_low_match_quality_rejected():
+    m = _match(quality=0.20)
+    e = _edge(match=m, conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
+    filt = SignalFilter()
+    assert filt.filter([e]) == []
+    assert "match_quality" in filt.explains(e)
+
+
+def test_acceptable_match_quality_passes():
+    m = _match(quality=0.80)
+    e = _edge(match=m, conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
+    filt = SignalFilter()
+    assert len(filt.filter([e])) == 1
+
+
+# ── Stale data ────────────────────────────────────────────────────────────────
+
+def test_stale_options_data_rejected():
+    """Options data 10 minutes old → rejected."""
+    stale_ts = _NOW - timedelta(seconds=600)
+    m = _match(options_ts=stale_ts)
+    e = _edge(match=m, conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
+    filt = SignalFilter()
+    assert filt.filter([e]) == []
+    assert "options_data_age" in filt.explains(e)
+
+
+def test_stale_pm_data_rejected():
+    """PM data 10 minutes old → rejected."""
+    stale_ts = _NOW - timedelta(seconds=600)
+    m = _match(pm_ts=stale_ts)
+    e = _edge(match=m, conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
+    filt = SignalFilter()
+    assert filt.filter([e]) == []
+    assert "pm_data_age" in filt.explains(e)
+
+
+def test_fresh_data_passes():
+    fresh_ts = _NOW - timedelta(seconds=30)
+    m = _match(options_ts=fresh_ts, pm_ts=fresh_ts)
+    e = _edge(match=m, conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
+    filt = SignalFilter()
+    assert len(filt.filter([e])) == 1
+
+
+# ── Vol fit quality ───────────────────────────────────────────────────────────
+
+def test_high_vol_rmse_rejected_with_surface():
+    """RMSE 8 % > 5 % threshold → rejected when surface provided."""
+    mock_smile = MagicMock()
+    mock_smile.fit_rmse = 0.08
+
+    mock_surface = MagicMock()
+    mock_surface.get_smile.return_value = mock_smile
+
+    e = _edge(conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
+    filt = SignalFilter()
+    assert filt.filter([e], surface=mock_surface) == []
+    assert "vol_rmse" in filt.explains(e, surface=mock_surface)
+
+
+def test_good_vol_rmse_passes_with_surface():
+    mock_smile = MagicMock()
+    mock_smile.fit_rmse = 0.02
+
+    mock_surface = MagicMock()
+    mock_surface.get_smile.return_value = mock_smile
+
+    e = _edge(conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
+    filt = SignalFilter()
+    assert len(filt.filter([e], surface=mock_surface)) == 1
+
+
+def test_no_surface_skips_vol_fit_criterion():
+    """Without a surface, vol-fit criterion is skipped (don't penalise missing data)."""
+    e = _edge(conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
+    filt = SignalFilter()
+    assert len(filt.filter([e], surface=None)) == 1
+
+
+# ── Ranking ───────────────────────────────────────────────────────────────────
+
+def test_signals_ranked_by_adjusted_edge():
+    e1 = _edge(conservative_edge=0.05, adj_yes=0.05, mid_yes=0.10)
+    e2 = _edge(conservative_edge=0.12, adj_yes=0.12, mid_yes=0.20)
+    e3 = _edge(conservative_edge=0.08, adj_yes=0.08, mid_yes=0.12)
+    filt = SignalFilter()
+    signals = filt.filter([e1, e2, e3])
+    edges = [s.adjusted_edge for s in signals]
+    assert edges == sorted(edges, reverse=True)
+
+
+def test_multiple_signals_all_pass():
+    edges = [
+        _edge(conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15),
+        _edge(conservative_edge=0.07, adj_yes=0.07, mid_yes=0.12),
+        _edge(conservative_edge=0.04, adj_yes=0.04, mid_yes=0.08),
+    ]
+    filt = SignalFilter()
+    signals = filt.filter(edges)
+    assert len(signals) == 3
+
+
+def test_mixed_batch_some_pass_some_fail():
+    good = _edge(conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
+    bad = _edge(conservative_edge=0.01, adj_yes=0.01, mid_yes=0.02)
+    filt = SignalFilter()
+    signals = filt.filter([good, bad])
+    assert len(signals) == 1
+
+
+# ── Empty input ───────────────────────────────────────────────────────────────
+
+def test_empty_input_returns_empty():
+    filt = SignalFilter()
+    assert filt.filter([]) == []
