@@ -4,13 +4,18 @@ Each criterion is a pure function; adding a new criterion means adding a
 function and inserting it into the ``_CRITERIA`` list — no other changes needed.
 
 Filter criteria (all configurable via FilterConfig):
-  1. min_conservative_edge  — reject if best adjusted edge < threshold (default 3 %)
-  2. min_days_to_expiry     — reject contracts expiring < 1 day (extreme gamma risk)
-  3. max_days_to_expiry     — reject contracts expiring > 90 days (stale vol surface)
-  4. max_pm_spread          — reject if PM bid-ask spread > threshold (poor liquidity)
-  5. min_match_quality      — reject low-quality option-to-PM matches
-  6. max_vol_fit_rmse       — reject when SVI fit quality is poor (unreliable probs)
-  7. stale_data             — reject when cache entry is older than max_data_age_seconds
+  1.  no_edge               — reject if no positive edge exists
+  2.  min_conservative_edge — reject if best adjusted edge < threshold (default 3 %)
+  3.  min_mid_edge          — reject if mid edge < threshold (1 %)
+  4.  expiry_bounds         — reject contracts too close or too far from expiry
+  5.  pm_spread             — reject if PM bid-ask spread > threshold (12 %)
+  6.  match_quality         — reject low-quality option-to-PM matches
+  7.  vol_fit               — reject when SVI fit quality is poor (unreliable probs)
+  8.  stale_data            — reject when cache entry is older than max_data_age_seconds
+  9.  correlated_exposure   — reject if adding would exceed correlated exposure cap
+  10. feed_freshness        — reject if ANY upstream feed is staler than threshold
+  11. odds_velocity         — reject if PM price is converging toward implied prob at speed
+  12. vol_regime_edge       — adjust minimum edge threshold by volatility regime
 
 Passing signals are converted to ``ArbitrageSignal`` objects (from models.py) and
 ranked by adjusted edge descending.  The confidence field is left at its default
@@ -21,7 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 import structlog
 
@@ -30,6 +35,11 @@ from btc_pm_arb.pricing.cache import CacheEntry
 from btc_pm_arb.pricing.vol_surface import VolSurface
 from btc_pm_arb.signals.edge import EdgeResult
 from btc_pm_arb.signals.matcher import cache_entry_to_options_quote
+
+if TYPE_CHECKING:
+    from btc_pm_arb.feeds.health import FeedHealthTracker
+    from btc_pm_arb.pricing.realized_vol import RealizedVolTracker, VolRegime
+    from btc_pm_arb.signals.velocity import OddsVelocityTracker
 
 logger: structlog.BoundLogger = structlog.get_logger(__name__)
 
@@ -61,6 +71,20 @@ class FilterConfig:
     max_position_usd: float = 1_000.0
     max_correlated_exposure_usd: float = 5_000.0
     correlated_strike_band_pct: float = 0.10   # strikes within 10 % are "correlated"
+
+    # ── Enhancement 1a: Data Freshness Gate ───────────────────────────────────
+    max_deribit_staleness_s: float = 5.0       # Deribit WS tick recency
+    max_pm_staleness_s: float = 15.0           # Polymarket / Kalshi tick recency
+
+    # ── Enhancement 1b: Odds Velocity Gate ───────────────────────────────────
+    # Reject if the PM price is converging AND |velocity| > this threshold
+    odds_velocity_threshold: float = 1e-3      # prob/second (0.1 %/s)
+
+    # ── Enhancement 1c: Volatility Regime Filter ──────────────────────────────
+    # When a RealizedVolTracker is provided, the base min_conservative_edge is
+    # multiplied by the regime factor (0.8 / 1.0 / 1.5).  This gate uses the
+    # regime-adjusted threshold rather than a hard rejection.
+    use_vol_regime_adjustment: bool = True
 
 
 # ── Criterion functions ───────────────────────────────────────────────────────
@@ -169,6 +193,79 @@ def _reject_correlated_exposure(
     return None
 
 
+def _reject_feed_freshness(e: EdgeResult, cfg: FilterConfig, ctx: dict) -> str | None:
+    """Reject if any upstream feed has gone stale beyond its configured threshold.
+
+    Requires ``ctx["feed_health"]`` → ``FeedHealthTracker``.
+    Skipped (pass) when no health tracker is present in context.
+    """
+    health: FeedHealthTracker | None = ctx.get("feed_health")
+    if health is None:
+        return None
+    deribit_s = health.staleness_s(DataSource.DERIBIT)
+    if deribit_s > cfg.max_deribit_staleness_s:
+        return (
+            f"deribit_feed_stale {deribit_s:.1f}s > max {cfg.max_deribit_staleness_s}s"
+        )
+    pm_source = e.match.pm_tick.source
+    pm_s = health.staleness_s(pm_source)
+    if pm_s > cfg.max_pm_staleness_s:
+        return f"{pm_source}_feed_stale {pm_s:.1f}s > max {cfg.max_pm_staleness_s}s"
+    return None
+
+
+def _reject_odds_velocity(e: EdgeResult, cfg: FilterConfig, ctx: dict) -> str | None:
+    """Reject if PM price is converging toward implied probability at speed.
+
+    Requires ``ctx["odds_tracker"]`` → ``OddsVelocityTracker``.
+    Skipped when no tracker is present in context.
+
+    Logic:
+    * converging + |v| > threshold → reject (edge is closing, don't chase)
+    * diverging + |v| > threshold → pass (edge is widening; confidence is set
+      in ConfidenceScorer, not here)
+    """
+    tracker: OddsVelocityTracker | None = ctx.get("odds_tracker")
+    if tracker is None:
+        return None
+    implied = e.match.options_entry.mid_prob
+    result = tracker.velocity_at(e.match.pm_tick.contract_id, implied_prob=implied)
+    if result is None:
+        return None
+    if result.direction == "converging" and abs(result.velocity) > cfg.odds_velocity_threshold:
+        return (
+            f"odds_converging velocity={result.velocity:.5f} > "
+            f"threshold {cfg.odds_velocity_threshold}"
+        )
+    return None
+
+
+def _reject_vol_regime_edge(e: EdgeResult, cfg: FilterConfig, ctx: dict) -> str | None:
+    """Apply regime-adjusted minimum edge threshold.
+
+    Requires ``ctx["rv_tracker"]`` → ``RealizedVolTracker``.
+    Skipped (uses base min_edge) when no tracker provided.
+
+    Regime multipliers (from realized_vol.py):
+      LOW:    0.8  (tighter threshold acceptable in calm markets)
+      NORMAL: 1.0  (base threshold)
+      HIGH:   1.5  (wider edge required; elevated basis risk)
+    """
+    if not cfg.use_vol_regime_adjustment:
+        return None
+    rv_tracker: RealizedVolTracker | None = ctx.get("rv_tracker")
+    if rv_tracker is None:
+        return None
+    adj_min = rv_tracker.effective_min_edge(cfg.min_conservative_edge)
+    if e.best_conservative_edge < adj_min:
+        regime = rv_tracker.current_regime()
+        return (
+            f"regime_adjusted_edge {e.best_conservative_edge:.4f} < "
+            f"regime_min {adj_min:.4f} (regime={regime})"
+        )
+    return None
+
+
 _CRITERIA: list[_Criterion] = [
     _reject_no_edge,
     _reject_min_conservative_edge,
@@ -179,6 +276,10 @@ _CRITERIA: list[_Criterion] = [
     _reject_vol_fit,
     _reject_stale_data,
     _reject_correlated_exposure,
+    # Enhancement gates (skipped if their context keys are absent)
+    _reject_feed_freshness,
+    _reject_odds_velocity,
+    _reject_vol_regime_edge,
 ]
 
 
@@ -201,19 +302,31 @@ class SignalFilter:
         edge_results: list[EdgeResult],
         surface: VolSurface | None = None,
         positions: dict[str, float] | None = None,
+        feed_health: "FeedHealthTracker | None" = None,
+        odds_tracker: "OddsVelocityTracker | None" = None,
+        rv_tracker: "RealizedVolTracker | None" = None,
     ) -> list[ArbitrageSignal]:
         """Filter EdgeResults and return ranked ArbitrageSignal list.
 
         Args:
-            edge_results: Output of EdgeCalculator.compute() calls.
-            surface:      VolSurface for vol-quality criterion.
-            positions:    Existing positions {contract_id: notional_usd} for
-                          correlated-exposure filtering.
+            edge_results:  Output of EdgeCalculator.compute() calls.
+            surface:       VolSurface for vol-quality criterion.
+            positions:     Existing positions {contract_id: notional_usd} for
+                           correlated-exposure filtering.
+            feed_health:   FeedHealthTracker for the Data Freshness Gate.
+            odds_tracker:  OddsVelocityTracker for the Odds Velocity Gate.
+            rv_tracker:    RealizedVolTracker for the Vol Regime Filter.
 
         Returns:
             Signals ranked by adjusted_edge descending (best opportunity first).
         """
-        ctx: dict = {"surface": surface, "positions": positions or {}}
+        ctx: dict = {
+            "surface": surface,
+            "positions": positions or {},
+            "feed_health": feed_health,
+            "odds_tracker": odds_tracker,
+            "rv_tracker": rv_tracker,
+        }
 
         signals: list[ArbitrageSignal] = []
         for edge in edge_results:
@@ -225,7 +338,7 @@ class SignalFilter:
                     reason=rejection,
                 )
                 continue
-            signals.append(_to_arbitrage_signal(edge))
+            signals.append(_to_arbitrage_signal(edge, feed_health, rv_tracker))
 
         signals.sort(key=lambda s: s.adjusted_edge, reverse=True)
         return signals
@@ -235,9 +348,18 @@ class SignalFilter:
         edge: EdgeResult,
         surface: VolSurface | None = None,
         positions: dict[str, float] | None = None,
+        feed_health: "FeedHealthTracker | None" = None,
+        odds_tracker: "OddsVelocityTracker | None" = None,
+        rv_tracker: "RealizedVolTracker | None" = None,
     ) -> str | None:
         """Return the first rejection reason for a single EdgeResult, or None if it passes."""
-        ctx: dict = {"surface": surface, "positions": positions or {}}
+        ctx: dict = {
+            "surface": surface,
+            "positions": positions or {},
+            "feed_health": feed_health,
+            "odds_tracker": odds_tracker,
+            "rv_tracker": rv_tracker,
+        }
         return self._first_rejection(edge, ctx)
 
     # ── private ───────────────────────────────────────────────────────────
@@ -252,20 +374,29 @@ class SignalFilter:
 
 # ── Conversion helper ─────────────────────────────────────────────────────────
 
-def _to_arbitrage_signal(edge: EdgeResult) -> ArbitrageSignal:
+def _to_arbitrage_signal(
+    edge: EdgeResult,
+    feed_health: "FeedHealthTracker | None" = None,
+    rv_tracker: "RealizedVolTracker | None" = None,
+) -> ArbitrageSignal:
     """Convert a passing EdgeResult to an ArbitrageSignal (confidence = 0.5 placeholder)."""
     options_quote = cache_entry_to_options_quote(
         edge.match.options_entry,
         contract_id=edge.match.pm_tick.contract_id,
     )
     raw = edge.edge_yes_mid if edge.best_side == "buy_yes" else edge.edge_no_mid
+    staleness = feed_health.all_staleness_ms() if feed_health is not None else {}
+    regime = str(rv_tracker.current_regime()) if rv_tracker is not None else "normal"
     return ArbitrageSignal(
         options_quote=options_quote,
         pm_quote=edge.match.pm_quote,
         raw_edge=raw,
         adjusted_edge=edge.best_conservative_edge,
+        fill_adjusted_edge=edge.fill_adjusted_edge,
         trade_side=edge.best_side,  # type: ignore[arg-type]
         confidence=0.5,
+        feed_staleness_ms=staleness,
+        vol_regime=regime,
         timestamp=edge.timestamp,
     )
 

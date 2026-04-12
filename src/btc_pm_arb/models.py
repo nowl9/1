@@ -107,6 +107,11 @@ class PredictionMarketTick(BaseModel):
     no_bid: float | None = None
     no_ask: float | None = None
 
+    # Order book depth levels for fill-adjusted edge calculation.
+    # Each entry is (price [0,1], size_usd). Sorted price ascending for YES.
+    order_book_yes: list[tuple[float, float]] = Field(default_factory=list)
+    order_book_no: list[tuple[float, float]] = Field(default_factory=list)
+
     timestamp: datetime
 
     @property
@@ -177,10 +182,22 @@ class ArbitrageSignal(BaseModel):
     # Positive means prediction market is *too high* → sell YES (or buy NO)
     # Negative means prediction market is *too low* → buy YES
     raw_edge: float
-    adjusted_edge: float  # after settlement basis correction
+    adjusted_edge: float  # after settlement basis correction (conservative)
+
+    # Fill-adjusted edge: accounts for order book depth when walking the book.
+    # None when no order book data is available (falls back to adjusted_edge).
+    fill_adjusted_edge: float | None = None
 
     # Side to trade on the prediction market
     trade_side: Literal["buy_yes", "sell_yes", "buy_no", "sell_no"]
 
     confidence: float = Field(ge=0.0, le=1.0, default=0.5)
+
+    # Feed staleness at signal generation time (ms per source).
+    # Used for monitoring and the data freshness gate.
+    feed_staleness_ms: dict[str, float] = Field(default_factory=dict)
+
+    # Volatility regime at signal generation time
+    vol_regime: str = "normal"
+
     timestamp: datetime

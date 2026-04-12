@@ -68,6 +68,10 @@ class EdgeResult:
     best_side: TradeSide | None    # which side has the larger positive edge
     best_conservative_edge: float  # max(adj_yes, adj_no) if > 0 else 0
 
+    # ── fill-adjusted edge (accounts for order book depth) ────────────────
+    # None when no order book data available — falls back to conservative edge
+    fill_adjusted_edge: float | None = None
+
     # ── history statistics (set by EdgeCalculator from its deque) ─────────
     edge_history_mean: float = 0.0   # mean conservative edge over recent history
     edge_history_std: float = 0.0    # std dev of recent edge
@@ -147,6 +151,9 @@ class EdgeCalculator:
         # ── best side ─────────────────────────────────────────────────────
         best_side, best_edge = _pick_best_side(adj_yes, adj_no)
 
+        # ── fill-adjusted edge ────────────────────────────────────────────
+        fill_adj = _compute_fill_adjusted_edge(match, best_side, ops_bid, ops_ask)
+
         # ── update history ─────────────────────────────────────────────────
         contract_id = match.pm_tick.contract_id
         self._history[contract_id].append((datetime.now(timezone.utc), best_edge))
@@ -159,6 +166,7 @@ class EdgeCalculator:
             conservative_edge=round(best_edge, 4),
             adj_yes=round(adj_yes, 4),
             adj_no=round(adj_no, 4),
+            fill_adjusted=round(fill_adj, 4) if fill_adj is not None else None,
         )
 
         return EdgeResult(
@@ -171,6 +179,7 @@ class EdgeCalculator:
             adjusted_edge_no=adj_no,
             best_side=best_side,
             best_conservative_edge=best_edge,
+            fill_adjusted_edge=fill_adj,
             edge_history_mean=h_mean,
             edge_history_std=h_std,
             edge_persistence=h_persistence,
@@ -274,3 +283,65 @@ def _pick_best_side(
     if adj_yes >= adj_no:
         return "buy_yes", max(adj_yes, 0.0)
     return "buy_no", max(adj_no, 0.0)
+
+
+def fill_adjusted_price(
+    order_book: list[tuple[float, float]],
+    size_usd: float,
+) -> float | None:
+    """Walk an order book to compute the volume-weighted average fill price.
+
+    Args:
+        order_book: List of (price, size_usd) levels sorted by price ascending
+                    (for YES buys: cheapest ask first).
+        size_usd:   Total notional to fill in USD.
+
+    Returns:
+        VWAP fill price in [0, 1], or None if the book cannot fill ``size_usd``.
+    """
+    if not order_book or size_usd <= 0:
+        return None
+    remaining = size_usd
+    cost = 0.0
+    for price, level_size in order_book:
+        if remaining <= 0:
+            break
+        take = min(remaining, level_size)
+        cost += price * take
+        remaining -= take
+    if remaining > 1e-9:
+        return None   # book too thin to fill the full size
+    return cost / size_usd
+
+
+def _compute_fill_adjusted_edge(
+    match: MatchResult,
+    best_side: TradeSide | None,
+    ops_bid: float,
+    ops_ask: float,
+) -> float | None:
+    """Compute fill-adjusted edge using the PM order book if available.
+
+    Returns None when no order book data is present (caller falls back to
+    the conservative edge).
+    """
+    if best_side is None:
+        return None
+
+    if best_side == "buy_yes":
+        book = match.pm_tick.order_book_yes
+        if not book:
+            return None
+        # Use the same size heuristic as risk.size_for_signal's default
+        fill_price = fill_adjusted_price(book, size_usd=200.0)
+        if fill_price is None:
+            return None
+        return ops_bid - fill_price
+    else:
+        book = match.pm_tick.order_book_no
+        if not book:
+            return None
+        fill_price = fill_adjusted_price(book, size_usd=200.0)
+        if fill_price is None:
+            return None
+        return (1.0 - ops_ask) - fill_price

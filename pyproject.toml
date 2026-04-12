@@ -19,6 +19,9 @@ dependencies = [
     "python-dotenv>=1.0",
     "py-clob-client>=0.18",
     "cryptography>=42.0",
+    "fastapi>=0.110",
+    "uvicorn>=0.29",
+    "pmxt>=2.0",
 ]
 
 [project.optional-dependencies]
@@ -38,6 +41,9 @@ packages = ["src/btc_pm_arb"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+filterwarnings = [
+    "ignore::RuntimeWarning:numpy",
+]
 
 [tool.pyright]
 pythonVersion = "3.11"

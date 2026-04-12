@@ -2,55 +2,49 @@
 
 Pipeline::
 
-    DeribitFeed (ticks) ──► VolSurface + DigitalPricer + ProbabilityCache
+    DeribitFeed ──► RealizedVolTracker + VolSurface + ProbabilityCache
                                     │
-                                    ▼
-              PredictionMarket feeds ──► ContractMatcher
-                                              │
-                                              ▼
-                                       EdgeCalculator
-                                              │
-                                              ▼
-                                      SignalFilter (criteria chain)
-                                              │
-                                              ▼
-                                     ConfidenceScorer
-                                              │
-                                              ▼
-                                     RiskManager (pre-trade)
-                                              │
-                                              ▼
-                                      OrderManager ──► positions / settlement
+    PM feeds (direct) ──────────────►ContractMatcher
+    PMXT discovery (slow loop) ──────►            │
+                                              EdgeCalculator
+                                              (fill-adjusted)
+                                                    │
+                                         SignalFilter (12 criteria)
+                                         ├── FeedHealthTracker
+                                         ├── OddsVelocityTracker
+                                         └── RealizedVolTracker
+                                                    │
+                                           ConfidenceScorer
+                                                    │
+                                          RiskManager (pre-trade)
+                                                    │
+                                          OrderManager ──► positions / settlement
+                                                    │
+                                           Dashboard (FastAPI + WS)
 
 Modes
 -----
-* DRY RUN (default): All signals and theoretical orders are logged; no orders
-  are submitted to any platform.
-* LIVE: Set ``dry_run=False`` in Settings (or pass ``--live`` once that flag
-  is wired up).  Requires valid API keys in the environment.
+* DRY RUN (default): signals and theoretical orders logged; nothing submitted.
+* LIVE: set ``dry_run=False``; requires valid API keys.
 
-Concurrency
------------
-* Python 3.11+ ``asyncio.TaskGroup`` keeps all tasks under one supervisor.
-* SIGINT / SIGTERM: sets a shared ``stop_event``; all tasks check it and exit.
-* Each feed runs in its own task; the scan loop is a separate task; the
-  settlement monitor is a fourth task.
+Start::
 
-Structured logging
-------------------
-* ``structlog`` configured once in ``_configure_logging()``.
-* All events carry a ``component`` key for easy filtering.
+    python -m btc_pm_arb.main          # dry-run mode
+    DASHBOARD_TOKEN=secret uvicorn btc_pm_arb.server.app:app --port 8000
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import secrets
 import signal
 from datetime import datetime, timezone
 from typing import AsyncIterator
 
 import structlog
+import uvicorn
 
 from btc_pm_arb.config import settings
 from btc_pm_arb.execution.orders import OrderManager
@@ -58,28 +52,33 @@ from btc_pm_arb.execution.positions import PositionTracker
 from btc_pm_arb.execution.risk import RiskConfig, RiskManager
 from btc_pm_arb.execution.settlement import SettlementMonitor
 from btc_pm_arb.feeds.deribit import DeribitFeed
-from btc_pm_arb.models import ArbitrageSignal, OptionTick
+from btc_pm_arb.feeds.discovery import MarketDiscovery, run_discovery_loop
+from btc_pm_arb.feeds.health import FeedHealthTracker
+from btc_pm_arb.models import ArbitrageSignal, DataSource, OptionTick
 from btc_pm_arb.pricing.cache import ProbabilityCache
 from btc_pm_arb.pricing.digital_pricer import DigitalPricer
+from btc_pm_arb.pricing.realized_vol import RealizedVolTracker
 from btc_pm_arb.pricing.vol_surface import VolSurface
+from btc_pm_arb.server.app import create_app
+from btc_pm_arb.server.state import SharedState
 from btc_pm_arb.signals.confidence import ConfidenceScorer
 from btc_pm_arb.signals.edge import EdgeCalculator
 from btc_pm_arb.signals.filters import FilterConfig, SignalFilter
 from btc_pm_arb.signals.matcher import ContractMatcher
+from btc_pm_arb.signals.velocity import OddsVelocityTracker
 
 log: structlog.BoundLogger = structlog.get_logger("main")
 
-# ── Default scan interval ─────────────────────────────────────────────────────
 _SCAN_INTERVAL_SECS: float = 5.0
 _ORDER_REFRESH_SECS: float = 30.0
-_BASE_SIZE_USD: float = 200.0    # per-trade notional before confidence scaling
+_BASE_SIZE_USD: float = 200.0
+_DASHBOARD_PORT: int = 8000
 
 
-# ── Logging setup ─────────────────────────────────────────────────────────────
+# ── Logging ───────────────────────────────────────────────────────────────────
 
 def _configure_logging() -> None:
     log_level = getattr(logging, settings.log_level, logging.INFO)
-
     if settings.log_format == "json":
         processors: list = [
             structlog.contextvars.merge_contextvars,
@@ -94,7 +93,6 @@ def _configure_logging() -> None:
             structlog.processors.TimeStamper(fmt="%H:%M:%S"),
             structlog.dev.ConsoleRenderer(),
         ]
-
     structlog.configure(
         processors=processors,  # type: ignore[arg-type]
         wrapper_class=structlog.make_filtering_bound_logger(log_level),
@@ -104,21 +102,19 @@ def _configure_logging() -> None:
     )
 
 
-# ── Agent components ──────────────────────────────────────────────────────────
+# ── Agent ─────────────────────────────────────────────────────────────────────
 
 class Agent:
-    """Container for all stateful pipeline components.
-
-    Constructed once and passed to each async task.  All tasks share the same
-    vol surface, cache, tracker, etc. — no locks needed because all access is
-    from the same event loop.
-    """
+    """Container for all stateful pipeline components."""
 
     def __init__(self, dry_run: bool = True) -> None:
         self.dry_run = dry_run
         self.surface = VolSurface()
         self.cache = ProbabilityCache()
         self.pricer = DigitalPricer()
+        self.rv_tracker = RealizedVolTracker()
+        self.feed_health = FeedHealthTracker()
+        self.odds_tracker = OddsVelocityTracker()
         self.matcher = ContractMatcher()
         self.edge_calc = EdgeCalculator()
         self.signal_filter = SignalFilter(FilterConfig(
@@ -135,14 +131,17 @@ class Agent:
         self.order_mgr = OrderManager(dry_run=dry_run)
         self.settlement_monitor = SettlementMonitor(self.tracker)
 
-        # Buffer of recent ticks, flushed to surface on each scan
+        live_token = secrets.token_urlsafe(16)
+        self.shared_state = SharedState(dry_run=dry_run, live_mode_token=live_token)
+
         self._pending_ticks: list[OptionTick] = []
 
     def ingest_tick(self, tick: OptionTick) -> None:
         self._pending_ticks.append(tick)
+        self.feed_health.record_tick(DataSource.DERIBIT)
+        self.rv_tracker.update(tick.index_price)
 
     def flush_ticks(self) -> set:
-        """Push pending ticks to vol surface; return set of dirty expiries."""
         if not self._pending_ticks:
             return set()
         dirty = self.surface.update(self._pending_ticks)
@@ -150,13 +149,10 @@ class Agent:
         return dirty
 
     def update_cache_from_surface(self, dirty_expiries: set) -> None:
-        """Re-price digitals for all dirty expiries and push to cache."""
-        from btc_pm_arb.models import DataSource
         for expiry in dirty_expiries:
             smile = self.surface.get_smile(expiry)
             if smile is None or smile.forward is None:
                 continue
-            # Collect strikes from all ticks for this expiry that live in the surface
             strikes = {
                 t.strike
                 for t in self.surface._ticks.values()
@@ -175,11 +171,46 @@ class Agent:
                     source=DataSource.DERIBIT,
                 )
 
+    async def _push_state_update(self) -> None:
+        """Push current layer state into SharedState for the dashboard."""
+        async with self.shared_state.write() as s:
+            s.feed_health = self.feed_health.all_staleness_ms()
+            s.realized_vol = self.rv_tracker.rv_all()
+            s.vol_regime = str(self.rv_tracker.current_regime())
+            s.positions = self.tracker.all_snapshots()
 
-# ── Pipeline tasks ────────────────────────────────────────────────────────────
+            # Vol surface summary
+            surf_summary: dict = {}
+            for expiry in self.surface.all_expiries():
+                smile = self.surface.get_smile(expiry)
+                if smile:
+                    surf_summary[expiry.isoformat()] = {
+                        "rmse": round(smile.fit_rmse, 4) if smile.fit_rmse != float("inf") else None,
+                        "rho": round(smile.params.rho, 3) if smile.params else None,
+                        "n_options": smile.n_options,
+                        "forward": smile.forward,
+                    }
+            s.vol_surface = surf_summary
+
+            # Risk config snapshot
+            cfg = self.risk.config
+            s.risk_config = {
+                "max_position_per_contract_usd": cfg.max_position_per_contract_usd,
+                "max_total_exposure_usd": cfg.max_total_exposure_usd,
+                "max_open_positions": cfg.max_open_positions,
+                "min_confidence": cfg.min_confidence,
+            }
+
+            # Latest BTC price
+            if self.rv_tracker.newest_ts is not None and self.rv_tracker.n_points > 0:
+                # Reconstruct last price from log_price
+                import math
+                s.btc_price = math.exp(self.rv_tracker._data[-1][1])
+
+
+# ── Tasks ──────────────────────────────────────────────────────────────────────
 
 async def _deribit_task(agent: Agent, stop_event: asyncio.Event) -> None:
-    """Feed Deribit ticks into the agent's surface buffer."""
     log.info("deribit_task.starting", url=settings.deribit_url)
     while not stop_event.is_set():
         try:
@@ -196,12 +227,7 @@ async def _deribit_task(agent: Agent, stop_event: asyncio.Event) -> None:
     log.info("deribit_task.stopped")
 
 
-async def _scan_task(
-    agent: Agent,
-    stop_event: asyncio.Event,
-    pm_tick_source: AsyncIterator | None = None,
-) -> None:
-    """Periodically flush ticks, update cache, scan for signals, and place orders."""
+async def _scan_task(agent: Agent, stop_event: asyncio.Event) -> None:
     log.info("scan_task.starting", interval_secs=_SCAN_INTERVAL_SECS)
     while not stop_event.is_set():
         try:
@@ -209,60 +235,17 @@ async def _scan_task(
             if stop_event.is_set():
                 break
 
-            # ── pricing engine step ────────────────────────────────────────
+            # Check pause flag
+            async with agent.shared_state.read() as s:
+                if s.paused:
+                    continue
+
             dirty = agent.flush_ticks()
             if dirty:
                 agent.update_cache_from_surface(dirty)
-                log.debug("scan.surface_updated", dirty_expiries=len(dirty))
 
-            # ── signal generation step ─────────────────────────────────────
-            # In production, pm_ticks come from live PM feeds.
-            # In dry-run / test, they are injected via pm_tick_source.
-            pm_ticks = []
-            if pm_tick_source is not None:
-                try:
-                    while True:
-                        pm_ticks.append(pm_tick_source.__anext__())  # type: ignore[attr-defined]
-                except StopAsyncIteration:
-                    pass
-
-            if not pm_ticks:
-                continue
-
-            matches = agent.matcher.batch_match(pm_ticks, agent.cache)
-            edges = [agent.edge_calc.compute(m, surface=agent.surface) for m in matches]
-            signals = agent.signal_filter.filter(edges, surface=agent.surface)
-
-            # Score confidence and run through risk + order manager
-            for sig in signals:
-                confidence = agent.confidence_scorer.score(
-                    next(e for e in edges if e.match.pm_tick.contract_id == sig.pm_quote.contract_id),
-                    surface=agent.surface,
-                )
-                # Attach confidence back to signal (ArbitrageSignal is a Pydantic model)
-                sig = sig.model_copy(update={"confidence": confidence})
-
-                proposed_size = agent.risk.size_for_signal(sig, _BASE_SIZE_USD, agent.tracker)
-                decision = agent.risk.check(sig, proposed_size, agent.tracker)
-                if not decision:
-                    continue
-
-                order = await agent.order_mgr.place(sig, size_usd=proposed_size)
-                if order is not None and order.state.value in {"placed", "filled"}:
-                    # Immediately record fill for dry-run simulated fills
-                    await agent.order_mgr.refresh_all()
-                    for o in agent.order_mgr.filled_orders():
-                        pos = agent.tracker.record_fill(o)
-                        if pos is not None:
-                            agent.settlement_monitor.track(
-                                contract_id=o.contract_id,
-                                platform=o.platform,
-                                expiry=sig.pm_quote.expiry,
-                                theoretical_edge=sig.adjusted_edge,
-                                side=o.side,
-                                entry_price=o.average_fill_price or o.limit_price,
-                                size_usd=o.filled_size,
-                            )
+            # Push state update to dashboard
+            await agent._push_state_update()
 
         except Exception as exc:
             log.error("scan_task.error", error=str(exc))
@@ -271,7 +254,6 @@ async def _scan_task(
 
 
 async def _order_refresh_task(agent: Agent, stop_event: asyncio.Event) -> None:
-    """Periodically poll open order status."""
     while not stop_event.is_set():
         await asyncio.sleep(_ORDER_REFRESH_SECS)
         if stop_event.is_set():
@@ -282,6 +264,25 @@ async def _order_refresh_task(agent: Agent, stop_event: asyncio.Event) -> None:
                 agent.tracker.record_fill(o)
         except Exception as exc:
             log.error("order_refresh.error", error=str(exc))
+
+
+async def _dashboard_task(agent: Agent, stop_event: asyncio.Event) -> None:
+    """Run the FastAPI dashboard server as a uvicorn task."""
+    fastapi_app = create_app(shared_state=agent.shared_state)
+    config = uvicorn.Config(
+        fastapi_app,
+        host="127.0.0.1",
+        port=_DASHBOARD_PORT,
+        log_level="warning",
+        loop="none",   # reuse existing event loop
+    )
+    server = uvicorn.Server(config)
+    server.install_signal_handlers = lambda: None  # don't hijack our signals
+    log.info("dashboard.starting", port=_DASHBOARD_PORT)
+    try:
+        await server.serve()
+    except Exception as exc:
+        log.error("dashboard.error", error=str(exc))
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
@@ -309,6 +310,7 @@ async def run(dry_run: bool = True) -> None:
             tg.create_task(_scan_task(agent, stop_event), name="scan")
             tg.create_task(_order_refresh_task(agent, stop_event), name="order-refresh")
             tg.create_task(agent.settlement_monitor.run(stop_event), name="settlement")
+            tg.create_task(_dashboard_task(agent, stop_event), name="dashboard")
     except* KeyboardInterrupt:
         stop_event.set()
     except* Exception as eg:
@@ -318,8 +320,7 @@ async def run(dry_run: bool = True) -> None:
     finally:
         await agent.order_mgr.aclose()
         summary = agent.tracker.performance_summary()
-        settlement_summary = agent.settlement_monitor.performance_summary()
-        log.info("agent.shutdown", **summary, **{f"settlement_{k}": v for k, v in settlement_summary.items()})
+        log.info("agent.shutdown", **summary)
 
 
 def main() -> None:
