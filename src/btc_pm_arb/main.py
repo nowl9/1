@@ -173,24 +173,85 @@ class Agent:
 
     async def _push_state_update(self) -> None:
         """Push current layer state into SharedState for the dashboard."""
-        async with self.shared_state.write() as s:
-            s.feed_health = self.feed_health.all_staleness_ms()
-            s.realized_vol = self.rv_tracker.rv_all()
-            s.vol_regime = str(self.rv_tracker.current_regime())
-            s.positions = self.tracker.all_snapshots()
+        import math
+        import time
 
-            # Vol surface summary
-            surf_summary: dict = {}
-            for expiry in self.surface.all_expiries():
-                smile = self.surface.get_smile(expiry)
-                if smile:
-                    surf_summary[expiry.isoformat()] = {
-                        "rmse": round(smile.fit_rmse, 4) if smile.fit_rmse != float("inf") else None,
-                        "rho": round(smile.params.rho, 3) if smile.params else None,
-                        "n_options": smile.n_options,
-                        "forward": smile.forward,
-                    }
-            s.vol_surface = surf_summary
+        now = time.time()
+
+        # ── Feeds ─────────────────────────────────────────────────────────────
+        staleness = self.feed_health.all_staleness_ms()
+        feeds: dict = {}
+        for src_str, ms in staleness.items():
+            if ms == float("inf"):
+                feed_status = "disconnected"
+                last_tick = 0.0
+                latency_ms = 0
+            elif ms > 5_000:
+                feed_status = "stale"
+                last_tick = now - ms / 1000.0
+                latency_ms = int(ms)
+            else:
+                feed_status = "ok"
+                last_tick = now - ms / 1000.0
+                latency_ms = int(ms)
+            feeds[src_str] = {
+                "status": feed_status,
+                "latency_ms": latency_ms,
+                "last_tick": last_tick,
+                "is_stale": ms > 5_000 or ms == float("inf"),
+            }
+
+        # ── Vol surface summary ────────────────────────────────────────────────
+        by_expiry: dict = {}
+        last_fit_ts: float | None = None
+        for expiry in self.surface.all_expiries():
+            smile = self.surface.get_smile(expiry)
+            if smile:
+                by_expiry[expiry.isoformat()] = {
+                    "rmse": round(smile.fit_rmse, 4) if smile.fit_rmse != float("inf") else None,
+                    "rho": round(smile.params.rho, 3) if smile.params else None,
+                    "n_options": smile.n_options,
+                    "forward": smile.forward,
+                }
+                if last_fit_ts is None:
+                    last_fit_ts = now
+
+        slices = list(by_expiry.values())
+        rmses = [v["rmse"] for v in slices if v.get("rmse") is not None]
+        rhos = [v["rho"] for v in slices if v.get("rho") is not None]
+        vol_surface = {
+            "svi_rmse": round(sum(rmses) / len(rmses), 4) if rmses else None,
+            "active_smiles": len(slices),
+            "rho": round(sum(rhos) / len(rhos), 3) if rhos else None,
+            "last_fit_timestamp": last_fit_ts,
+            "by_expiry": by_expiry,
+        }
+
+        # ── Volatility regime ─────────────────────────────────────────────────
+        rv_1h = self.rv_tracker.rv(1.0)
+        rv_24h = self.rv_tracker.rv(24.0)
+        volatility_regime = {
+            "current": str(self.rv_tracker.current_regime()),
+            "rv_1h": round(rv_1h, 4) if rv_1h is not None else None,
+            "rv_24h": round(rv_24h, 4) if rv_24h is not None else None,
+            "effective_min_edge": round(
+                self.rv_tracker.effective_min_edge(settings.min_edge), 4
+            ),
+        }
+
+        # ── Positions / performance ────────────────────────────────────────────
+        positions = self.tracker.all_snapshots()
+        perf = self.tracker.performance_summary()
+        settlements = [p.snapshot() for p in self.tracker.closed_positions()]
+
+        async with self.shared_state.write() as s:
+            s.feeds = feeds
+            s.vol_surface = vol_surface
+            s.volatility_regime = volatility_regime
+            s.positions = positions
+            s.positions_summary = perf
+            s.settlements = settlements
+            s.performance = perf
 
             # Risk config snapshot
             cfg = self.risk.config
@@ -203,8 +264,6 @@ class Agent:
 
             # Latest BTC price
             if self.rv_tracker.newest_ts is not None and self.rv_tracker.n_points > 0:
-                # Reconstruct last price from log_price
-                import math
                 s.btc_price = math.exp(self.rv_tracker._data[-1][1])
 
 

@@ -206,7 +206,7 @@ def test_velocity_only_uses_window():
     t.update("c", yes_price=0.20, ts=old)       # outside window
     t.update("c", yes_price=0.40, ts=_NOW - timedelta(seconds=5))
     t.update("c", yes_price=0.42, ts=_NOW)
-    result = t.velocity_at("c", implied_prob=0.60)
+    result = t.velocity_at("c", implied_prob=0.60, ts=_NOW)
     assert result is not None
     assert result.n_samples == 2   # only the two recent ones
 

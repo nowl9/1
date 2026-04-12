@@ -1,24 +1,24 @@
-"""FastAPI dashboard backend — exposes live agent state and control endpoints.
+"""FastAPI dashboard backend.
 
 Endpoints
 ---------
+GET  /api/health          liveness probe
 GET  /api/status          agent status, uptime, BTC price
-WS   /ws/snapshot         push full state snapshot every 1.5 s
-POST /api/pause           pause signal generation and execution
-POST /api/resume          resume signal generation and execution
-POST /api/risk-config     update risk limits (validated by RiskConfig)
-POST /api/mode            toggle dry-run / live mode (requires confirmation token)
+GET  /api/config          current risk config (read-only, no auth)
+WS   /ws/snapshot         push full snapshot every 1.5 s
+POST /api/pause           pause execution
+POST /api/resume          resume execution
+POST /api/risk-config     update risk limits
+POST /api/mode            toggle dry-run / live (requires confirmation token)
+
+Static
+------
+GET  /                    serves server/static/index.html (frontend SPA)
 
 Auth
 ----
-* Control endpoints (POST) require ``Authorization: Bearer <DASHBOARD_TOKEN>``
-* The WebSocket and GET /api/status are unauthenticated (local/VPN access)
-* Token is read from the ``DASHBOARD_TOKEN`` env variable; defaults to an
-  insecure placeholder that logs a warning at startup
-
-Running standalone (for testing)::
-
-    uvicorn btc_pm_arb.server.app:create_app --factory --port 8000
+Control endpoints (POST) require ``Authorization: Bearer <DASHBOARD_TOKEN>``.
+Read-only endpoints and WebSocket need no auth.
 """
 
 from __future__ import annotations
@@ -27,24 +27,27 @@ import asyncio
 import json
 import os
 import time
-from typing import Any, AsyncGenerator
+from pathlib import Path
+from typing import Any
 
 import structlog
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from btc_pm_arb.execution.risk import RiskConfig
 from btc_pm_arb.server.state import SharedState
 
 logger: structlog.BoundLogger = structlog.get_logger(__name__)
 
-_SNAPSHOT_INTERVAL = 1.5   # seconds between WebSocket pushes
+_SNAPSHOT_INTERVAL: float = 1.5
 _INSECURE_TOKEN = "dev-token-change-me"
+_STATIC_DIR = Path(__file__).parent / "static"
 
-# ── Pydantic request models ────────────────────────────────────────────────────
+
+# ── Request models ────────────────────────────────────────────────────────────
 
 class RiskConfigRequest(BaseModel):
     max_position_per_contract_usd: float | None = None
@@ -53,23 +56,20 @@ class RiskConfigRequest(BaseModel):
     max_correlated_exposure_usd: float | None = None
     correlated_strike_band_pct: float | None = None
     min_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
+    min_edge: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
 class ModeRequest(BaseModel):
     live: bool
-    confirmation_token: str   # must match AgentState.live_mode_token
+    confirmation_token: str
 
 
 # ── App factory ────────────────────────────────────────────────────────────────
 
 def create_app(shared_state: SharedState | None = None) -> FastAPI:
-    """Create and configure the FastAPI application.
-
-    Args:
-        shared_state: Shared state object injected from the main orchestrator.
-                      If None (standalone mode), a fresh state is created.
-    """
+    """Create and configure the FastAPI application."""
     app = FastAPI(title="BTC PM Arb Dashboard", version="1.0.0")
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["*"],
@@ -95,18 +95,32 @@ def create_app(shared_state: SharedState | None = None) -> FastAPI:
                 detail="Invalid bearer token",
             )
 
+    # ── GET /api/health ───────────────────────────────────────────────────────
+
+    @app.get("/api/health")
+    async def health() -> dict[str, Any]:
+        return {"status": "ok", "timestamp": time.time()}
+
     # ── GET /api/status ───────────────────────────────────────────────────────
 
     @app.get("/api/status")
     async def get_status() -> JSONResponse:
         snap = await state.snapshot()
         return JSONResponse({
-            "status": snap["status"],
-            "uptime_s": snap["uptime_s"],
+            "agent_status": snap["agent_status"],
+            "uptime_seconds": snap["uptime_seconds"],
             "btc_price": snap["btc_price"],
-            "vol_regime": snap["vol_regime"],
+            "volatility_regime": snap.get("volatility_regime", {}),
             "timestamp": snap["timestamp"],
         })
+
+    # ── GET /api/config ───────────────────────────────────────────────────────
+
+    @app.get("/api/config")
+    async def get_config() -> JSONResponse:
+        """Current risk config — no auth required (read-only)."""
+        async with state.read() as s:
+            return JSONResponse(s.risk_config)
 
     # ── WebSocket /ws/snapshot ────────────────────────────────────────────────
 
@@ -148,18 +162,8 @@ def create_app(shared_state: SharedState | None = None) -> FastAPI:
     async def update_risk_config(req: RiskConfigRequest) -> dict[str, Any]:
         async with state.write() as s:
             cfg = s.risk_config
-            if req.max_position_per_contract_usd is not None:
-                cfg["max_position_per_contract_usd"] = req.max_position_per_contract_usd
-            if req.max_total_exposure_usd is not None:
-                cfg["max_total_exposure_usd"] = req.max_total_exposure_usd
-            if req.max_open_positions is not None:
-                cfg["max_open_positions"] = req.max_open_positions
-            if req.max_correlated_exposure_usd is not None:
-                cfg["max_correlated_exposure_usd"] = req.max_correlated_exposure_usd
-            if req.correlated_strike_band_pct is not None:
-                cfg["correlated_strike_band_pct"] = req.correlated_strike_band_pct
-            if req.min_confidence is not None:
-                cfg["min_confidence"] = req.min_confidence
+            updates = req.model_dump(exclude_none=True)
+            cfg.update(updates)
             updated = dict(cfg)
         logger.info("dashboard.risk_config_updated", **updated)
         return {"status": "ok", "risk_config": updated}
@@ -170,8 +174,8 @@ def create_app(shared_state: SharedState | None = None) -> FastAPI:
     async def set_mode(req: ModeRequest) -> dict[str, Any]:
         if req.live:
             async with state.read() as s:
-                expected_token = s.live_mode_token
-            if req.confirmation_token != expected_token:
+                expected = s.live_mode_token
+            if req.confirmation_token != expected:
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
                     detail="Invalid confirmation token for live mode",
@@ -182,9 +186,13 @@ def create_app(shared_state: SharedState | None = None) -> FastAPI:
         logger.warning("dashboard.mode_changed", mode=mode)
         return {"status": "ok", "mode": mode}
 
+    # ── Static files (frontend SPA) ───────────────────────────────────────────
+    # Mounted last so API routes take priority.
+    if _STATIC_DIR.is_dir():
+        app.mount("/", StaticFiles(directory=str(_STATIC_DIR), html=True), name="static")
+
     return app
 
 
-# ── Uvicorn entrypoint (standalone) ──────────────────────────────────────────
-
-app = create_app()   # module-level instance for ``uvicorn btc_pm_arb.server.app:app``
+# Module-level instance for ``uvicorn btc_pm_arb.server.app:app``
+app = create_app()

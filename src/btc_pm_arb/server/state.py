@@ -1,11 +1,11 @@
-"""Shared state manager — collects live snapshots from all pipeline layers.
+"""Shared state manager — single source of truth for the dashboard.
 
-All reads/writes are protected by a single asyncio.Lock so the FastAPI
-handlers (which run in the same event loop as the agent) see a consistent
-view.
+``AgentState`` holds all mutable data.  ``SharedState`` wraps it with an
+``asyncio.Lock`` so FastAPI handlers and agent tasks share it safely in one
+event loop.
 
-The state dict is designed to be directly JSON-serialisable so the WebSocket
-handler can broadcast it without extra serialization steps.
+``snapshot()`` produces the canonical JSON payload broadcast over WebSocket.
+The schema is defined here so the frontend and tests both reference one place.
 """
 
 from __future__ import annotations
@@ -21,110 +21,126 @@ import structlog
 logger: structlog.BoundLogger = structlog.get_logger(__name__)
 
 
+# ── State dataclass ────────────────────────────────────────────────────────────
+
+@dataclass
+class FeedStatus:
+    status: str = "unknown"       # "ok" | "stale" | "disconnected" | "unknown"
+    latency_ms: int = 0
+    last_tick: float = 0.0        # Unix timestamp of last received tick
+    is_stale: bool = True
+
+
 @dataclass
 class AgentState:
-    """Top-level mutable container for the agent's current state."""
+    """All mutable agent state, updated by background tasks."""
 
-    # Control flags (set by dashboard control endpoints)
+    # ── Control ───────────────────────────────────────────────────────────────
     paused: bool = False
     dry_run: bool = True
     started_at: float = field(default_factory=time.time)
-
-    # Latest BTC price (populated by the Deribit feed task)
-    btc_price: float | None = None
-
-    # Feed health: source → staleness_ms
-    feed_health: dict[str, float] = field(default_factory=dict)
-
-    # Vol surface summary: expiry → {rmse, rho, n_options, forward}
-    vol_surface: dict[str, Any] = field(default_factory=dict)
-
-    # Current signals (last scan output)
-    signals: list[dict] = field(default_factory=list)
-
-    # Open positions snapshots
-    positions: list[dict] = field(default_factory=list)
-
-    # Settled contracts
-    settlement_history: list[dict] = field(default_factory=list)
-
-    # Current risk config
-    risk_config: dict[str, Any] = field(default_factory=dict)
-
-    # Realized vol and regime
-    realized_vol: dict[str, Any] = field(default_factory=dict)   # window_h → rv value
-    vol_regime: str = "normal"
-
-    # Live mode confirmation token (set once at startup)
     live_mode_token: str = ""
 
+    # ── Market data ───────────────────────────────────────────────────────────
+    btc_price: float | None = None
+
+    # feed name → FeedStatus (keyed "deribit", "polymarket", "kalshi")
+    feeds: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    # ── Vol surface ───────────────────────────────────────────────────────────
+    vol_surface: dict[str, Any] = field(default_factory=dict)
+    # keys: svi_rmse, active_smiles, rho, last_fit_timestamp
+
+    # ── Volatility regime ─────────────────────────────────────────────────────
+    volatility_regime: dict[str, Any] = field(default_factory=dict)
+    # keys: current, rv_1h, rv_24h, effective_min_edge
+
+    # ── Signals ───────────────────────────────────────────────────────────────
+    signals: list[dict[str, Any]] = field(default_factory=list)
+
+    # ── Positions ─────────────────────────────────────────────────────────────
+    positions: list[dict[str, Any]] = field(default_factory=list)
+    positions_summary: dict[str, Any] = field(default_factory=dict)
+
+    # ── Settlements ───────────────────────────────────────────────────────────
+    settlements: list[dict[str, Any]] = field(default_factory=list)
+
+    # ── Performance ───────────────────────────────────────────────────────────
+    performance: dict[str, Any] = field(default_factory=dict)
+
+    # ── Risk config (live mirror of RiskManager config) ───────────────────────
+    risk_config: dict[str, Any] = field(default_factory=dict)
+
+
+# ── SharedState ────────────────────────────────────────────────────────────────
 
 class SharedState:
-    """Thread-safe shared state with asyncio.Lock.
+    """asyncio-safe wrapper around AgentState.
 
     Usage::
 
-        state = SharedState()
+        state = SharedState(dry_run=True, live_mode_token="abc")
 
-        # Write (from agent tasks):
         async with state.write() as s:
             s.btc_price = 62_000.0
 
-        # Read (from FastAPI handlers):
-        async with state.read() as s:
-            price = s.btc_price
-
-        # Snapshot (for WebSocket broadcast):
-        snap = await state.snapshot()
+        snap = await state.snapshot()   # → JSON-serializable dict
     """
 
     def __init__(self, dry_run: bool = True, live_mode_token: str = "") -> None:
         self._state = AgentState(dry_run=dry_run, live_mode_token=live_mode_token)
         self._lock = asyncio.Lock()
 
-    class _WriteCtx:
-        def __init__(self, state: "SharedState") -> None:
-            self._state = state
+    # ── Context managers ──────────────────────────────────────────────────────
+
+    class _Ctx:
+        def __init__(self, shared: "SharedState") -> None:
+            self._shared = shared
 
         async def __aenter__(self) -> AgentState:
-            await self._state._lock.acquire()
-            return self._state._state
+            await self._shared._lock.acquire()
+            return self._shared._state
 
         async def __aexit__(self, *_: object) -> None:
-            self._state._lock.release()
+            self._shared._lock.release()
 
-    class _ReadCtx:
-        def __init__(self, state: "SharedState") -> None:
-            self._state = state
+    def write(self) -> "_Ctx":
+        return self._Ctx(self)
 
-        async def __aenter__(self) -> AgentState:
-            await self._state._lock.acquire()
-            return self._state._state
+    def read(self) -> "_Ctx":
+        return self._Ctx(self)
 
-        async def __aexit__(self, *_: object) -> None:
-            self._state._lock.release()
-
-    def write(self) -> "_WriteCtx":
-        return self._WriteCtx(self)
-
-    def read(self) -> "_ReadCtx":
-        return self._ReadCtx(self)
+    # ── Snapshot ──────────────────────────────────────────────────────────────
 
     async def snapshot(self) -> dict[str, Any]:
-        """Return a JSON-serializable snapshot of the full state."""
+        """Return the full JSON-serializable dashboard payload."""
         async with self.read() as s:
             uptime = time.time() - s.started_at
+
+            if s.paused:
+                agent_status = "paused"
+            elif s.dry_run:
+                agent_status = "dry_run"
+            else:
+                agent_status = "running"
+
             return {
-                "status": "paused" if s.paused else ("dry_run" if s.dry_run else "live"),
-                "uptime_s": round(uptime, 1),
+                "timestamp": time.time(),
                 "btc_price": s.btc_price,
-                "feed_health": s.feed_health,
+                "agent_status": agent_status,
+                "uptime_seconds": round(uptime, 1),
+
+                "feeds": s.feeds,
                 "vol_surface": s.vol_surface,
+                "volatility_regime": s.volatility_regime,
+
                 "signals": s.signals,
+
                 "positions": s.positions,
-                "settlement_history": s.settlement_history,
+                "positions_summary": s.positions_summary,
+
+                "settlements": s.settlements,
+                "performance": s.performance,
+
                 "risk_config": s.risk_config,
-                "realized_vol": s.realized_vol,
-                "vol_regime": s.vol_regime,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
             }
