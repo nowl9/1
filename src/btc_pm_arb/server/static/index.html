@@ -1,0 +1,1046 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>BTC PM Arb Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Anybody:wght@400;600;700&display=swap" rel="stylesheet" />
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+:root {
+  --bg:      #07080a;
+  --card:    #0d0f13;
+  --border:  #1a1d24;
+  --text:    #e2e8f0;
+  --muted:   #64748b;
+  --green:   #00e5a0;
+  --amber:   #ffb224;
+  --red:     #ff4466;
+  --blue:    #00c2ff;
+  --purple:  #a78bfa;
+  --mono:    'IBM Plex Mono', 'Courier New', monospace;
+  --display: 'Anybody', sans-serif;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body, #root { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.5;
+}
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+/* ── Header ─────────────────────────────────────────────── */
+.header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.header-title {
+  font-family: var(--display);
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--green);
+  letter-spacing: 0.04em;
+  flex: 1;
+}
+.conn-dot {
+  width: 8px; height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.conn-dot.ok     { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.conn-dot.warn   { background: var(--amber); box-shadow: 0 0 6px var(--amber); }
+.conn-dot.error  { background: var(--red);   box-shadow: 0 0 6px var(--red); }
+.btc-price {
+  font-family: var(--display);
+  font-size: 18px;
+  font-weight: 700;
+  color: var(--blue);
+  letter-spacing: 0.02em;
+}
+.status-pill {
+  padding: 2px 10px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.pill-running  { background: #00e5a022; color: var(--green); border: 1px solid #00e5a044; }
+.pill-dry_run  { background: #00c2ff22; color: var(--blue);  border: 1px solid #00c2ff44; }
+.pill-paused   { background: #ffb22422; color: var(--amber); border: 1px solid #ffb22444; }
+
+/* ── Main scroll area ───────────────────────────────────── */
+.main { flex: 1; overflow-y: auto; padding: 12px 16px; }
+
+/* ── Bottom nav ─────────────────────────────────────────── */
+.bottom-nav {
+  display: flex;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.bottom-nav button {
+  flex: 1;
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 500;
+  padding: 12px 4px;
+  cursor: pointer;
+  letter-spacing: 0.04em;
+  transition: color 0.15s;
+  text-transform: uppercase;
+}
+.bottom-nav button:hover { color: var(--text); }
+.bottom-nav button.active { color: var(--green); border-top: 2px solid var(--green); }
+
+/* ── Card ───────────────────────────────────────────────── */
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px;
+  margin-bottom: 12px;
+}
+.card-title {
+  font-family: var(--display);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin-bottom: 10px;
+}
+
+/* ── Grid layouts ───────────────────────────────────────── */
+.grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; }
+.stat-box {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px;
+}
+.stat-label { font-size: 10px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+.stat-value { font-size: 16px; font-weight: 600; margin-top: 2px; }
+.stat-value.green  { color: var(--green); }
+.stat-value.amber  { color: var(--amber); }
+.stat-value.red    { color: var(--red); }
+.stat-value.blue   { color: var(--blue); }
+.stat-value.purple { color: var(--purple); }
+.stat-value.muted  { color: var(--muted); }
+
+/* ── Feed health ────────────────────────────────────────── */
+.feed-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid var(--border);
+}
+.feed-row:last-child { border-bottom: none; }
+.feed-name { flex: 1; font-size: 12px; color: var(--text); }
+.feed-latency { font-size: 11px; color: var(--muted); width: 60px; text-align: right; }
+.feed-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 8px;
+  border-radius: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  width: 80px;
+  text-align: center;
+}
+.badge-ok           { background: #00e5a018; color: var(--green); border: 1px solid #00e5a030; }
+.badge-stale        { background: #ffb22418; color: var(--amber); border: 1px solid #ffb22430; }
+.badge-disconnected { background: #ff446618; color: var(--red);   border: 1px solid #ff446630; }
+.badge-unknown      { background: #64748b18; color: var(--muted); border: 1px solid #64748b30; }
+
+/* ── Signal list ────────────────────────────────────────── */
+.signal-item {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin-bottom: 8px;
+}
+.signal-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.signal-title {
+  flex: 1;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.signal-edge {
+  font-family: var(--display);
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--green);
+}
+.signal-edge.negative { color: var(--red); }
+.signal-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.meta-tag {
+  font-size: 10px;
+  color: var(--muted);
+  background: #ffffff08;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+.meta-tag span { color: var(--text); }
+.vol-badge {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 7px;
+  border-radius: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.vol-low    { background: #00c2ff18; color: var(--blue);   border: 1px solid #00c2ff30; }
+.vol-normal { background: #00e5a018; color: var(--green);  border: 1px solid #00e5a030; }
+.vol-high   { background: #ff446618; color: var(--red);    border: 1px solid #ff446630; }
+
+/* ── Positions ──────────────────────────────────────────── */
+.pos-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.pos-row:last-child { border-bottom: none; }
+.pos-contract { flex: 1; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pos-pnl { font-weight: 600; min-width: 70px; text-align: right; }
+.pos-pnl.pos { color: var(--green); }
+.pos-pnl.neg { color: var(--red); }
+.pos-pnl.zero { color: var(--muted); }
+.pos-platform {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.platform-polymarket { background: #a78bfa18; color: var(--purple); border: 1px solid #a78bfa30; }
+.platform-kalshi     { background: #00c2ff18; color: var(--blue);   border: 1px solid #00c2ff30; }
+
+/* ── Controls ───────────────────────────────────────────── */
+.control-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+.control-row:last-child { border-bottom: none; }
+.control-label { flex: 1; font-size: 12px; color: var(--text); }
+.control-label small { display: block; color: var(--muted); font-size: 10px; margin-top: 2px; }
+.btn {
+  padding: 7px 18px;
+  border-radius: 6px;
+  border: none;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  transition: opacity 0.15s;
+}
+.btn:hover { opacity: 0.85; }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-green  { background: var(--green); color: var(--bg); }
+.btn-amber  { background: var(--amber); color: var(--bg); }
+.btn-red    { background: var(--red);   color: #fff; }
+.btn-blue   { background: var(--blue);  color: var(--bg); }
+.btn-ghost  { background: transparent; color: var(--muted); border: 1px solid var(--border); }
+
+/* ── Range slider ───────────────────────────────────────── */
+.slider-wrap { flex: 1; }
+.slider-row  { display: flex; align-items: center; gap: 8px; }
+input[type=range] {
+  flex: 1;
+  -webkit-appearance: none;
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  outline: none;
+}
+input[type=range]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: var(--green);
+  cursor: pointer;
+}
+input[type=range]::-moz-range-thumb {
+  width: 14px; height: 14px;
+  border-radius: 50%;
+  background: var(--green);
+  cursor: pointer;
+  border: none;
+}
+.slider-val { min-width: 60px; text-align: right; font-size: 12px; color: var(--green); font-weight: 600; }
+
+/* ── Text input ─────────────────────────────────────────── */
+input[type=text], input[type=password] {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 7px 10px;
+  outline: none;
+  width: 100%;
+  transition: border-color 0.15s;
+}
+input[type=text]:focus, input[type=password]:focus { border-color: var(--green); }
+
+/* ── Toast ──────────────────────────────────────────────── */
+.toast-stack {
+  position: fixed;
+  bottom: 60px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  z-index: 100;
+  pointer-events: none;
+  width: min(400px, 90vw);
+}
+.toast {
+  padding: 9px 14px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  animation: fadeUp 0.2s ease;
+  pointer-events: auto;
+}
+.toast-info    { background: #1a1d24; border: 1px solid var(--border); color: var(--text); }
+.toast-success { background: #00e5a015; border: 1px solid #00e5a040; color: var(--green); }
+.toast-error   { background: #ff446615; border: 1px solid #ff446640; color: var(--red); }
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Uptime / misc ──────────────────────────────────────── */
+.stale-warn {
+  background: #ffb22412;
+  border: 1px solid #ffb22440;
+  color: var(--amber);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 11px;
+  margin-bottom: 10px;
+}
+.empty-state { color: var(--muted); text-align: center; padding: 24px; font-size: 12px; }
+.section-title {
+  font-family: var(--display);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: var(--muted);
+  margin: 14px 0 8px;
+}
+.divider { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+.uptime { font-size: 11px; color: var(--muted); }
+.confirm-row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+.confirm-row input { flex: 1; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
+function debounce(fn, ms) {
+  let t;
+  return (...args) => { clearTimeout(t); t = setTimeout(() => fn(...args), ms); };
+}
+
+function fmt(n, d = 2) {
+  if (n == null) return '—';
+  return Number(n).toFixed(d);
+}
+function pct(n, d = 1) {
+  if (n == null) return '—';
+  return (Number(n) * 100).toFixed(d) + '%';
+}
+function usd(n) {
+  if (n == null) return '—';
+  return '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function pnlClass(v) {
+  if (v == null || v === 0) return 'zero';
+  return v > 0 ? 'pos' : 'neg';
+}
+
+// ── Small components ──────────────────────────────────────────────────────────
+
+function ConnDot({ connected }) {
+  return <span className={`conn-dot ${connected ? 'ok' : 'error'}`} title={connected ? 'Connected' : 'Disconnected'} />;
+}
+
+function StatusPill({ status }) {
+  return <span className={`status-pill pill-${status}`}>{status}</span>;
+}
+
+function VolBadge({ regime }) {
+  const cls = regime === 'low' ? 'vol-low' : regime === 'high' ? 'vol-high' : 'vol-normal';
+  return <span className={`vol-badge ${cls}`}>{regime || 'normal'}</span>;
+}
+
+function FeedDot({ status }) {
+  const cls = status === 'ok' ? 'ok' : status === 'stale' ? 'warn' : 'error';
+  return <span className={`conn-dot ${cls}`} style={{ width: 7, height: 7 }} />;
+}
+
+// ── Toast stack ───────────────────────────────────────────────────────────────
+
+function Toasts({ toasts }) {
+  return (
+    <div className="toast-stack">
+      {toasts.map(t => (
+        <div key={t.id} className={`toast toast-${t.type}`}>{t.msg}</div>
+      ))}
+    </div>
+  );
+}
+
+// ── Header ────────────────────────────────────────────────────────────────────
+
+function Header({ connected, snap }) {
+  const price = snap?.btc_price;
+  const status = snap?.agent_status;
+  const uptime = snap?.uptime_seconds;
+
+  function fmtUptime(s) {
+    if (s == null) return '';
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = Math.floor(s % 60);
+    return h > 0
+      ? `${h}h ${m}m`
+      : m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+  }
+
+  return (
+    <header className="header">
+      <ConnDot connected={connected} />
+      <span className="header-title">BTC PM ARB</span>
+      {price != null && (
+        <span className="btc-price">{usd(price)}</span>
+      )}
+      {status && <StatusPill status={status} />}
+      {uptime != null && <span className="uptime">up {fmtUptime(uptime)}</span>}
+    </header>
+  );
+}
+
+// ── Overview Tab ──────────────────────────────────────────────────────────────
+
+function OverviewTab({ snap }) {
+  if (!snap) return <div className="empty-state">Waiting for data…</div>;
+
+  const feeds = snap.feeds || {};
+  const vol = snap.vol_surface || {};
+  const regime = snap.volatility_regime || {};
+  const perf = snap.positions_summary || {};
+
+  // Stale data warning
+  const now = Date.now() / 1000;
+  const isDataStale = snap.timestamp && (now - snap.timestamp) > 10;
+
+  const feedEntries = Object.entries(feeds);
+
+  return (
+    <div>
+      {isDataStale && (
+        <div className="stale-warn">Data is stale ({Math.round(now - snap.timestamp)}s old)</div>
+      )}
+
+      {/* Summary stats */}
+      <div className="grid-3">
+        <div className="stat-box">
+          <div className="stat-label">BTC Price</div>
+          <div className="stat-value blue">{snap.btc_price != null ? usd(snap.btc_price) : '—'}</div>
+        </div>
+        <div className="stat-box">
+          <div className="stat-label">RV 1h</div>
+          <div className="stat-value">{pct(regime.rv_1h)}</div>
+        </div>
+        <div className="stat-box">
+          <div className="stat-label">RV 24h</div>
+          <div className="stat-value">{pct(regime.rv_24h)}</div>
+        </div>
+      </div>
+
+      {/* Vol regime + surface */}
+      <div className="grid-2" style={{ marginTop: 8 }}>
+        <div className="stat-box">
+          <div className="stat-label">Vol Regime</div>
+          <div style={{ marginTop: 4 }}>
+            <VolBadge regime={regime.current} />
+            {regime.effective_min_edge != null && (
+              <span style={{ marginLeft: 8, fontSize: 11, color: 'var(--muted)' }}>
+                edge floor {pct(regime.effective_min_edge)}
+              </span>
+            )}
+          </div>
+        </div>
+        <div className="stat-box">
+          <div className="stat-label">SVI Surface</div>
+          <div className="stat-value" style={{ fontSize: 13 }}>
+            {vol.active_smiles ?? 0} smiles
+            {vol.svi_rmse != null && (
+              <span style={{ marginLeft: 8, fontSize: 11, color: 'var(--muted)', fontWeight: 400 }}>
+                rmse {fmt(vol.svi_rmse, 4)}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+
+      {/* Portfolio summary */}
+      <div className="section-title">Portfolio</div>
+      <div className="grid-3">
+        <div className="stat-box">
+          <div className="stat-label">Open</div>
+          <div className="stat-value">{perf.open_positions ?? 0}</div>
+        </div>
+        <div className="stat-box">
+          <div className="stat-label">Unrealized P&amp;L</div>
+          <div className={`stat-value ${pnlClass(perf.total_unrealized_pnl)}`}>
+            {perf.total_unrealized_pnl != null ? usd(perf.total_unrealized_pnl) : '—'}
+          </div>
+        </div>
+        <div className="stat-box">
+          <div className="stat-label">Realized P&amp;L</div>
+          <div className={`stat-value ${pnlClass(perf.total_realized_pnl)}`}>
+            {perf.total_realized_pnl != null ? usd(perf.total_realized_pnl) : '—'}
+          </div>
+        </div>
+      </div>
+
+      {/* Feed health */}
+      <div className="section-title">Feed Health</div>
+      <div className="card" style={{ padding: '8px 14px' }}>
+        {feedEntries.length === 0
+          ? <div className="empty-state" style={{ padding: 8 }}>No feeds</div>
+          : feedEntries.map(([name, f]) => (
+            <div className="feed-row" key={name}>
+              <FeedDot status={f.status} />
+              <span className="feed-name">{name.replace('DataSource.', '').toLowerCase()}</span>
+              <span className="feed-latency">
+                {f.latency_ms > 0 ? `${f.latency_ms}ms` : '—'}
+              </span>
+              <span className={`feed-badge badge-${f.status || 'unknown'}`}>{f.status}</span>
+            </div>
+          ))
+        }
+      </div>
+
+      {/* Top 3 signals */}
+      {snap.signals && snap.signals.length > 0 && (
+        <>
+          <div className="section-title">Top Signals</div>
+          {snap.signals.slice(0, 3).map((sig, i) => (
+            <SignalCard key={i} signal={sig} compact />
+          ))}
+        </>
+      )}
+    </div>
+  );
+}
+
+// ── Signal card ───────────────────────────────────────────────────────────────
+
+function SignalCard({ signal: s, compact }) {
+  const edge = s.fill_adjusted_edge ?? s.edge;
+  const edgeNeg = edge != null && edge < 0;
+  return (
+    <div className="signal-item">
+      <div className="signal-header">
+        <span className="signal-title">
+          {s.venue?.toUpperCase() || '?'} · ${(s.strike / 1000).toFixed(0)}k
+          {s.expiry_label || (s.days_to_expiry != null ? ` · ${fmt(s.days_to_expiry, 0)}d` : '')}
+        </span>
+        <VolBadge regime={s.vol_regime} />
+        <span className={`signal-edge ${edgeNeg ? 'negative' : ''}`}>
+          {edge != null ? pct(edge) : '—'}
+        </span>
+      </div>
+      {!compact && (
+        <div className="signal-meta">
+          {s.model_prob     != null && <span className="meta-tag">model <span>{pct(s.model_prob)}</span></span>}
+          {s.market_prob    != null && <span className="meta-tag">mkt <span>{pct(s.market_prob)}</span></span>}
+          {s.confidence     != null && <span className="meta-tag">conf <span>{pct(s.confidence)}</span></span>}
+          {s.svi_rmse       != null && <span className="meta-tag">rmse <span>{fmt(s.svi_rmse, 4)}</span></span>}
+          {s.venue && <span className="meta-tag">venue <span>{s.venue}</span></span>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Signals Tab ───────────────────────────────────────────────────────────────
+
+function SignalsTab({ snap }) {
+  const signals = snap?.signals ?? [];
+
+  const sorted = useMemo(() =>
+    [...signals].sort((a, b) => {
+      const ea = a.fill_adjusted_edge ?? a.edge ?? -Infinity;
+      const eb = b.fill_adjusted_edge ?? b.edge ?? -Infinity;
+      return eb - ea;
+    }),
+    [signals]
+  );
+
+  if (!snap) return <div className="empty-state">Waiting for data…</div>;
+  if (sorted.length === 0) return <div className="empty-state">No signals yet.</div>;
+
+  return (
+    <div>
+      <div className="section-title">{sorted.length} signal{sorted.length !== 1 ? 's' : ''}</div>
+      {sorted.map((s, i) => <SignalCard key={i} signal={s} />)}
+    </div>
+  );
+}
+
+// ── Positions Tab ─────────────────────────────────────────────────────────────
+
+function PositionsTab({ snap }) {
+  if (!snap) return <div className="empty-state">Waiting for data…</div>;
+
+  const positions = snap.positions ?? [];
+  const settlements = snap.settlements ?? [];
+  const perf = snap.positions_summary || {};
+
+  const open = positions.filter(p => !p.closed);
+  const closed = settlements.length > 0 ? settlements : positions.filter(p => p.closed);
+
+  function platformClass(p) {
+    if (!p) return '';
+    const s = String(p).toLowerCase();
+    if (s.includes('poly')) return 'platform-polymarket';
+    if (s.includes('kalshi')) return 'platform-kalshi';
+    return '';
+  }
+
+  return (
+    <div>
+      {/* Performance summary */}
+      <div className="grid-2">
+        <div className="stat-box">
+          <div className="stat-label">Total Exposure</div>
+          <div className="stat-value blue">{usd(perf.total_exposure_usd)}</div>
+        </div>
+        <div className="stat-box">
+          <div className="stat-label">Win Rate</div>
+          <div className="stat-value">{perf.win_rate != null ? pct(perf.win_rate) : '—'}</div>
+        </div>
+      </div>
+      <div className="grid-2" style={{ marginTop: 8 }}>
+        <div className="stat-box">
+          <div className="stat-label">Unrealized P&amp;L</div>
+          <div className={`stat-value ${pnlClass(perf.total_unrealized_pnl)}`}>
+            {usd(perf.total_unrealized_pnl)}
+          </div>
+        </div>
+        <div className="stat-box">
+          <div className="stat-label">Realized P&amp;L</div>
+          <div className={`stat-value ${pnlClass(perf.total_realized_pnl)}`}>
+            {usd(perf.total_realized_pnl)}
+          </div>
+        </div>
+      </div>
+
+      {/* Open positions */}
+      <div className="section-title">Open ({open.length})</div>
+      <div className="card" style={{ padding: '6px 14px' }}>
+        {open.length === 0
+          ? <div className="empty-state" style={{ padding: 10 }}>No open positions</div>
+          : open.map((p, i) => (
+            <div className="pos-row" key={i}>
+              <span className={`pos-platform ${platformClass(p.platform)}`}>
+                {String(p.platform || '').replace('DataSource.', '').toLowerCase().slice(0, 4)}
+              </span>
+              <span className="pos-contract">{p.contract_id}</span>
+              <span style={{ fontSize: 11, color: 'var(--muted)', minWidth: 50, textAlign: 'right' }}>
+                {usd(p.filled_size)}
+              </span>
+              <span className={`pos-pnl ${pnlClass(p.unrealized_pnl)}`}>
+                {usd(p.unrealized_pnl)}
+              </span>
+            </div>
+          ))
+        }
+      </div>
+
+      {/* Settlement log */}
+      <div className="section-title">Settlement Log ({closed.length})</div>
+      <div className="card" style={{ padding: '6px 14px' }}>
+        {closed.length === 0
+          ? <div className="empty-state" style={{ padding: 10 }}>No settlements</div>
+          : closed.map((p, i) => (
+            <div className="pos-row" key={i}>
+              <span className={`pos-platform ${platformClass(p.platform)}`}>
+                {String(p.platform || '').replace('DataSource.', '').toLowerCase().slice(0, 4)}
+              </span>
+              <span className="pos-contract">{p.contract_id}</span>
+              <span className={`pos-pnl ${pnlClass(p.realized_pnl)}`}>
+                {usd(p.realized_pnl)}
+              </span>
+            </div>
+          ))
+        }
+      </div>
+    </div>
+  );
+}
+
+// ── Controls Tab ──────────────────────────────────────────────────────────────
+
+function ControlsTab({ snap, token, setToken, post, toast }) {
+  const [liveToken, setLiveToken] = useState('');
+  const [riskDraft, setRiskDraft] = useState({});
+  const cfg = snap?.risk_config || {};
+  const status = snap?.agent_status;
+
+  // Merge live risk config into draft on first load
+  useEffect(() => {
+    if (snap?.risk_config && Object.keys(riskDraft).length === 0) {
+      setRiskDraft({ ...snap.risk_config });
+    }
+  }, [snap?.risk_config]);
+
+  const debouncedPost = useMemo(
+    () => debounce((updates) => {
+      post('/api/risk-config', updates)
+        .then(() => toast('Risk config saved', 'success'))
+        .catch(() => {});
+    }, 300),
+    [post, toast]
+  );
+
+  function handleSlider(key, value) {
+    const next = { ...riskDraft, [key]: value };
+    setRiskDraft(next);
+    debouncedPost({ [key]: value });
+  }
+
+  async function handlePause() {
+    try {
+      await post('/api/pause', {});
+      toast('Agent paused', 'success');
+    } catch {}
+  }
+
+  async function handleResume() {
+    try {
+      await post('/api/resume', {});
+      toast('Agent resumed', 'success');
+    } catch {}
+  }
+
+  async function handleSetLive() {
+    try {
+      await post('/api/mode', { live: true, confirmation_token: liveToken });
+      toast('Switched to LIVE mode', 'success');
+      setLiveToken('');
+    } catch {}
+  }
+
+  async function handleSetDryRun() {
+    try {
+      await post('/api/mode', { live: false, confirmation_token: '' });
+      toast('Switched to dry-run mode', 'success');
+    } catch {}
+  }
+
+  const isLive = status === 'running';
+  const isPaused = status === 'paused';
+
+  return (
+    <div>
+      {/* Auth token */}
+      <div className="section-title">Authentication</div>
+      <div className="card">
+        <div className="control-row">
+          <div className="control-label">
+            Bearer Token
+            <small>Stored in localStorage; required for control endpoints</small>
+          </div>
+        </div>
+        <input
+          type="password"
+          value={token}
+          onChange={e => setToken(e.target.value)}
+          placeholder="Enter dashboard token…"
+          autoComplete="off"
+        />
+      </div>
+
+      {/* Agent control */}
+      <div className="section-title">Agent Control</div>
+      <div className="card">
+        <div className="control-row">
+          <div className="control-label">
+            Execution
+            <small>Current: <strong style={{ color: 'var(--text)' }}>{status || '—'}</strong></small>
+          </div>
+          {!isPaused
+            ? <button className="btn btn-amber" onClick={handlePause}>Pause</button>
+            : <button className="btn btn-green" onClick={handleResume}>Resume</button>
+          }
+        </div>
+        <hr className="divider" />
+        <div className="control-row">
+          <div className="control-label">
+            Mode
+            <small>{isLive ? 'LIVE — real orders being placed' : 'Dry-run — no real orders'}</small>
+          </div>
+          {isLive
+            ? <button className="btn btn-ghost" onClick={handleSetDryRun}>→ Dry Run</button>
+            : <span />
+          }
+        </div>
+        {!isLive && (
+          <>
+            <div className="confirm-row">
+              <input
+                type="password"
+                placeholder="Confirmation token to enable live mode…"
+                value={liveToken}
+                onChange={e => setLiveToken(e.target.value)}
+                autoComplete="off"
+              />
+              <button className="btn btn-red" onClick={handleSetLive} disabled={!liveToken}>
+                Go Live
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+
+      {/* Risk config sliders */}
+      <div className="section-title">Risk Config</div>
+      <div className="card">
+        <RiskSlider
+          label="Max Position / Contract"
+          keyName="max_position_per_contract_usd"
+          value={riskDraft.max_position_per_contract_usd ?? cfg.max_position_per_contract_usd ?? 500}
+          min={50} max={5000} step={50}
+          display={v => usd(v)}
+          onChange={handleSlider}
+        />
+        <hr className="divider" />
+        <RiskSlider
+          label="Max Total Exposure"
+          keyName="max_total_exposure_usd"
+          value={riskDraft.max_total_exposure_usd ?? cfg.max_total_exposure_usd ?? 10000}
+          min={1000} max={100000} step={1000}
+          display={v => usd(v)}
+          onChange={handleSlider}
+        />
+        <hr className="divider" />
+        <RiskSlider
+          label="Max Open Positions"
+          keyName="max_open_positions"
+          value={riskDraft.max_open_positions ?? cfg.max_open_positions ?? 20}
+          min={1} max={100} step={1}
+          display={v => String(Math.round(v))}
+          onChange={handleSlider}
+        />
+        <hr className="divider" />
+        <RiskSlider
+          label="Min Confidence"
+          keyName="min_confidence"
+          value={riskDraft.min_confidence ?? cfg.min_confidence ?? 0.6}
+          min={0} max={1} step={0.01}
+          display={v => pct(v)}
+          onChange={handleSlider}
+        />
+        <hr className="divider" />
+        <RiskSlider
+          label="Min Edge"
+          keyName="min_edge"
+          value={riskDraft.min_edge ?? cfg.min_edge ?? 0.01}
+          min={0} max={0.5} step={0.005}
+          display={v => pct(v)}
+          onChange={handleSlider}
+        />
+      </div>
+    </div>
+  );
+}
+
+function RiskSlider({ label, keyName, value, min, max, step, display, onChange }) {
+  return (
+    <div className="control-row">
+      <div className="control-label">{label}</div>
+      <div className="slider-wrap">
+        <div className="slider-row">
+          <input
+            type="range"
+            min={min} max={max} step={step}
+            value={value}
+            onChange={e => onChange(keyName, parseFloat(e.target.value))}
+          />
+          <span className="slider-val">{display(value)}</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+
+function App() {
+  const [snap, setSnap] = useState(null);
+  const [connected, setConnected] = useState(false);
+  const [tab, setTab] = useState('overview');
+  const [token, setToken] = useState(() => localStorage.getItem('dashboard_token') || '');
+  const [toasts, setToasts] = useState([]);
+
+  const wsRef = useRef(null);
+  const reconnectDelay = useRef(1000);
+  const reconnectTimer = useRef(null);
+
+  const toast = useCallback((msg, type = 'info') => {
+    const id = Date.now() + Math.random();
+    setToasts(ts => [...ts, { id, msg, type }]);
+    setTimeout(() => setToasts(ts => ts.filter(t => t.id !== id)), 4000);
+  }, []);
+
+  const connect = useCallback(() => {
+    const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const ws = new WebSocket(`${protocol}//${location.host}/ws/snapshot`);
+
+    ws.onopen = () => {
+      setConnected(true);
+      reconnectDelay.current = 1000;
+    };
+
+    ws.onmessage = (e) => {
+      try { setSnap(JSON.parse(e.data)); } catch {}
+    };
+
+    ws.onclose = () => {
+      setConnected(false);
+      reconnectTimer.current = setTimeout(() => {
+        reconnectDelay.current = Math.min(reconnectDelay.current * 2, 30000);
+        connect();
+      }, reconnectDelay.current);
+    };
+
+    ws.onerror = () => ws.close();
+    wsRef.current = ws;
+  }, []);
+
+  useEffect(() => {
+    connect();
+    return () => {
+      clearTimeout(reconnectTimer.current);
+      wsRef.current?.close();
+    };
+  }, [connect]);
+
+  useEffect(() => {
+    localStorage.setItem('dashboard_token', token);
+  }, [token]);
+
+  const post = useCallback(async (path, body) => {
+    const res = await fetch(path, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${token}`,
+      },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      const msg = data.detail || `HTTP ${res.status}`;
+      toast(msg, 'error');
+      throw new Error(msg);
+    }
+    return data;
+  }, [token, toast]);
+
+  const TABS = ['overview', 'signals', 'positions', 'controls'];
+
+  return (
+    <div className="app">
+      <Header connected={connected} snap={snap} />
+      <div className="main">
+        {tab === 'overview'  && <OverviewTab  snap={snap} />}
+        {tab === 'signals'   && <SignalsTab   snap={snap} />}
+        {tab === 'positions' && <PositionsTab snap={snap} />}
+        {tab === 'controls'  && (
+          <ControlsTab
+            snap={snap}
+            token={token}
+            setToken={setToken}
+            post={post}
+            toast={toast}
+          />
+        )}
+      </div>
+      <nav className="bottom-nav">
+        {TABS.map(t => (
+          <button
+            key={t}
+            className={tab === t ? 'active' : ''}
+            onClick={() => setTab(t)}
+          >
+            {t}
+          </button>
+        ))}
+      </nav>
+      <Toasts toasts={toasts} />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
