@@ -135,6 +135,9 @@ class DeribitFeed:
         self._pending_rpcs: dict[int, asyncio.Future[Any]] = {}
         # Cache of parsed instrument metadata to avoid re-parsing on every tick
         self._instrument_cache: dict[str, tuple[float, datetime, OptionType]] = {}
+        # Strong references to short-lived background tasks (heartbeat replies)
+        # so the runtime cannot GC them mid-flight.  Tasks self-discard on done.
+        self._background_tasks: set[asyncio.Task[Any]] = set()
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -287,6 +290,16 @@ class DeribitFeed:
                 logger.warning("deribit_invalid_json", raw=raw[:200])
                 continue
             await self._handle_message(msg)
+            # Force a single trip through the event loop after each frame.
+            # The ticker dispatch path inside _handle_message has no inner
+            # awaits, and asyncio.Queue.get() inside ws.recv() returns
+            # synchronously when the recv buffer is non-empty — so under
+            # sustained ticker load (~9000 msg/s for 912 instruments at
+            # 100 ms cadence) this loop becomes a tight CPU loop with no
+            # suspension points, starving wait_for resume callbacks for
+            # outer RPCs (set_heartbeat, public/test).  Yielding here gives
+            # those callbacks a chance to run between every frame.
+            await asyncio.sleep(0)
 
     async def _handle_message(self, msg: dict[str, Any]) -> None:
         # JSON-RPC response to one of our requests
@@ -315,8 +328,14 @@ class DeribitFeed:
             if channel.startswith("ticker."):
                 self._handle_ticker(data)
         elif method == "heartbeat":
-            # Server-initiated heartbeat — respond with test_request
-            await self._respond_to_heartbeat()
+            # Server-initiated heartbeat.  Spawn the reply as a background
+            # task so the message loop continues reading frames (and
+            # dispatching RPC responses) while our reply is in flight on
+            # the wire.  Stash the task so it can't be GC'd mid-send;
+            # auto-discard on completion — no further lifecycle management.
+            task = asyncio.create_task(self._respond_to_heartbeat())
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
 
     def _handle_ticker(self, data: dict[str, Any]) -> None:
         """Parse a raw ticker payload and push an OptionTick onto the queue."""
