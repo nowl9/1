@@ -139,7 +139,17 @@ class Agent:
     def ingest_tick(self, tick: OptionTick) -> None:
         self._pending_ticks.append(tick)
         self.feed_health.record_tick(DataSource.DERIBIT)
-        self.rv_tracker.update(tick.index_price)
+        # Throttle the RV tracker to at most 1 Hz: every option tick carries
+        # the same BTC index price (the index updates only a few times per
+        # second), but we receive hundreds of option-tick events per second
+        # across 912 instruments — calling rv_tracker.update on every one is
+        # both redundant and, because update() is O(N) over its data deque,
+        # the proximate cause of the event-loop starvation that produced
+        # 30 s heartbeat-RPC timeouts and 252 s connection deaths.  See
+        # diagnostic round 5 trace: rv() takes ~0.1 ms at N=1000 but ~7 ms
+        # at N=50 000, called per option tick, saturated the consumer task
+        # within ~90 s of operation.
+        self.rv_tracker.maybe_update(tick.index_price)
 
     def flush_ticks(self) -> set:
         if not self._pending_ticks:

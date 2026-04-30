@@ -102,6 +102,41 @@ class RealizedVolTracker:
         self._data.append((now, math.log(price)))
         self._check_regime_change()
 
+    def maybe_update(
+        self,
+        price: float,
+        min_interval_s: float = 1.0,
+    ) -> bool:
+        """Throttled variant of :meth:`update`.
+
+        Applies the update only if at least ``min_interval_s`` seconds of
+        wall-time have elapsed since the most recent observation; returns
+        ``True`` when an update was applied, ``False`` when throttled.
+
+        Motivation: the realized-vol calculation cares about the BTC
+        *index-price* time series (which natively updates at most a few
+        Hz), but the upstream caller (``Agent.ingest_tick``) sees one
+        ``index_price`` value per *option-tick* event — hundreds per
+        second across 912 instruments, almost all carrying the same
+        index price.  Calling the O(N) :meth:`update` per option tick
+        saturates the event loop within ~90 s of operation; throttling
+        to 1 Hz reduces the call rate by 2-3 orders of magnitude with no
+        material loss of fidelity for vol estimation.
+
+        ``min_interval_s`` defaults to 1.0 s, suitable for the BTC index
+        feed; callers with different cadence requirements can override.
+        """
+        if price <= 0:
+            return False
+        now = datetime.now(timezone.utc)
+        last = self.newest_ts
+        if last is not None:
+            elapsed_s = (now - last).total_seconds()
+            if elapsed_s < min_interval_s:
+                return False
+        self.update(price, ts=now)
+        return True
+
     # ── Queries ───────────────────────────────────────────────────────────────
 
     def rv(self, window_h: float) -> float | None:
