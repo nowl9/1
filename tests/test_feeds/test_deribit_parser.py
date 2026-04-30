@@ -87,15 +87,16 @@ class TestDeribitFeedTickParsing:
     """Test _handle_ticker by calling it directly on a feed instance."""
 
     def _make_feed(self) -> DeribitFeed:
-        feed = DeribitFeed.__new__(DeribitFeed)
-        feed._url = "wss://fake"
-        feed._queue = asyncio.Queue(maxsize=1000)
-        feed._running = False
-        feed._ws = None
-        feed._rpc_id = 0
-        feed._pending_rpcs = {}
-        feed._instrument_cache = {}
-        return feed
+        # Build via __init__ rather than __new__ + manual attribute
+        # injection.  The original helper bypassed __init__ as a
+        # micro-optimisation, but __init__ does nothing expensive (it
+        # sets attributes and creates an asyncio.Queue), and bypassing
+        # it forces the helper to track every new attribute the class
+        # gains — caused two regressions in round 5 instrumentation
+        # (_heartbeat_reply_ids, _pending_rpc_methods).  Going through
+        # __init__ keeps the fixture in sync with the class definition
+        # automatically.
+        return DeribitFeed(url="wss://fake", queue_maxsize=1000)
 
     def test_valid_call_tick_enqueued(self) -> None:
         feed = self._make_feed()
@@ -206,15 +207,16 @@ class TestDeribitFeedMessageDispatch:
     """Test _handle_message routing without network."""
 
     def _make_feed(self) -> DeribitFeed:
-        feed = DeribitFeed.__new__(DeribitFeed)
-        feed._url = "wss://fake"
-        feed._queue = asyncio.Queue(maxsize=1000)
-        feed._running = False
-        feed._ws = None
-        feed._rpc_id = 0
-        feed._pending_rpcs = {}
-        feed._instrument_cache = {}
-        return feed
+        # Build via __init__ rather than __new__ + manual attribute
+        # injection.  The original helper bypassed __init__ as a
+        # micro-optimisation, but __init__ does nothing expensive (it
+        # sets attributes and creates an asyncio.Queue), and bypassing
+        # it forces the helper to track every new attribute the class
+        # gains — caused two regressions in round 5 instrumentation
+        # (_heartbeat_reply_ids, _pending_rpc_methods).  Going through
+        # __init__ keeps the fixture in sync with the class definition
+        # automatically.
+        return DeribitFeed(url="wss://fake", queue_maxsize=1000)
 
     @pytest.mark.asyncio
     async def test_rpc_response_resolves_future(self) -> None:
