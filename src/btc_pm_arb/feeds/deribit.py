@@ -66,6 +66,27 @@ _RECONNECT_MAX = 60.0   # seconds cap
 _RECONNECT_FACTOR = 2.0
 
 
+# ── Helper: version-tolerant websocket "is open?" check ───────────────────────
+
+def _ws_open(ws: Any) -> bool:
+    """Return True iff ``ws`` is connected and OPEN.
+
+    Spans both the pre-13 and post-13 ``websockets`` library APIs:
+      * websockets <13 exposed a boolean ``.closed`` property.
+      * websockets >=13 removed ``.closed`` in favour of ``.state`` (a
+        ``websockets.protocol.State`` enum: CONNECTING / OPEN / CLOSING / CLOSED).
+    Without this shim, calls like ``ws.closed`` on >=13 raise AttributeError
+    inside the heartbeat loop, taking the connection down every ~80 s.
+    """
+    if ws is None:
+        return False
+    state = getattr(ws, "state", None)
+    if state is not None:
+        return getattr(state, "name", "") == "OPEN"
+    # Fallback for pre-13 websockets that exposed ``.closed``
+    return not getattr(ws, "closed", True)
+
+
 # ── Helper: parse instrument name ─────────────────────────────────────────────
 
 def parse_instrument(name: str) -> tuple[float, datetime, OptionType] | None:
@@ -379,7 +400,7 @@ class DeribitFeed:
 
         while self._running:
             await asyncio.sleep(_HEARTBEAT_INTERVAL)
-            if self._ws is None or self._ws.closed:
+            if not _ws_open(self._ws):
                 break
             # test_request triggers a heartbeat response from the server;
             # if it doesn't respond the connection dies and we reconnect.
@@ -391,7 +412,7 @@ class DeribitFeed:
 
     async def _respond_to_heartbeat(self) -> None:
         """Respond to a server-initiated heartbeat/test_request."""
-        if self._ws is None or self._ws.closed:
+        if not _ws_open(self._ws):
             return
         try:
             rpc_id = self._next_id()
