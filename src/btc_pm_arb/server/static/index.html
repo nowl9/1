@@ -1,0 +1,1460 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+<meta name="theme-color" content="#07080a" />
+<title>BTC PM Arb Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+:root {
+  --bg:        #07080a;
+  --card:      #0d0f13;
+  --card-hi:   #11141a;
+  --border:    #1a1d24;
+  --text:      #c8cdd5;
+  --text-dim:  #5a6170;
+  --text-bright: #eef0f4;
+  --green:     #00e5a0;
+  --green-dim: #00e5a015;
+  --amber:     #ffb224;
+  --amber-dim: #ffb22415;
+  --red:       #ff4466;
+  --red-dim:   #ff446615;
+  --blue:      #00c2ff;
+  --blue-dim:  #00c2ff15;
+  --purple:    #a78bfa;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+html, body, #root { height: 100%; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 12px;
+  line-height: 1.45;
+  font-feature-settings: "tnum" 1;
+  -webkit-font-smoothing: antialiased;
+}
+button {
+  font-family: inherit;
+  font-size: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+input { font-family: inherit; }
+
+/* ── App shell ─────────────────────────────────────────────── */
+.app {
+  max-width: 480px;
+  margin: 0 auto;
+  min-height: 100vh;
+  background: var(--bg);
+  padding-bottom: calc(64px + env(safe-area-inset-bottom));
+  position: relative;
+}
+
+/* ── Header ────────────────────────────────────────────────── */
+.header {
+  padding: 16px 16px 12px;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  z-index: 10;
+}
+.header-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+.brand-label {
+  color: var(--text-dim);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  margin-bottom: 4px;
+}
+.btc-price {
+  font-size: 26px;
+  font-weight: 600;
+  color: var(--text-bright);
+  letter-spacing: -0.01em;
+}
+.btc-price-stale { color: var(--text-dim); }
+.header-pills {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 4px;
+}
+
+/* ── Pills / badges ────────────────────────────────────────── */
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.08em;
+  border-radius: 3px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+.pill-green { color: var(--green); background: var(--green-dim); border-color: var(--green); }
+.pill-amber { color: var(--amber); background: var(--amber-dim); border-color: var(--amber); }
+.pill-red   { color: var(--red);   background: var(--red-dim);   border-color: var(--red); }
+.pill-blue  { color: var(--blue);  background: var(--blue-dim);  border-color: var(--blue); }
+.pill-dim   { color: var(--text-dim); background: transparent; border-color: var(--border); }
+
+/* ── Stale banner ──────────────────────────────────────────── */
+.stale-banner {
+  background: var(--amber-dim);
+  border-bottom: 1px solid var(--amber);
+  color: var(--amber);
+  font-size: 11px;
+  padding: 8px 16px;
+  text-align: center;
+  letter-spacing: 0.04em;
+}
+
+/* ── Tab content ───────────────────────────────────────────── */
+.tab-content {
+  padding: 12px;
+  animation: slideUp 0.2s ease;
+}
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ── Cards ─────────────────────────────────────────────────── */
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 12px;
+  margin-bottom: 12px;
+}
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 10px;
+}
+.card-title {
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.14em;
+}
+
+/* ── Stats grid ────────────────────────────────────────────── */
+.stat-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.stat-cell {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+.stat-label {
+  color: var(--text-dim);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  margin-bottom: 4px;
+}
+.stat-value {
+  font-size: 18px;
+  font-weight: 600;
+  color: var(--text-bright);
+  letter-spacing: -0.01em;
+}
+.stat-sub {
+  color: var(--text-dim);
+  font-size: 10px;
+  margin-top: 2px;
+}
+.green  { color: var(--green) !important; }
+.amber  { color: var(--amber) !important; }
+.red    { color: var(--red) !important; }
+.blue   { color: var(--blue) !important; }
+.purple { color: var(--purple) !important; }
+.dim    { color: var(--text-dim) !important; }
+.bright { color: var(--text-bright) !important; }
+
+/* ── Feed rows ─────────────────────────────────────────────── */
+.feed-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.feed-row:last-child { border-bottom: none; }
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+.dot-live  { background: var(--green); animation: pulse 2s infinite; }
+.dot-stale { background: var(--amber); }
+.dot-error { background: var(--red); }
+.dot-dim   { background: var(--text-dim); }
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.3; }
+}
+.feed-name {
+  font-weight: 500;
+  color: var(--text-bright);
+  flex: 1;
+  text-transform: capitalize;
+}
+.feed-latency {
+  color: var(--text-dim);
+  font-size: 11px;
+  min-width: 52px;
+  text-align: right;
+}
+
+/* ── Divider ───────────────────────────────────────────────── */
+.divider {
+  height: 1px;
+  background: var(--border);
+  margin: 10px 0;
+}
+
+/* ── Vol grid ──────────────────────────────────────────────── */
+.vol-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px 12px;
+}
+.vol-cell {
+  display: flex;
+  flex-direction: column;
+}
+.vol-label {
+  color: var(--text-dim);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  margin-bottom: 2px;
+}
+.vol-value {
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--text-bright);
+}
+
+/* ── Signal rows ───────────────────────────────────────────── */
+.signal-row {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+}
+.signal-row:last-child { border-bottom: none; }
+.signal-row.filtered { opacity: 0.4; }
+.signal-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+.signal-name {
+  color: var(--text-bright);
+  font-weight: 500;
+  font-size: 12px;
+  margin-bottom: 2px;
+}
+.signal-meta {
+  color: var(--text-dim);
+  font-size: 10px;
+  letter-spacing: 0.04em;
+}
+.signal-side {
+  flex-shrink: 0;
+}
+.signal-row .signal-metrics {
+  display: flex;
+  gap: 10px;
+  margin-top: 6px;
+  font-size: 10px;
+  flex-wrap: wrap;
+}
+.signal-metric {
+  color: var(--text-dim);
+}
+.signal-metric .metric-val {
+  color: var(--text);
+  font-weight: 500;
+}
+.signal-edges {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-top: 4px;
+}
+.edge-theo {
+  color: var(--text-dim);
+  text-decoration: line-through;
+  font-size: 11px;
+}
+.edge-fill {
+  font-weight: 600;
+  font-size: 13px;
+}
+.signal-reasons {
+  margin-top: 8px;
+  background: var(--amber-dim);
+  border-left: 2px solid var(--amber);
+  padding: 6px 10px;
+  font-size: 10px;
+  color: var(--amber);
+  border-radius: 0 3px 3px 0;
+}
+.signal-reasons li { margin: 2px 0; list-style: none; }
+.signal-reasons li:before { content: "→ "; color: var(--amber); opacity: 0.6; }
+
+/* ── Position rows ─────────────────────────────────────────── */
+.pos-row {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+.pos-row:last-child { border-bottom: none; }
+.pos-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+}
+.pos-name {
+  color: var(--text-bright);
+  font-weight: 500;
+  font-size: 12px;
+}
+.pos-pnl {
+  font-weight: 600;
+  font-size: 13px;
+  white-space: nowrap;
+}
+.pos-meta {
+  color: var(--text-dim);
+  font-size: 10px;
+  margin-top: 2px;
+  letter-spacing: 0.02em;
+}
+.pos-bar {
+  height: 2px;
+  background: var(--border);
+  border-radius: 1px;
+  margin-top: 6px;
+  overflow: hidden;
+  position: relative;
+}
+.pos-bar-fill {
+  height: 100%;
+  border-radius: 1px;
+  transition: width 0.3s ease;
+}
+
+/* ── Settlement rows ───────────────────────────────────────── */
+.settle-row {
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.settle-row:last-child { border-bottom: none; }
+.settle-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.settle-name {
+  color: var(--text-bright);
+  font-weight: 500;
+  font-size: 12px;
+  flex: 1;
+}
+.settle-badges {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.settle-meta {
+  color: var(--text-dim);
+  font-size: 10px;
+  margin-top: 2px;
+}
+
+/* ── Big buttons ───────────────────────────────────────────── */
+.big-btn {
+  display: block;
+  width: 100%;
+  padding: 16px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  border: 1px solid transparent;
+  margin-bottom: 8px;
+  min-height: 50px;
+  transition: filter 0.1s ease;
+}
+.big-btn:active { filter: brightness(1.2); }
+.big-btn-red {
+  background: var(--red);
+  color: #1a0008;
+}
+.big-btn-green {
+  background: var(--green);
+  color: #001a10;
+}
+.big-btn-outline {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+}
+.big-btn-outline:active { background: var(--card-hi); }
+.big-btn-amber {
+  background: var(--amber);
+  color: #1a1100;
+}
+
+/* ── Sliders ───────────────────────────────────────────────── */
+.slider-row {
+  margin-bottom: 14px;
+}
+.slider-row:last-child { margin-bottom: 0; }
+.slider-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 6px;
+}
+.slider-label {
+  color: var(--text-dim);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.slider-value {
+  color: var(--text-bright);
+  font-weight: 600;
+  font-size: 13px;
+}
+input[type="range"] {
+  width: 100%;
+  height: 30px;
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  margin: 0;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 3px;
+  background: var(--border);
+  border-radius: 2px;
+}
+input[type="range"]::-moz-range-track {
+  height: 3px;
+  background: var(--border);
+  border-radius: 2px;
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--blue);
+  margin-top: -8px;
+  border: 2px solid var(--bg);
+  cursor: pointer;
+}
+input[type="range"]::-moz-range-thumb {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--blue);
+  border: 2px solid var(--bg);
+  cursor: pointer;
+}
+
+/* ── Token input ───────────────────────────────────────────── */
+.token-input {
+  width: 100%;
+  background: var(--card-hi);
+  border: 1px solid var(--border);
+  color: var(--text-bright);
+  padding: 12px;
+  border-radius: 4px;
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+.token-input:focus {
+  outline: none;
+  border-color: var(--blue);
+}
+
+/* ── Confirmation overlay ──────────────────────────────────── */
+.confirm-warn {
+  background: var(--amber-dim);
+  border: 1px solid var(--amber);
+  color: var(--amber);
+  padding: 12px;
+  border-radius: 4px;
+  margin-bottom: 10px;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.confirm-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+/* ── Tab bar ───────────────────────────────────────────────── */
+.tabbar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  max-width: 480px;
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  background: var(--card);
+  border-top: 1px solid var(--border);
+  padding-bottom: env(safe-area-inset-bottom);
+  z-index: 20;
+}
+.tab-btn {
+  padding: 14px 4px;
+  text-align: center;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  border-top: 2px solid transparent;
+  min-height: 56px;
+  transition: color 0.1s ease;
+}
+.tab-btn.active {
+  color: var(--text-bright);
+  border-top-color: var(--blue);
+}
+
+/* ── Toast ─────────────────────────────────────────────────── */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: calc(80px + env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  background: var(--card-hi);
+  border: 1px solid var(--border);
+  color: var(--text-bright);
+  padding: 10px 18px;
+  border-radius: 4px;
+  font-size: 12px;
+  z-index: 100;
+  animation: slideUp 0.2s ease;
+  max-width: 360px;
+}
+.toast-success { border-color: var(--green); color: var(--green); }
+.toast-error   { border-color: var(--red);   color: var(--red); }
+
+/* ── Misc ──────────────────────────────────────────────────── */
+.empty-state {
+  color: var(--text-dim);
+  text-align: center;
+  padding: 20px 0;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+.conn-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.row-between {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback, useMemo } = React;
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+const fmtUsd = (v, opts = {}) => {
+  if (v === null || v === undefined || Number.isNaN(v)) return "—";
+  const sign = v < 0 ? "-" : (opts.signed && v > 0 ? "+" : "");
+  const abs = Math.abs(v);
+  const digits = opts.digits ?? (abs < 100 ? 2 : 0);
+  return `${sign}$${abs.toLocaleString(undefined, {
+    minimumFractionDigits: digits, maximumFractionDigits: digits,
+  })}`;
+};
+const fmtPct = (v, digits = 1) => {
+  if (v === null || v === undefined || Number.isNaN(v)) return "—";
+  return `${(v * 100).toFixed(digits)}%`;
+};
+const fmtPctSigned = (v, digits = 1) => {
+  if (v === null || v === undefined || Number.isNaN(v)) return "—";
+  const sign = v > 0 ? "+" : "";
+  return `${sign}${(v * 100).toFixed(digits)}%`;
+};
+const fmtNum = (v, digits = 0) => {
+  if (v === null || v === undefined || Number.isNaN(v)) return "—";
+  return v.toLocaleString(undefined, {
+    minimumFractionDigits: digits, maximumFractionDigits: digits,
+  });
+};
+const fmtUptime = (s) => {
+  if (!s || s < 0) return "0s";
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = Math.floor(s % 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m ${sec}s`;
+  return `${sec}s`;
+};
+const pnlClass = (v) => v > 0 ? "green" : v < 0 ? "red" : "dim";
+
+// ─── Auth ────────────────────────────────────────────────────────────────────
+const TOKEN_KEY = "arb_dashboard_token";
+const getToken = () => localStorage.getItem(TOKEN_KEY) || "";
+const setToken = (t) => localStorage.setItem(TOKEN_KEY, t);
+
+const apiCall = async (path, body, showToast) => {
+  try {
+    const res = await fetch(path, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${getToken()}`,
+      },
+      body: JSON.stringify(body || {}),
+    });
+    if (res.status === 401) {
+      showToast("Auth failed — check token", "error");
+      return null;
+    }
+    if (res.status === 403) {
+      const msg = (await res.json().catch(() => ({}))).detail || "Forbidden";
+      showToast(msg, "error");
+      return null;
+    }
+    if (!res.ok) {
+      showToast(`Request failed (${res.status})`, "error");
+      return null;
+    }
+    showToast("Done", "success");
+    return await res.json();
+  } catch (e) {
+    showToast("Network error", "error");
+    return null;
+  }
+};
+
+// ─── WebSocket hook ──────────────────────────────────────────────────────────
+function useSnapshot() {
+  const [snap, setSnap] = useState(null);
+  const [conn, setConn] = useState("connecting"); // connected | reconnecting | error | connecting
+  const [lastTick, setLastTick] = useState(0);
+  const wsRef = useRef(null);
+  const delayRef = useRef(1000);
+  const aliveRef = useRef(true);
+
+  useEffect(() => {
+    aliveRef.current = true;
+
+    const connect = () => {
+      if (!aliveRef.current) return;
+      const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const url = `${proto}//${window.location.host}/ws/snapshot`;
+      let ws;
+      try { ws = new WebSocket(url); }
+      catch (e) { setConn("error"); return; }
+
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        delayRef.current = 1000;
+        setConn("connected");
+      };
+      ws.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          setSnap(data);
+          setLastTick(Date.now());
+        } catch {}
+      };
+      ws.onerror = () => {
+        setConn("error");
+      };
+      ws.onclose = () => {
+        if (!aliveRef.current) return;
+        setConn("reconnecting");
+        const d = delayRef.current;
+        delayRef.current = Math.min(d * 2, 30000);
+        setTimeout(connect, d);
+      };
+    };
+
+    connect();
+    return () => {
+      aliveRef.current = false;
+      if (wsRef.current) {
+        try { wsRef.current.close(); } catch {}
+      }
+    };
+  }, []);
+
+  return { snap, conn, lastTick };
+}
+
+// ─── Toast hook ──────────────────────────────────────────────────────────────
+function useToasts() {
+  const [toast, setToastState] = useState(null);
+  const timerRef = useRef(null);
+  const showToast = useCallback((text, kind = "success") => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    setToastState({ text, kind });
+    timerRef.current = setTimeout(() => setToastState(null), 2000);
+  }, []);
+  return { toast, showToast };
+}
+
+// ─── Components ──────────────────────────────────────────────────────────────
+
+function Pill({ kind = "dim", children }) {
+  return <span className={`pill pill-${kind}`}>{children}</span>;
+}
+
+function StatCell({ label, value, sub, valueClass }) {
+  return (
+    <div className="stat-cell">
+      <div className="stat-label">{label}</div>
+      <div className={`stat-value ${valueClass || ""}`}>{value}</div>
+      {sub ? <div className="stat-sub">{sub}</div> : null}
+    </div>
+  );
+}
+
+function Header({ snap, conn, lastTick }) {
+  const status = snap?.agent_status || "unknown";
+  const dryRun = status === "dry_run";
+  const paused = status === "paused";
+  const running = status === "running";
+
+  const modePill = dryRun
+    ? <Pill kind="amber">DRY RUN</Pill>
+    : <Pill kind="red">LIVE</Pill>;
+  const stsPill = paused
+    ? <Pill kind="amber">PAUSED</Pill>
+    : <Pill kind="green">RUNNING</Pill>;
+
+  const connDot = conn === "connected"
+    ? <span className="conn-dot" style={{ background: "var(--green)" }} />
+    : conn === "reconnecting"
+      ? <span className="conn-dot" style={{ background: "var(--amber)" }} />
+      : <span className="conn-dot" style={{ background: "var(--red)" }} />;
+
+  const stale = !snap || (Date.now() - lastTick > 5000);
+
+  return (
+    <header className="header">
+      <div className="header-row">
+        <div>
+          <div className="brand-label">BTC ARB AGENT {connDot}</div>
+          <div className={`btc-price ${stale ? "btc-price-stale" : ""}`}>
+            {snap?.btc_price ? `$${fmtNum(snap.btc_price, 0)}` : "—"}
+          </div>
+        </div>
+        <div className="header-pills">
+          {modePill}
+          {stsPill}
+          <span className="pill pill-dim">UP {fmtUptime(snap?.uptime_seconds)}</span>
+        </div>
+      </div>
+    </header>
+  );
+}
+
+// ─── Tab: Overview ───────────────────────────────────────────────────────────
+function TabOverview({ snap }) {
+  const perf = snap?.performance || {};
+  const summary = snap?.positions_summary || {};
+  const feeds = snap?.feeds || {};
+  const vol = snap?.vol_surface || {};
+  const regime = snap?.volatility_regime || {};
+  const positions = snap?.positions || [];
+  const signals = snap?.signals || [];
+  const risk = snap?.risk_config || {};
+
+  const unrealized = perf.unrealized_pnl ?? summary.unrealized_pnl ?? 0;
+  const settled = perf.settled_pnl ?? 0;
+  const winRate = perf.win_rate;
+  const tradeCount = perf.trade_count ?? perf.total_trades;
+  const exposure = summary.total_exposure ?? perf.total_exposure ?? 0;
+  const maxExposure = risk.max_total_exposure_usd || 1;
+  const exposurePct = exposure / maxExposure;
+
+  const actionable = signals.filter(s => s && s.actionable && !s.filtered);
+  const topSignals = [...signals]
+    .filter(s => s && s.actionable && !s.filtered)
+    .sort((a, b) => Math.abs(b.fill_adjusted_edge ?? b.edge ?? 0) - Math.abs(a.fill_adjusted_edge ?? a.edge ?? 0))
+    .slice(0, 3);
+
+  const regimeName = (regime.current || "normal").toString().toLowerCase();
+  const regimeKind = regimeName === "low" ? "blue" : regimeName === "high" ? "red" : "green";
+
+  const feedOrder = ["deribit", "polymarket", "kalshi"];
+  const orderedFeeds = feedOrder.map(name => [name, feeds[name] || {}]);
+
+  return (
+    <>
+      <div className="stat-grid">
+        <StatCell
+          label="UNREALIZED P&L"
+          value={fmtUsd(unrealized, { signed: true, digits: 2 })}
+          valueClass={pnlClass(unrealized)}
+        />
+        <StatCell
+          label="SETTLED P&L"
+          value={fmtUsd(settled, { signed: true, digits: 2 })}
+          valueClass={pnlClass(settled)}
+        />
+        <StatCell
+          label="WIN RATE"
+          value={winRate != null ? fmtPct(winRate, 0) : "—"}
+          sub={tradeCount != null ? `${tradeCount} trades` : null}
+          valueClass="bright"
+        />
+        <StatCell
+          label="EXPOSURE"
+          value={fmtUsd(exposure, { digits: 0 })}
+          sub={`of ${fmtUsd(maxExposure, { digits: 0 })}`}
+          valueClass={exposurePct > 0.8 ? "amber" : "bright"}
+        />
+      </div>
+
+      <div className="card">
+        <div className="card-header">
+          <div className="card-title">SYSTEM HEALTH</div>
+          <Pill kind={regimeKind}>{regimeName.toUpperCase()}</Pill>
+        </div>
+        {orderedFeeds.map(([name, f]) => {
+          const status = f.status || "unknown";
+          const dotKind = status === "ok" || status === "live" ? "live"
+                        : status === "stale" ? "stale"
+                        : status === "disconnected" || status === "error" ? "error"
+                        : "dim";
+          const pillKind = dotKind === "live" ? "green"
+                         : dotKind === "stale" ? "amber"
+                         : dotKind === "error" ? "red" : "dim";
+          const lat = f.latency_ms != null ? `${Math.round(f.latency_ms)}ms` : "—";
+          return (
+            <div className="feed-row" key={name}>
+              <span className={`dot dot-${dotKind}`} />
+              <span className="feed-name">{name}</span>
+              <span className="feed-latency">{lat}</span>
+              <Pill kind={pillKind}>{status.toUpperCase()}</Pill>
+            </div>
+          );
+        })}
+        <div className="divider" />
+        <div className="vol-grid">
+          <div className="vol-cell">
+            <div className="vol-label">SVI RMSE</div>
+            <div className={`vol-value ${(vol.svi_rmse ?? 1) < 0.005 ? "green" : "amber"}`}>
+              {vol.svi_rmse != null ? vol.svi_rmse.toFixed(4) : "—"}
+            </div>
+          </div>
+          <div className="vol-cell">
+            <div className="vol-label">SMILES</div>
+            <div className="vol-value bright">{vol.active_smiles ?? "—"}</div>
+          </div>
+          <div className="vol-cell">
+            <div className="vol-label">RHO</div>
+            <div className="vol-value purple">
+              {vol.rho != null ? vol.rho.toFixed(3) : "—"}
+            </div>
+          </div>
+          <div className="vol-cell">
+            <div className="vol-label">RV 1H / 24H</div>
+            <div className="vol-value bright">
+              {regime.rv_1h != null ? fmtPct(regime.rv_1h, 1) : "—"}
+              {" / "}
+              {regime.rv_24h != null ? fmtPct(regime.rv_24h, 1) : "—"}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-header">
+          <div className="card-title">TOP SIGNALS</div>
+          <Pill kind={actionable.length > 0 ? "blue" : "dim"}>
+            {actionable.length} ACTIONABLE
+          </Pill>
+        </div>
+        {topSignals.length === 0 ? (
+          <div className="empty-state">No actionable signals</div>
+        ) : topSignals.map((sig, i) => {
+          const theo = sig.edge ?? 0;
+          const fill = sig.fill_adjusted_edge ?? theo;
+          const side = (sig.side || "yes").toLowerCase();
+          const sideKind = side === "yes" ? "blue" : "red";
+          const sideText = side === "yes" ? "BUY YES" : "BUY NO";
+          return (
+            <div className="signal-row" key={sig.id || sig.name || i} style={{ cursor: "default" }}>
+              <div className="signal-top">
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div className="signal-name">{sig.name || sig.contract || "—"}</div>
+                  <div className="signal-meta">
+                    {(sig.platform || "").toUpperCase()}
+                    {sig.expiry ? ` · ${sig.expiry}` : ""}
+                  </div>
+                  <div className="signal-edges">
+                    <span className="edge-theo">{fmtPctSigned(theo, 2)}</span>
+                    <span className={`edge-fill ${pnlClass(fill)}`}>{fmtPctSigned(fill, 2)}</span>
+                  </div>
+                </div>
+                <Pill kind={sideKind}>{sideText}</Pill>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="card">
+        <div className="card-header">
+          <div className="card-title">OPEN POSITIONS</div>
+          <Pill kind="dim">{positions.length}</Pill>
+        </div>
+        {positions.length === 0 ? (
+          <div className="empty-state">No open positions</div>
+        ) : positions.slice(0, 5).map((p, i) => <PositionRow key={p.id || p.name || i} pos={p} />)}
+      </div>
+    </>
+  );
+}
+
+// ─── Tab: Signals ────────────────────────────────────────────────────────────
+function SignalRowFull({ sig }) {
+  const [expanded, setExpanded] = useState(false);
+  const theo = sig.edge ?? 0;
+  const fill = sig.fill_adjusted_edge ?? theo;
+  const filtered = !!sig.filtered;
+  const reasons = sig.rejection_reasons || sig.filter_reasons || [];
+  const side = (sig.side || "yes").toLowerCase();
+  const vel = (sig.velocity || sig.divergence_velocity || "").toString().toLowerCase();
+  const velNum = typeof sig.velocity === "number" ? sig.velocity : null;
+
+  let velLabel = "→ stbl", velCls = "dim";
+  if (vel.includes("conv") || (velNum != null && velNum < -0.0001)) {
+    velLabel = "↘ conv"; velCls = "red";
+  } else if (vel.includes("div") || (velNum != null && velNum > 0.0001)) {
+    velLabel = "↗ div"; velCls = "green";
+  }
+
+  const passKind = filtered ? "dim" : "green";
+  const passText = filtered ? "FILT" : "PASS";
+  const sideKind = side === "yes" ? "blue" : "red";
+  const sideText = side === "yes" ? "BUY YES" : "BUY NO";
+
+  const imp = sig.implied_prob ?? sig.imp_prob ?? sig.deribit_prob ?? null;
+  const pm  = sig.market_prob ?? sig.pm_prob ?? sig.poly_prob ?? null;
+  const conf = sig.confidence ?? sig.conf ?? null;
+  const stale = sig.staleness_ms ?? sig.stale_ms ?? null;
+
+  return (
+    <div
+      className={`signal-row ${filtered ? "filtered" : ""}`}
+      onClick={() => filtered && reasons.length > 0 ? setExpanded(!expanded) : null}
+    >
+      <div className="signal-top">
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div className="signal-name">{sig.name || sig.contract || "—"}</div>
+          <div className="signal-meta">
+            {(sig.platform || "").toUpperCase()}
+            {sig.expiry ? ` · ${sig.expiry}` : ""}
+            {stale != null ? ` · ${Math.round(stale)}ms` : ""}
+          </div>
+        </div>
+        <div className="signal-side" style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "flex-end" }}>
+          <Pill kind={passKind}>{passText}</Pill>
+          <Pill kind={sideKind}>{sideText}</Pill>
+        </div>
+      </div>
+      <div className="signal-metrics">
+        {imp != null && <span className="signal-metric">imp <span className="metric-val">{fmtPct(imp, 1)}</span></span>}
+        {pm != null && <span className="signal-metric">pm <span className="metric-val">{fmtPct(pm, 1)}</span></span>}
+        {conf != null && <span className="signal-metric">conf <span className="metric-val">{fmtPct(conf, 0)}</span></span>}
+        <span className={`signal-metric ${velCls}`}>{velLabel}</span>
+      </div>
+      <div className="signal-edges">
+        <span className="edge-theo">{fmtPctSigned(theo, 2)}</span>
+        <span className={`edge-fill ${pnlClass(fill)}`}>{fmtPctSigned(fill, 2)}</span>
+      </div>
+      {expanded && reasons.length > 0 && (
+        <ul className="signal-reasons">
+          {reasons.map((r, i) => <li key={i}>{r}</li>)}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function TabSignals({ snap }) {
+  const signals = snap?.signals || [];
+  const sorted = [...signals].sort((a, b) =>
+    Math.abs(b.fill_adjusted_edge ?? b.edge ?? 0) -
+    Math.abs(a.fill_adjusted_edge ?? a.edge ?? 0)
+  );
+
+  return (
+    <div className="card">
+      <div className="card-header">
+        <div className="card-title">ALL SIGNALS</div>
+        <Pill kind="dim">{signals.length} TRACKED</Pill>
+      </div>
+      {sorted.length === 0 ? (
+        <div className="empty-state">No signals yet</div>
+      ) : sorted.map((s, i) => <SignalRowFull key={s.id || s.name || i} sig={s} />)}
+    </div>
+  );
+}
+
+// ─── Position rows / Tab: Positions ──────────────────────────────────────────
+function PositionRow({ pos }) {
+  const pnl = pos.unrealized_pnl ?? pos.pnl ?? 0;
+  const entry = pos.entry_price ?? pos.entry ?? null;
+  const cur = pos.current_price ?? pos.mark_price ?? pos.mark ?? null;
+  const size = pos.size ?? pos.notional ?? null;
+  const cost = pos.cost ?? pos.entry_cost ?? (entry && size ? entry * size : null);
+  const pct = cost ? Math.max(-1, Math.min(1, pnl / Math.max(1, Math.abs(cost)))) : 0;
+  const barWidth = `${Math.min(100, Math.abs(pct) * 100)}%`;
+  const barColor = pnl >= 0 ? "var(--green)" : "var(--red)";
+
+  return (
+    <div className="pos-row">
+      <div className="pos-top">
+        <div className="pos-name">{pos.name || pos.contract || "—"}</div>
+        <div className={`pos-pnl ${pnlClass(pnl)}`}>{fmtUsd(pnl, { signed: true, digits: 2 })}</div>
+      </div>
+      <div className="pos-meta">
+        {(pos.platform || "").toUpperCase()}
+        {pos.side ? ` · ${pos.side.toUpperCase()}` : ""}
+        {entry != null ? ` · ${fmtPct(entry, 1)}` : ""}
+        {cur != null ? ` → ${fmtPct(cur, 1)}` : ""}
+        {size != null ? ` · ${fmtUsd(size, { digits: 0 })}` : ""}
+      </div>
+      <div className="pos-bar">
+        <div className="pos-bar-fill" style={{ width: barWidth, background: barColor }} />
+      </div>
+    </div>
+  );
+}
+
+function TabPositions({ snap }) {
+  const positions = snap?.positions || [];
+  const settlements = snap?.settlements || [];
+  const perf = snap?.performance || {};
+  const summary = snap?.positions_summary || {};
+
+  const settled = perf.settled_pnl ?? 0;
+  const winRate = perf.win_rate;
+  const ecr = perf.edge_capture_ratio ?? perf.edge_capture ?? null;
+
+  return (
+    <>
+      <div className="stat-grid">
+        <StatCell
+          label="SETTLED P&L"
+          value={fmtUsd(settled, { signed: true, digits: 2 })}
+          valueClass={pnlClass(settled)}
+        />
+        <StatCell
+          label="WIN RATE"
+          value={winRate != null ? fmtPct(winRate, 0) : "—"}
+          sub={perf.trade_count != null ? `${perf.trade_count} trades` : null}
+          valueClass="bright"
+        />
+        <StatCell
+          label="EDGE CAPTURE"
+          value={ecr != null ? fmtPct(ecr, 0) : "—"}
+          valueClass="bright"
+        />
+        <StatCell
+          label="OPEN"
+          value={positions.length}
+          sub={summary.total_exposure != null ? fmtUsd(summary.total_exposure, { digits: 0 }) : null}
+          valueClass="bright"
+        />
+      </div>
+
+      <div className="card">
+        <div className="card-header">
+          <div className="card-title">OPEN POSITIONS</div>
+          <Pill kind="dim">{positions.length}</Pill>
+        </div>
+        {positions.length === 0 ? (
+          <div className="empty-state">No open positions</div>
+        ) : positions.map((p, i) => <PositionRow key={p.id || p.name || i} pos={p} />)}
+      </div>
+
+      <div className="card">
+        <div className="card-header">
+          <div className="card-title">SETTLEMENT LOG</div>
+          <Pill kind="dim">{settlements.length}</Pill>
+        </div>
+        {settlements.length === 0 ? (
+          <div className="empty-state">No settlements yet</div>
+        ) : settlements.slice(0, 30).map((s, i) => {
+          const result = (s.result || s.outcome || "").toString().toLowerCase();
+          const kind = result === "win" ? "green" : result === "loss" ? "red" : "dim";
+          const pnl = s.pnl ?? s.realized_pnl ?? 0;
+          const ec = s.edge_captured ?? null;
+          const et = s.edge_theoretical ?? s.theoretical_edge ?? null;
+          return (
+            <div className="settle-row" key={s.id || i}>
+              <div className="settle-top">
+                <div className="settle-name">{s.name || s.contract || "—"}</div>
+                <div className="settle-badges">
+                  <Pill kind={kind}>{result.toUpperCase() || "—"}</Pill>
+                  <span className={`pos-pnl ${pnlClass(pnl)}`}>{fmtUsd(pnl, { signed: true, digits: 2 })}</span>
+                </div>
+              </div>
+              {(ec != null || et != null) && (
+                <div className="settle-meta">
+                  edge: {ec != null ? fmtPctSigned(ec, 2) : "—"}
+                  {et != null ? ` of ${fmtPctSigned(et, 2)}` : ""}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </>
+  );
+}
+
+// ─── Tab: Controls ───────────────────────────────────────────────────────────
+const SLIDERS = [
+  { key: "max_position_per_contract_usd", label: "MAX PER CONTRACT", min: 100,  max: 2000,  step: 50,   fmt: v => fmtUsd(v, { digits: 0 }) },
+  { key: "max_total_exposure_usd",        label: "MAX TOTAL EXPOSURE", min: 1000, max: 20000, step: 500,  fmt: v => fmtUsd(v, { digits: 0 }) },
+  { key: "min_edge",                       label: "MIN EDGE",           min: 0.01, max: 0.10,  step: 0.005, fmt: v => fmtPct(v, 1) },
+  { key: "min_confidence",                 label: "MIN CONFIDENCE",     min: 0.10, max: 0.80,  step: 0.05,  fmt: v => fmtPct(v, 0) },
+  { key: "max_open_positions",             label: "MAX OPEN POSITIONS", min: 5,    max: 50,    step: 1,     fmt: v => `${Math.round(v)}` },
+];
+
+const SLIDER_DEFAULTS = {
+  max_position_per_contract_usd: 500,
+  max_total_exposure_usd: 5000,
+  min_edge: 0.02,
+  min_confidence: 0.5,
+  max_open_positions: 10,
+};
+
+function TabControls({ snap, showToast }) {
+  const [tokenInput, setTokenInputState] = useState(getToken());
+  const [hasToken, setHasToken] = useState(!!getToken());
+  const [confirmLive, setConfirmLive] = useState(false);
+  const [confirmToken, setConfirmToken] = useState("");
+  const [sliderVals, setSliderVals] = useState(SLIDER_DEFAULTS);
+  const initialLoaded = useRef(false);
+  const debounceTimers = useRef({});
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/config")
+      .then(r => r.json())
+      .then(cfg => {
+        if (cancelled) return;
+        setSliderVals(prev => {
+          const next = { ...prev };
+          for (const s of SLIDERS) {
+            if (cfg[s.key] != null && !Number.isNaN(Number(cfg[s.key]))) {
+              next[s.key] = Number(cfg[s.key]);
+            }
+          }
+          return next;
+        });
+        initialLoaded.current = true;
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, []);
+
+  const status = snap?.agent_status;
+  const paused = status === "paused";
+  const dryRun = status === "dry_run";
+  const regime = snap?.volatility_regime || {};
+
+  const saveToken = () => {
+    setToken(tokenInput.trim());
+    setHasToken(!!tokenInput.trim());
+    showToast("Token saved", "success");
+  };
+  const clearToken = () => {
+    setToken("");
+    setTokenInputState("");
+    setHasToken(false);
+  };
+
+  const onSlider = (key, value) => {
+    setSliderVals(prev => ({ ...prev, [key]: value }));
+    if (debounceTimers.current[key]) clearTimeout(debounceTimers.current[key]);
+    debounceTimers.current[key] = setTimeout(() => {
+      apiCall("/api/risk-config", { [key]: value }, showToast);
+    }, 300);
+  };
+
+  const togglePause = () => {
+    apiCall(paused ? "/api/resume" : "/api/pause", {}, showToast);
+  };
+
+  const requestModeSwitch = () => {
+    if (dryRun) {
+      setConfirmLive(true);
+    } else {
+      apiCall("/api/mode", { live: false, confirmation_token: "" }, showToast);
+    }
+  };
+
+  const confirmModeLive = async () => {
+    const result = await apiCall("/api/mode", {
+      live: true,
+      confirmation_token: confirmToken,
+    }, showToast);
+    if (result) {
+      setConfirmLive(false);
+      setConfirmToken("");
+    }
+  };
+
+  if (!hasToken) {
+    return (
+      <div className="card">
+        <div className="card-header">
+          <div className="card-title">DASHBOARD AUTH</div>
+        </div>
+        <p className="dim" style={{ marginBottom: 10, fontSize: 11 }}>
+          Enter the bearer token to enable agent controls. Stored locally in this browser only.
+        </p>
+        <input
+          type="password"
+          className="token-input"
+          placeholder="Bearer token"
+          value={tokenInput}
+          onChange={(e) => setTokenInputState(e.target.value)}
+        />
+        <button className="big-btn big-btn-outline" onClick={saveToken} disabled={!tokenInput.trim()}>
+          Save Token
+        </button>
+      </div>
+    );
+  }
+
+  const regimeName = (regime.current || "normal").toString().toLowerCase();
+  const regimeKind = regimeName === "low" ? "blue" : regimeName === "high" ? "red" : "green";
+  const mult = regime.multiplier ?? regime.edge_multiplier ?? null;
+
+  return (
+    <>
+      <div className="card">
+        <div className="card-header">
+          <div className="card-title">AGENT CONTROL</div>
+        </div>
+        {confirmLive ? (
+          <>
+            <div className="confirm-warn">
+              ⚠ Switching to LIVE mode will execute real trades with real funds.
+              Enter the live-mode confirmation token to proceed.
+            </div>
+            <input
+              type="password"
+              className="token-input"
+              placeholder="Confirmation token"
+              value={confirmToken}
+              onChange={(e) => setConfirmToken(e.target.value)}
+            />
+            <div className="confirm-actions">
+              <button className="big-btn big-btn-red" onClick={confirmModeLive} disabled={!confirmToken}>
+                Confirm Live
+              </button>
+              <button
+                className="big-btn big-btn-outline"
+                onClick={() => { setConfirmLive(false); setConfirmToken(""); }}
+              >
+                Cancel
+              </button>
+            </div>
+          </>
+        ) : (
+          <>
+            <button
+              className={`big-btn ${paused ? "big-btn-green" : "big-btn-red"}`}
+              onClick={togglePause}
+            >
+              {paused ? "▶ RESUME AGENT" : "⏸ PAUSE AGENT"}
+            </button>
+            <button className="big-btn big-btn-outline" onClick={requestModeSwitch}>
+              MODE: {dryRun ? "DRY RUN" : "LIVE"}
+            </button>
+          </>
+        )}
+      </div>
+
+      <div className="card">
+        <div className="card-header">
+          <div className="card-title">RISK LIMITS</div>
+        </div>
+        {SLIDERS.map(s => (
+          <div className="slider-row" key={s.key}>
+            <div className="slider-head">
+              <span className="slider-label">{s.label}</span>
+              <span className="slider-value">{s.fmt(sliderVals[s.key])}</span>
+            </div>
+            <input
+              type="range"
+              min={s.min}
+              max={s.max}
+              step={s.step}
+              value={sliderVals[s.key]}
+              onChange={(e) => onSlider(s.key, Number(e.target.value))}
+            />
+          </div>
+        ))}
+      </div>
+
+      <div className="card">
+        <div className="card-header">
+          <div className="card-title">VOLATILITY REGIME</div>
+          <Pill kind={regimeKind}>{regimeName.toUpperCase()}</Pill>
+        </div>
+        <div className="vol-grid">
+          <div className="vol-cell">
+            <div className="vol-label">RV 1H</div>
+            <div className="vol-value bright">
+              {regime.rv_1h != null ? fmtPct(regime.rv_1h, 1) : "—"}
+            </div>
+          </div>
+          <div className="vol-cell">
+            <div className="vol-label">RV 24H</div>
+            <div className="vol-value bright">
+              {regime.rv_24h != null ? fmtPct(regime.rv_24h, 1) : "—"}
+            </div>
+          </div>
+          <div className="vol-cell">
+            <div className="vol-label">EFFECTIVE MIN EDGE</div>
+            <div className="vol-value bright">
+              {regime.effective_min_edge != null ? fmtPct(regime.effective_min_edge, 1) : "—"}
+            </div>
+          </div>
+          <div className="vol-cell">
+            <div className="vol-label">MULTIPLIER</div>
+            <div className="vol-value purple">
+              {mult != null ? `${Number(mult).toFixed(1)}×` : "—"}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-header">
+          <div className="card-title">SESSION</div>
+        </div>
+        <button className="big-btn big-btn-outline" onClick={clearToken}>
+          Clear Saved Token
+        </button>
+      </div>
+    </>
+  );
+}
+
+// ─── App ─────────────────────────────────────────────────────────────────────
+function App() {
+  const [tab, setTab] = useState("overview");
+  const { snap, conn, lastTick } = useSnapshot();
+  const { toast, showToast } = useToasts();
+
+  const stale = lastTick > 0 && (Date.now() - lastTick > 5000);
+  const showStaleBanner = conn !== "connected" || stale;
+  const secondsAgo = lastTick > 0 ? Math.floor((Date.now() - lastTick) / 1000) : null;
+
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setTick(x => x + 1), 1000);
+    return () => clearInterval(t);
+  }, []);
+
+  return (
+    <div className="app">
+      <Header snap={snap} conn={conn} lastTick={lastTick} />
+      {showStaleBanner && (
+        <div className="stale-banner">
+          {conn === "reconnecting" ? "RECONNECTING…" : conn === "error" ? "CONNECTION ERROR" : "STALE DATA"}
+          {secondsAgo != null ? ` · last update ${secondsAgo}s ago` : ""}
+        </div>
+      )}
+      <div key={tab} className="tab-content">
+        {tab === "overview"  && <TabOverview snap={snap} />}
+        {tab === "signals"   && <TabSignals snap={snap} />}
+        {tab === "positions" && <TabPositions snap={snap} />}
+        {tab === "controls"  && <TabControls snap={snap} showToast={showToast} />}
+      </div>
+
+      <nav className="tabbar">
+        {[
+          ["overview",  "Overview"],
+          ["signals",   "Signals"],
+          ["positions", "Positions"],
+          ["controls",  "Controls"],
+        ].map(([id, label]) => (
+          <button
+            key={id}
+            className={`tab-btn ${tab === id ? "active" : ""}`}
+            onClick={() => setTab(id)}
+          >
+            {label}
+          </button>
+        ))}
+      </nav>
+
+      {toast && (
+        <div className={`toast toast-${toast.kind}`}>{toast.text}</div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
