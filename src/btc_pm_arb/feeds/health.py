@@ -62,8 +62,14 @@ class FeedHealthTracker:
         return self.staleness_s(source) > max_age_s
 
     def all_staleness_ms(self) -> dict[str, float]:
-        """Return staleness for all feeds as a JSON-serializable dict."""
-        return {str(src): self.staleness_ms(src) for src in DataSource}
+        """Return staleness for all feeds as a JSON-serializable dict.
+
+        Keys are the lowercase enum *values* (``"deribit"``, ``"polymarket"``,
+        ``"kalshi"``) — NOT ``str(member)``, which on a ``(str, Enum)`` mixin
+        produces the verbose ``"DataSource.DERIBIT"`` form on Python 3.11+ and
+        causes the dashboard's ``feeds["deribit"]`` lookup to miss.
+        """
+        return {src.value: self.staleness_ms(src) for src in DataSource}
 
     def summary(self) -> dict[str, float]:
         return self.all_staleness_ms()
