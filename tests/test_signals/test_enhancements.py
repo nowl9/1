@@ -144,8 +144,12 @@ def test_feed_health_is_stale():
 def test_feed_health_all_staleness_keys():
     h = FeedHealthTracker()
     summary = h.all_staleness_ms()
+    # Keys are the lowercase enum *values* ("deribit", "polymarket", "kalshi"),
+    # not str(member) — see FeedHealthTracker.all_staleness_ms docstring for
+    # why (dashboard JS does feeds["deribit"] lookups, not the verbose
+    # "DataSource.DERIBIT" form that str() produces on a (str, Enum) mixin).
     for src in DataSource:
-        assert str(src) in summary
+        assert src.value in summary
 
 
 # ══════════════════════════════════════════════════════════════════════════════
