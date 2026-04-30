@@ -133,11 +133,29 @@ class DeribitFeed:
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._rpc_id = 0
         self._pending_rpcs: dict[int, asyncio.Future[Any]] = {}
+        # Companion to _pending_rpcs: maps the same rpc_id to its method
+        # name, so RPC-response dispatch logs can name the original method
+        # (responses don't carry method info themselves).
+        self._pending_rpc_methods: dict[int, str] = {}
         # Cache of parsed instrument metadata to avoid re-parsing on every tick
         self._instrument_cache: dict[str, tuple[float, datetime, OptionType]] = {}
         # Strong references to short-lived background tasks (heartbeat replies)
         # so the runtime cannot GC them mid-flight.  Tasks self-discard on done.
         self._background_tasks: set[asyncio.Task[Any]] = set()
+        # Ids of public/test calls we issued as heartbeat replies (sent
+        # directly via _ws.send, NOT through _rpc).  Deribit acks these
+        # with a normal JSON-RPC response — tracked here so the dispatch
+        # log can distinguish "expected heartbeat ack" from "real
+        # unmatched response" (the latter being a true diagnostic signal).
+        self._heartbeat_reply_ids: set[int] = set()
+        # ── Diagnostic counters (instrumentation; no behavioural effect) ─────
+        # Reset on each successful connect (in _connect_and_run).
+        self._frames_processed: int = 0
+        self._rpc_responses_dispatched: int = 0
+        self._rpc_responses_unmatched: int = 0
+        self._rpc_responses_late: int = 0
+        self._heartbeats_received: int = 0
+        self._loop_alive_log_ts: float = 0.0
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -197,6 +215,16 @@ class DeribitFeed:
         ) as ws:
             self._ws = ws
             self._pending_rpcs.clear()
+            self._pending_rpc_methods.clear()
+            self._heartbeat_reply_ids.clear()
+            # Reset diagnostic counters so each connect-cycle's logs are
+            # independently interpretable.
+            self._frames_processed = 0
+            self._rpc_responses_dispatched = 0
+            self._rpc_responses_unmatched = 0
+            self._rpc_responses_late = 0
+            self._heartbeats_received = 0
+            self._loop_alive_log_ts = 0.0
             logger.info("deribit_connected")
 
             # The message loop must be running BEFORE we issue any RPC so that
@@ -227,17 +255,51 @@ class DeribitFeed:
         rpc_id = self._next_id()
         fut: asyncio.Future[Any] = asyncio.get_event_loop().create_future()
         self._pending_rpcs[rpc_id] = fut
+        self._pending_rpc_methods[rpc_id] = method
         payload = json.dumps({
             "jsonrpc": "2.0",
             "id": rpc_id,
             "method": method,
             "params": params,
         })
+        t_send = time.monotonic()
+        logger.info(
+            "deribit_rpc_sent",
+            rpc_id=rpc_id,
+            rpc_id_type=type(rpc_id).__name__,
+            method=method,
+        )
         await self._ws.send(payload)
         try:
-            return await asyncio.wait_for(fut, timeout=30.0)
+            result = await asyncio.wait_for(fut, timeout=30.0)
+            elapsed_ms = round((time.monotonic() - t_send) * 1000, 1)
+            logger.info(
+                "deribit_rpc_completed",
+                rpc_id=rpc_id,
+                method=method,
+                elapsed_ms=elapsed_ms,
+            )
+            return result
         except asyncio.TimeoutError:
+            elapsed_ms = round((time.monotonic() - t_send) * 1000, 1)
             self._pending_rpcs.pop(rpc_id, None)
+            self._pending_rpc_methods.pop(rpc_id, None)
+            # Snapshot the message-loop state at the moment of timeout so
+            # we can tell whether the response was missed (loop alive but
+            # not dispatching) or the loop is hung (no frames processed).
+            logger.warning(
+                "deribit_rpc_timeout_diagnostic",
+                rpc_id=rpc_id,
+                rpc_id_type=type(rpc_id).__name__,
+                method=method,
+                elapsed_ms=elapsed_ms,
+                pending_keys_at_timeout=sorted(self._pending_rpcs.keys()),
+                frames_processed=self._frames_processed,
+                rpc_responses_dispatched=self._rpc_responses_dispatched,
+                rpc_responses_unmatched=self._rpc_responses_unmatched,
+                rpc_responses_late=self._rpc_responses_late,
+                heartbeats_received=self._heartbeats_received,
+            )
             raise TimeoutError(f"RPC {method} timed out after 30 s")
 
     # ── Internal: instrument discovery ───────────────────────────────────────
@@ -283,30 +345,104 @@ class DeribitFeed:
 
     async def _message_loop(self) -> None:
         assert self._ws is not None
-        async for raw in self._ws:
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                logger.warning("deribit_invalid_json", raw=raw[:200])
-                continue
-            await self._handle_message(msg)
-            # Force a single trip through the event loop after each frame.
-            # The ticker dispatch path inside _handle_message has no inner
-            # awaits, and asyncio.Queue.get() inside ws.recv() returns
-            # synchronously when the recv buffer is non-empty — so under
-            # sustained ticker load (~9000 msg/s for 912 instruments at
-            # 100 ms cadence) this loop becomes a tight CPU loop with no
-            # suspension points, starving wait_for resume callbacks for
-            # outer RPCs (set_heartbeat, public/test).  Yielding here gives
-            # those callbacks a chance to run between every frame.
-            await asyncio.sleep(0)
+        loop_started = time.monotonic()
+        try:
+            async for raw in self._ws:
+                try:
+                    msg = json.loads(raw)
+                except json.JSONDecodeError:
+                    logger.warning("deribit_invalid_json", raw=raw[:200])
+                    continue
+                await self._handle_message(msg)
+                self._frames_processed += 1
+                # Periodic liveness log — fires only when the loop is
+                # actually iterating frames.  If RPC timeouts occur and the
+                # last `deribit_message_loop_alive` was >5 s ago, the loop
+                # is hung; if these logs are still firing through a timeout,
+                # the loop is alive and the bug is elsewhere.
+                now = time.monotonic()
+                if now - self._loop_alive_log_ts >= 5.0:
+                    logger.info(
+                        "deribit_message_loop_alive",
+                        frames=self._frames_processed,
+                        rpc_responses_dispatched=self._rpc_responses_dispatched,
+                        rpc_responses_unmatched=self._rpc_responses_unmatched,
+                        heartbeats_received=self._heartbeats_received,
+                        pending_rpcs=sorted(self._pending_rpcs.keys()),
+                        seconds_since_connect=round(now - loop_started, 2),
+                    )
+                    self._loop_alive_log_ts = now
+                # Force a single trip through the event loop after each frame.
+                # See diagnostic round 5 — kept while we instrument; may be
+                # revisited once we understand why prior fixes didn't help.
+                await asyncio.sleep(0)
+            logger.info(
+                "deribit_message_loop_exit",
+                reason="async_for_returned",
+                frames=self._frames_processed,
+                seconds_since_connect=round(time.monotonic() - loop_started, 2),
+            )
+        except Exception as exc:
+            logger.warning(
+                "deribit_message_loop_exit",
+                reason="exception",
+                error_type=type(exc).__name__,
+                error=str(exc),
+                frames=self._frames_processed,
+                seconds_since_connect=round(time.monotonic() - loop_started, 2),
+            )
+            raise
 
     async def _handle_message(self, msg: dict[str, Any]) -> None:
         # JSON-RPC response to one of our requests
         if "id" in msg:
-            rpc_id: int = msg["id"]
+            rpc_id = msg["id"]
+            # First: is this the server's ack of one of our heartbeat
+            # replies (sent fire-and-forget via _respond_to_heartbeat)?
+            # Those are expected and carry no diagnostic value.
+            if isinstance(rpc_id, int) and rpc_id in self._heartbeat_reply_ids:
+                self._heartbeat_reply_ids.discard(rpc_id)
+                logger.debug("deribit_heartbeat_reply_ack", response_id=rpc_id)
+                return
+            sent_method = self._pending_rpc_methods.pop(rpc_id, None)
             fut = self._pending_rpcs.pop(rpc_id, None)
-            if fut and not fut.done():
+            if fut is None:
+                # Response arrived for an id we are not tracking.  Either
+                # an id-type mismatch (int vs str), a duplicate id, or a
+                # stale response from a prior connection.  Diagnostic dump
+                # logs the response id's runtime type and our pending keys.
+                self._rpc_responses_unmatched += 1
+                logger.warning(
+                    "deribit_rpc_response_unmatched",
+                    response_id=rpc_id,
+                    response_id_type=type(rpc_id).__name__,
+                    pending_keys=sorted(
+                        self._pending_rpcs.keys(),
+                        key=lambda k: (isinstance(k, str), k),
+                    ),
+                    pending_key_types=sorted(
+                        {type(k).__name__ for k in self._pending_rpcs.keys()}
+                    ),
+                    has_error="error" in msg,
+                )
+            elif fut.done():
+                # Response arrived after the awaiting task had already
+                # given up (timeout/cancel).  Logged so we can correlate.
+                self._rpc_responses_late += 1
+                logger.warning(
+                    "deribit_rpc_response_late",
+                    response_id=rpc_id,
+                    method=sent_method,
+                    has_error="error" in msg,
+                )
+            else:
+                self._rpc_responses_dispatched += 1
+                logger.info(
+                    "deribit_rpc_response_dispatched",
+                    response_id=rpc_id,
+                    method=sent_method,
+                    has_error="error" in msg,
+                )
                 if "error" in msg:
                     err = msg["error"]
                     fut.set_exception(
@@ -333,6 +469,13 @@ class DeribitFeed:
             # dispatching RPC responses) while our reply is in flight on
             # the wire.  Stash the task so it can't be GC'd mid-send;
             # auto-discard on completion — no further lifecycle management.
+            self._heartbeats_received += 1
+            params = msg.get("params", {}) or {}
+            logger.info(
+                "deribit_heartbeat_received",
+                hb_type=params.get("type", "?"),
+                count=self._heartbeats_received,
+            )
             task = asyncio.create_task(self._respond_to_heartbeat())
             self._background_tasks.add(task)
             task.add_done_callback(self._background_tasks.discard)
@@ -435,6 +578,10 @@ class DeribitFeed:
             return
         try:
             rpc_id = self._next_id()
+            # Register the id so _handle_message can recognise the
+            # incoming server ack as expected heartbeat-reply traffic
+            # rather than logging it as a true unmatched response.
+            self._heartbeat_reply_ids.add(rpc_id)
             payload = json.dumps({
                 "jsonrpc": "2.0",
                 "id": rpc_id,
@@ -443,4 +590,5 @@ class DeribitFeed:
             })
             await self._ws.send(payload)
         except Exception as exc:
+            self._heartbeat_reply_ids.discard(rpc_id)
             logger.warning("deribit_heartbeat_respond_failed", error=str(exc))
