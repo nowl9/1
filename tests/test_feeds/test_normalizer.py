@@ -100,20 +100,21 @@ class TestNormalizePolymarketTick:
 
 class TestNormalizeKalshiTick:
     def _base_raw(self, **overrides: object) -> dict:
+        # Post March-2026 migration: dollar-string fields, not integer cents.
         raw = {
             "ticker": "KXBTC-24DEC31-B100000",
             "title": "Will BTC be above $100,000 on Dec 31?",
             "subtitle": "BTC above $100,000",
-            "yes_bid": 62,
-            "yes_ask": 65,
-            "no_bid": 35,
-            "no_ask": 38,
+            "yes_bid_dollars": "0.62",
+            "yes_ask_dollars": "0.65",
+            "no_bid_dollars": "0.35",
+            "no_ask_dollars": "0.38",
             "close_time": "2024-12-31T23:59:00Z",
         }
         raw.update(overrides)
         return raw
 
-    def test_cents_converted_to_float(self) -> None:
+    def test_dollar_strings_parsed_to_float(self) -> None:
         tick = normalize_kalshi_tick(self._base_raw())
         assert tick.yes_bid == pytest.approx(0.62)
         assert tick.yes_ask == pytest.approx(0.65)
@@ -141,11 +142,11 @@ class TestNormalizeKalshiTick:
 
     def test_fallback_to_last_price_when_no_bid_ask(self) -> None:
         raw = self._base_raw()
-        del raw["yes_bid"]
-        del raw["yes_ask"]
-        del raw["no_bid"]
-        del raw["no_ask"]
-        raw["last_price"] = 55
+        del raw["yes_bid_dollars"]
+        del raw["yes_ask_dollars"]
+        del raw["no_bid_dollars"]
+        del raw["no_ask_dollars"]
+        raw["last_price_dollars"] = "0.55"
         tick = normalize_kalshi_tick(raw)
         assert tick.yes_bid == pytest.approx(0.55)
         assert tick.yes_ask == pytest.approx(0.55)
@@ -159,14 +160,15 @@ class TestNormalizeKalshiTick:
 
 class TestPmTickToProbabilityQuote:
     def _kalshi_tick(self) -> object:
+        # Post March-2026 migration: dollar-string fields, not integer cents.
         raw = {
             "ticker": "KXBTC-24DEC31-B100000",
             "title": "BTC above $100,000?",
             "subtitle": "BTC above $100,000",
-            "yes_bid": 62,
-            "yes_ask": 65,
-            "no_bid": 35,
-            "no_ask": 38,
+            "yes_bid_dollars": "0.62",
+            "yes_ask_dollars": "0.65",
+            "no_bid_dollars": "0.35",
+            "no_ask_dollars": "0.38",
             "close_time": "2024-12-31T23:59:00Z",
         }
         return normalize_kalshi_tick(raw)

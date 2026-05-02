@@ -1,9 +1,13 @@
-"""Tests for KalshiFeed — currently scoped to the URL-construction regression
-caught in round 6 verification.
+"""Tests for KalshiFeed.
 
-Broader unit-test coverage of orderbook parsing and tick conversion is
-deferred to a future round once we've seen real Kalshi /orderbook responses
-to ground the fixtures."""
+Coverage:
+* URL-construction regression (round 6 verification).
+* Dollar-string round-trip regression (Round 7c step 1.5):
+  TestBuildTickDollarRoundTrip exercises the post-March-2026 wire
+  format end-to-end through ``_build_tick`` → ``normalize_kalshi_tick``,
+  catching the silent zero-ticks failure mode observed against
+  api.elections.kalshi.com prod.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +16,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from btc_pm_arb.feeds.kalshi import KalshiFeed
+from btc_pm_arb.feeds.kalshi import KalshiFeed, _build_tick
 
 
 @pytest.mark.asyncio
@@ -53,3 +57,56 @@ async def test_request_paths_do_not_double_trade_api_prefix() -> None:
             f"path {path!r} starts with /trade-api/v2 — base_url already ends "
             f"in that prefix; this would produce a doubled-prefix 404 at runtime."
         )
+
+
+class TestBuildTickDollarRoundTrip:
+    """Regression for the March 2026 dollar-string migration.
+
+    Before this test existed, KalshiFeed silently emitted zero ticks for
+    5+ minutes against api.elections.kalshi.com because _poll_loop read
+    "orderbook" (gone) instead of "orderbook_fp", and _build_tick parsed
+    [price_cents, qty] (gone) instead of [price_dollars_str, qty_str].
+    """
+
+    def test_orderbook_fp_yes_dollars_round_trip(self) -> None:
+        # Mirror the wire format observed against /orderbook on prod.
+        book_fp = {
+            "yes_dollars": [["0.6100", "50.00"], ["0.6200", "100.00"]],
+            "no_dollars": [["0.3500", "200.00"], ["0.3400", "75.00"]],
+        }
+        meta = {
+            "title": "Will BTC be above $100,000 on Dec 31?",
+            "subtitle": "BTC above $100,000",
+            "close_time": "2026-12-31T23:59:00Z",
+        }
+        tick = _build_tick("KXBTC-26DEC31-B100000", meta, book_fp)
+        assert tick is not None
+        assert tick.yes_bid == pytest.approx(0.62)   # max yes_dollars price
+        assert tick.no_bid == pytest.approx(0.35)    # max no_dollars price
+        assert tick.yes_ask == pytest.approx(0.65)   # 1 - max(no) = 1 - 0.35
+        assert tick.no_ask == pytest.approx(0.38)    # 1 - max(yes) = 1 - 0.62
+        assert tick.strike == 100_000.0
+        assert tick.contract_id == "KXBTC-26DEC31-B100000"
+
+    def test_one_sided_orderbook_emits_complementary_pair(self) -> None:
+        """Real prod observation: many Kalshi BTC contracts have one-sided books.
+
+        Probe of prod /orderbook for KXBTC-26MAY0203-T86299.99 returned
+        yes_dollars=[] and no_dollars populated. _build_tick must still emit
+        a tick — yes_ask is derivable from no_bid via complementary pricing.
+        """
+        book_fp = {
+            "yes_dollars": [],
+            "no_dollars": [["0.0100", "33383.00"], ["0.9900", "16456.00"]],
+        }
+        meta = {
+            "title": "Will BTC be above $86,300 on May 2?",
+            "subtitle": "BTC above $86,300",
+            "close_time": "2026-05-02T16:00:00Z",
+        }
+        tick = _build_tick("KXBTC-26MAY0203-T86299.99", meta, book_fp)
+        assert tick is not None
+        assert tick.yes_bid is None              # no yes-side bids
+        assert tick.no_bid == pytest.approx(0.99)  # max no_dollars price
+        assert tick.yes_ask == pytest.approx(0.01)  # 1 - max(no) = 0.01
+        assert tick.no_ask is None                # no yes-side bid → can't derive

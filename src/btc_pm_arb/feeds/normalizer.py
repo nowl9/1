@@ -106,23 +106,29 @@ def normalize_polymarket_tick(raw: dict) -> PredictionMarketTick:
 def normalize_kalshi_tick(raw: dict) -> PredictionMarketTick:
     """Normalize a raw Kalshi market snapshot.
 
-    Kalshi prices are in cents (1–99 integer) → convert to [0, 1].
+    Post March-2026 migration, Kalshi prices are fixed-point dollar
+    strings in [0, 1] (e.g. ``"0.6200"`` = 62¢).  ``_build_tick``
+    pre-aggregates these into floats; this function accepts either
+    floats or string-encoded floats via the ``_dollar_to_prob`` helper.
     """
-    def cents_to_prob(v: int | float | None) -> float | None:
+    def _dollar_to_prob(v: object) -> float | None:
         if v is None:
             return None
-        return round(float(v) / 100.0, 4)
+        try:
+            return round(float(v), 4)
+        except (ValueError, TypeError):
+            return None
 
-    yes_bid = cents_to_prob(raw.get("yes_bid"))
-    yes_ask = cents_to_prob(raw.get("yes_ask"))
-    no_bid = cents_to_prob(raw.get("no_bid"))
-    no_ask = cents_to_prob(raw.get("no_ask"))
+    yes_bid = _dollar_to_prob(raw.get("yes_bid_dollars"))
+    yes_ask = _dollar_to_prob(raw.get("yes_ask_dollars"))
+    no_bid = _dollar_to_prob(raw.get("no_bid_dollars"))
+    no_ask = _dollar_to_prob(raw.get("no_ask_dollars"))
 
     # If only last_price available use it as mid
     if yes_bid is None and yes_ask is None:
-        last = raw.get("last_price")
+        last = raw.get("last_price_dollars")
         if last is not None:
-            mid = cents_to_prob(last)
+            mid = _dollar_to_prob(last)
             yes_bid = yes_ask = mid
             no_bid = no_ask = round(1 - mid, 4) if mid is not None else None
 

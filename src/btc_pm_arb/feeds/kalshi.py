@@ -34,15 +34,25 @@ Architecture
 
 Kalshi orderbook semantics
 --------------------------
-The orderbook response contains *bid* levels for each side
-(``yes`` and ``no``); asks are derived from the opposite side's bid::
+The orderbook response wrapper key is ``orderbook_fp`` (was
+``orderbook`` pre-March-2026; renamed as part of Kalshi's fixed-point
+dollar-string migration).  The inner dict contains *bid* levels for
+each side (``yes_dollars`` and ``no_dollars``, was ``yes`` / ``no``);
+asks are derived from the opposite side's bid::
 
-    yes_ask_cents = 100 - max(no_bid_levels)
-    no_ask_cents  = 100 - max(yes_bid_levels)
+    yes_ask = 1.0 - max(no_bid_levels_as_floats)
+    no_ask  = 1.0 - max(yes_bid_levels_as_floats)
+
+Each level is a 2-tuple ``[price_dollars_str, qty_str]``.  The price
+is a fixed-point dollar string in [0, 1] (e.g. ``"0.6200"`` = 62¢);
+both tuple elements need ``float()`` casting.  Pre-migration these
+were integer cents in [1, 99] — silently emitting zero ticks if the
+old shape is assumed (caught via the Round 7c pre-task observation).
 
 This is Kalshi's complementary-pair pricing — buying YES is identical
 to selling NO at (1 - price).  See the orderbook → tick conversion in
-:func:`_build_tick`.
+:func:`_build_tick`.  Round-trip regression covered by
+``tests/test_feeds/test_kalshi.py::TestBuildTickDollarRoundTrip``.
 """
 
 from __future__ import annotations
@@ -302,7 +312,12 @@ class KalshiFeed:
                         error_type=type(exc).__name__,
                     )
                     continue
-                book = book_body.get("orderbook") or {}
+                # Wrapper key renamed from "orderbook" to "orderbook_fp"
+                # in Kalshi's March 2026 fixed-point dollar-string migration.
+                # The old key is gone — no dual-shape fallback (deliberate;
+                # see module docstring).  Inner shape uses *_dollars keys
+                # parsed by _build_tick.
+                book = book_body.get("orderbook_fp") or {}
                 tick = _build_tick(ticker, meta, book)
                 if tick is None:
                     continue
@@ -334,29 +349,35 @@ class KalshiFeed:
 def _build_tick(ticker: str, meta: dict, book: dict) -> PredictionMarketTick | None:
     """Combine cached market metadata with a fresh orderbook into a tick.
 
-    Kalshi orderbook semantics: each side has *bid* levels only.  Asks are
-    derived from the opposite side (yes_ask = 100 - best_no_bid).  Returns
-    None if the orderbook has no bids on either side (no quotes available).
+    Kalshi orderbook semantics (post-March-2026 fixed-point migration):
+    each side has *bid* levels only under ``yes_dollars`` and
+    ``no_dollars`` keys; asks are derived from the opposite side
+    (``yes_ask = 1.0 - best_no_bid``).  Returns ``None`` if the
+    orderbook has no bids on either side (no quotes available).
     """
-    yes_levels = book.get("yes") or []
-    no_levels = book.get("no") or []
+    yes_levels = book.get("yes_dollars") or []
+    no_levels = book.get("no_dollars") or []
 
-    # Each level is [price_cents, quantity].  We want the highest bid on
-    # each side (best price the market is offering to pay).
-    def _best_bid_cents(levels: list) -> int | None:
+    # Each level is [price_dollars_str, qty_str] — both string-encoded
+    # fixed-point floats in Kalshi's wire format.  We want the highest
+    # bid on each side (best price the market is offering to pay), as
+    # a float in [0, 1].
+    def _best_bid_dollars(levels: list) -> float | None:
         if not levels:
             return None
         try:
-            return max(int(p) for p, _ in levels)
+            return max(float(p) for p, _ in levels)
         except (TypeError, ValueError):
             return None
 
-    yes_best_bid = _best_bid_cents(yes_levels)
-    no_best_bid = _best_bid_cents(no_levels)
+    yes_best_bid = _best_bid_dollars(yes_levels)
+    no_best_bid = _best_bid_dollars(no_levels)
 
-    # Complementary-pair derivation: ask comes from the opposite side's bid.
-    yes_best_ask = (100 - no_best_bid) if no_best_bid is not None else None
-    no_best_ask = (100 - yes_best_bid) if yes_best_bid is not None else None
+    # Complementary-pair derivation: ask comes from the opposite side's
+    # bid.  Round to 4 decimals to match the precision convention in
+    # normalize_kalshi_tick / _dollar_to_prob.
+    yes_best_ask = round(1.0 - no_best_bid, 4) if no_best_bid is not None else None
+    no_best_ask = round(1.0 - yes_best_bid, 4) if yes_best_bid is not None else None
 
     if yes_best_bid is None and yes_best_ask is None:
         # No quotes at all — nothing to emit.
@@ -366,10 +387,10 @@ def _build_tick(ticker: str, meta: dict, book: dict) -> PredictionMarketTick | N
         "ticker": ticker,
         "title": meta.get("title", "") or "",
         "subtitle": meta.get("subtitle", "") or "",
-        "yes_bid": yes_best_bid,
-        "yes_ask": yes_best_ask,
-        "no_bid": no_best_bid,
-        "no_ask": no_best_ask,
+        "yes_bid_dollars": yes_best_bid,
+        "yes_ask_dollars": yes_best_ask,
+        "no_bid_dollars": no_best_bid,
+        "no_ask_dollars": no_best_ask,
         "close_time": meta.get("close_time"),
     }
     return normalize_kalshi_tick(raw)
