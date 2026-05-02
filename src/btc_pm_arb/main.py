@@ -144,6 +144,12 @@ class Agent:
         # drains this buffer is queued as a future round; bounded deque
         # prevents unbounded growth in the meantime.
         self._pending_pm_ticks: deque[PredictionMarketTick] = deque(maxlen=10_000)
+        # First-observed PM tick per source — gates the diagnostic log in
+        # ``ingest_pm_tick`` so we get exactly ONE shape sample per source
+        # per process.  Used to verify upstream tick quality (Kalshi cents
+        # field migration, Polymarket _build_tick output) without flooding
+        # logs.
+        self._first_tick_logged: set[DataSource] = set()
 
     def ingest_tick(self, tick: OptionTick) -> None:
         self._pending_ticks.append(tick)
@@ -175,7 +181,21 @@ class Agent:
         matcher → edge → filter → confidence → orders pipeline that
         drains the buffer is wired up in a future round.  ``ContractMatcher``
         is constructed in ``Agent.__init__`` but not yet invoked anywhere.
+
+        The first tick observed per source is logged at INFO under
+        ``pm_tick.first_observed`` with the full pydantic dump — a
+        permanent diagnostic for upstream tick-shape regressions
+        (Kalshi cents-field migration, Polymarket _build_tick output).
+        Gated by ``_first_tick_logged`` so it fires exactly once per
+        source per process.
         """
+        if tick.source not in self._first_tick_logged:
+            self._first_tick_logged.add(tick.source)
+            log.info(
+                "pm_tick.first_observed",
+                source=tick.source.value,
+                tick=tick.model_dump(mode="json"),
+            )
         self._pending_pm_ticks.append(tick)
 
     def flush_pm_ticks(self) -> list[PredictionMarketTick]:
