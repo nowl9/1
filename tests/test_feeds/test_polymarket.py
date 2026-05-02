@@ -145,3 +145,16 @@ class TestIsBtcBinaryThreshold:
     def test_closed_market_rejected(self) -> None:
         market = self._base(closed=True)
         assert _is_btc_binary_threshold(market) is False
+
+    def test_json_encoded_outcomes_and_clob_token_ids_accepted(self) -> None:
+        """Polymarket gamma returns these as JSON strings, not lists.
+
+        Defensive decode in _coerce_to_list should accept both shapes.
+        Regression for the tracked=0 issue caught in Round 7b runtime
+        observation on commit 8260a11.
+        """
+        market = self._base(
+            outcomes='["Yes", "No"]',
+            clobTokenIds='["yes-tok", "no-tok"]',
+        )
+        assert _is_btc_binary_threshold(market) is True

@@ -66,6 +66,7 @@ of unit tests; the feed module only does I/O and aggregation.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Callable
 from typing import Any
 
@@ -384,6 +385,29 @@ class PolymarketFeed:
 # ── Filter / token resolution ─────────────────────────────────────────────────
 
 
+def _coerce_to_list(value: object) -> list:
+    """Accept a list or a JSON-encoded list string, return a list.
+
+    Polymarket's gamma API returns ``outcomes`` and ``clobTokenIds`` as
+    JSON-encoded strings (e.g. ``'["Yes","No"]'``) rather than native
+    lists.  Returns an empty list on any decode failure or unexpected
+    type, matching the fail-closed behavior of the binary-shape filter.
+
+    Regression: without this coercion every market was rejected as
+    ``reason=not_binary`` because ``isinstance("...", list)`` is False
+    (``tracked=0`` runtime observation on commit 8260a11).
+    """
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            decoded = json.loads(value)
+        except (ValueError, TypeError):
+            return []
+        return decoded if isinstance(decoded, list) else []
+    return []
+
+
 def _is_btc_binary_threshold(market: dict) -> bool:
     """True iff ``market`` is an active BTC binary YES/NO threshold market.
 
@@ -410,7 +434,7 @@ def _is_btc_binary_threshold(market: dict) -> bool:
         )
         return False
 
-    outcomes = market.get("outcomes") or []
+    outcomes = _coerce_to_list(market.get("outcomes"))
     if not (
         isinstance(outcomes, list)
         and len(outcomes) == 2
@@ -423,7 +447,7 @@ def _is_btc_binary_threshold(market: dict) -> bool:
         )
         return False
 
-    token_ids = market.get("clobTokenIds") or []
+    token_ids = _coerce_to_list(market.get("clobTokenIds"))
     if not (isinstance(token_ids, list) and len(token_ids) == 2):
         logger.debug(
             "polymarket_market_rejected",
@@ -460,8 +484,8 @@ def _resolve_yes_token(market: dict) -> str | None:
     ``None`` for any market whose outcomes/clobTokenIds shape doesn't match
     the expected binary layout.
     """
-    outcomes = market.get("outcomes") or []
-    token_ids = market.get("clobTokenIds") or []
+    outcomes = _coerce_to_list(market.get("outcomes"))
+    token_ids = _coerce_to_list(market.get("clobTokenIds"))
     if len(outcomes) != 2 or len(token_ids) != 2:
         return None
     for idx, name in enumerate(outcomes):
