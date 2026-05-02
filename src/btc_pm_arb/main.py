@@ -56,6 +56,7 @@ from btc_pm_arb.feeds.deribit import DeribitFeed
 from btc_pm_arb.feeds.discovery import MarketDiscovery, run_discovery_loop
 from btc_pm_arb.feeds.health import FeedHealthTracker
 from btc_pm_arb.feeds.kalshi import KalshiFeed
+from btc_pm_arb.feeds.polymarket import PolymarketFeed
 from btc_pm_arb.models import ArbitrageSignal, DataSource, OptionTick, PredictionMarketTick
 from btc_pm_arb.pricing.cache import ProbabilityCache
 from btc_pm_arb.pricing.digital_pricer import DigitalPricer
@@ -358,6 +359,47 @@ async def _kalshi_task(agent: Agent, stop_event: asyncio.Event) -> None:
     log.info("kalshi_task.stopped")
 
 
+async def _polymarket_task(agent: Agent, stop_event: asyncio.Event) -> None:
+    """Polymarket public REST market-data feed task — Round 7b / Issue 5.
+
+    Public data only — no credentials.  US trading is geoblocked and
+    OrderManager already short-circuits any signal targeting Polymarket;
+    this task feeds the matcher's data side only.
+
+    Routes every successful HTTP response into ``feed_health.record_tick``
+    via the feed's ``on_alive`` callback (same liveness pattern as Kalshi),
+    so the dashboard shows OK even when the BTC market universe is
+    momentarily empty.
+    """
+    log.info(
+        "polymarket_task.starting",
+        gamma_url=settings.polymarket_gamma_url,
+        clob_url=settings.polymarket_clob_url,
+    )
+
+    def _on_alive() -> None:
+        agent.feed_health.record_tick(DataSource.POLYMARKET)
+
+    while not stop_event.is_set():
+        try:
+            feed = PolymarketFeed(
+                gamma_url=settings.polymarket_gamma_url,
+                clob_url=settings.polymarket_clob_url,
+                on_alive=_on_alive,
+            )
+            async with feed:
+                async for tick in feed.ticks():
+                    if stop_event.is_set():
+                        return
+                    agent.ingest_pm_tick(tick)
+        except Exception as exc:
+            if stop_event.is_set():
+                return
+            log.warning("polymarket_task.reconnecting", error=str(exc))
+            await asyncio.sleep(5.0)
+    log.info("polymarket_task.stopped")
+
+
 async def _scan_task(agent: Agent, stop_event: asyncio.Event) -> None:
     log.info("scan_task.starting", interval_secs=_SCAN_INTERVAL_SECS)
     while not stop_event.is_set():
@@ -447,6 +489,7 @@ async def run(dry_run: bool = True) -> None:
         async with asyncio.TaskGroup() as tg:
             tg.create_task(_deribit_task(agent, stop_event), name="deribit-feed")
             tg.create_task(_kalshi_task(agent, stop_event), name="kalshi-feed")
+            tg.create_task(_polymarket_task(agent, stop_event), name="polymarket-feed")
             tg.create_task(_scan_task(agent, stop_event), name="scan")
             tg.create_task(_order_refresh_task(agent, stop_event), name="order-refresh")
             tg.create_task(agent.settlement_monitor.run(stop_event), name="settlement")
