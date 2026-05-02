@@ -65,7 +65,7 @@ from btc_pm_arb.pricing.vol_surface import VolSurface
 from btc_pm_arb.server.app import create_app
 from btc_pm_arb.server.state import SharedState
 from btc_pm_arb.signals.confidence import ConfidenceScorer
-from btc_pm_arb.signals.edge import EdgeCalculator
+from btc_pm_arb.signals.edge import EdgeCalculator, EdgeResult
 from btc_pm_arb.signals.filters import FilterConfig, SignalFilter
 from btc_pm_arb.signals.matcher import ContractMatcher
 from btc_pm_arb.signals.velocity import OddsVelocityTracker
@@ -150,6 +150,12 @@ class Agent:
         # field migration, Polymarket _build_tick output) without flooding
         # logs.
         self._first_tick_logged: set[DataSource] = set()
+        # Latest dashboard payload from ``run_scan_pipeline``.  Updated
+        # once per scan tick (5 s cadence); read by ``_push_state_update``
+        # into ``shared_state.signals`` for the WebSocket snapshot.  Empty
+        # list during cold-start (no fitted smiles → empty cache → no
+        # matches).  Defensive copy on read keeps shared-state independent.
+        self._latest_signals: list[dict] = []
 
     def ingest_tick(self, tick: OptionTick) -> None:
         self._pending_ticks.append(tick)
@@ -229,6 +235,185 @@ class Agent:
                     source=DataSource.DERIBIT,
                 )
 
+    # ── Round 7c step 2: matcher → edge → filter → confidence pipeline ────────
+
+    def run_scan_pipeline(self, pm_ticks: list[PredictionMarketTick]) -> None:
+        """Drain → match → edge → filter → confidence → emit.
+
+        Called from ``_scan_task`` once per scan cadence with the buffered
+        PM ticks.  Populates ``self._latest_signals`` with a unified list
+        of passing + rejected signal payloads for the dashboard.
+
+        DRY-OBSERVATION ONLY (Round 7c step 2): signals are logged at
+        INFO under ``signal.observed`` and pushed to the dashboard.
+        Order placement deferred to Round 8 — do NOT add a call to
+        ``self.order_mgr.place(...)`` here without lifting that gate.
+        """
+        # Feed the velocity tracker.  ``yes_mid`` is a @property that
+        # returns None unless both yes_bid and yes_ask are non-None;
+        # the guard below is the safe form (no double-counting on
+        # one-sided books).
+        for t in pm_ticks:
+            if t.yes_mid is not None:
+                self.odds_tracker.update(t.contract_id, t.yes_mid)
+
+        matches = self.matcher.batch_match(pm_ticks, self.cache)
+        if not matches:
+            # Cold-start (empty cache → no matches) or no overlap with
+            # tracked PM contracts.  Clear so the dashboard reflects
+            # "nothing actionable" rather than stale state.
+            self._latest_signals = []
+            return
+
+        edges = [self.edge_calc.compute(m, surface=self.surface) for m in matches]
+
+        # ``positions`` is empty until Round 8 places orders.  Passed to
+        # the correlated-exposure filter; criterion no-ops on empty dict.
+        positions: dict[str, float] = {}
+
+        passing = self.signal_filter.filter(
+            edges,
+            surface=self.surface,
+            positions=positions,
+            feed_health=self.feed_health,
+            odds_tracker=self.odds_tracker,
+            rv_tracker=self.rv_tracker,
+        )
+
+        # Backfill confidence onto each passing signal from its
+        # originating EdgeResult.  ArbitrageSignal is mutable (no
+        # ``frozen=True`` on the model); in-place attribute assignment
+        # is safe.
+        edges_by_id = {e.match.pm_tick.contract_id: e for e in edges}
+        for sig in passing:
+            e = edges_by_id.get(sig.pm_quote.contract_id)
+            if e is not None:
+                sig.confidence = self.confidence_scorer.score(
+                    e, surface=self.surface
+                )
+
+        # Collect rejection reasons for non-passing edges.  Verified
+        # read-only on trackers: ``signals/filters.py`` contains zero
+        # ``.update(`` calls; criterion functions only call read-only
+        # query methods (velocity_at, effective_min_edge, current_regime,
+        # staleness_s).  Safe to invoke per non-passing edge — no
+        # double-counting risk.
+        passing_ids = {s.pm_quote.contract_id for s in passing}
+        rejected: list[tuple[EdgeResult, str]] = []
+        for e in edges:
+            if e.match.pm_tick.contract_id in passing_ids:
+                continue
+            reason = self.signal_filter.explains(
+                e,
+                surface=self.surface,
+                positions=positions,
+                feed_health=self.feed_health,
+                odds_tracker=self.odds_tracker,
+                rv_tracker=self.rv_tracker,
+            )
+            if reason is not None:
+                rejected.append((e, reason))
+
+        self._latest_signals = self._build_signal_payloads(passing, rejected)
+
+        for sig in passing:
+            log.info(
+                "signal.observed",
+                contract=sig.pm_quote.contract_id,
+                platform=sig.pm_quote.source.value,
+                side=sig.trade_side,
+                adjusted_edge=round(sig.adjusted_edge, 4),
+                fill_adjusted_edge=(
+                    round(sig.fill_adjusted_edge, 4)
+                    if sig.fill_adjusted_edge is not None else None
+                ),
+                confidence=round(sig.confidence, 3),
+                pm_mid=round(sig.pm_quote.mid_prob, 4),
+                options_mid=round(sig.options_quote.mid_prob, 4),
+            )
+
+    def _build_signal_payloads(
+        self,
+        passing: list[ArbitrageSignal],
+        rejected: list[tuple[EdgeResult, str]],
+    ) -> list[dict]:
+        """Build a unified, capped, sorted payload list for the dashboard.
+
+        Passing signals first (capped at 50), then rejected (capped at
+        50), each sorted by ``abs(edge)`` descending so the most
+        material entries appear first in their group.
+        """
+        pass_payload = sorted(
+            (self._signal_to_payload(s) for s in passing),
+            key=lambda d: abs(d.get("edge") or 0.0),
+            reverse=True,
+        )[:50]
+        rej_payload = sorted(
+            (self._rejected_to_payload(e, r) for (e, r) in rejected),
+            key=lambda d: abs(d.get("edge") or 0.0),
+            reverse=True,
+        )[:50]
+        return pass_payload + rej_payload
+
+    @staticmethod
+    def _signal_to_payload(sig: ArbitrageSignal) -> dict:
+        """Render a passing ArbitrageSignal as the dashboard schema dict.
+
+        Schema mirrors what ``server/static/index.html`` reads from
+        ``snap.signals[]`` (TOP SIGNALS panel + ALL SIGNALS tab).
+
+        Expiry None-guard mirrors ``_rejected_to_payload`` for
+        consistency.  ``ProbabilityQuote.expiry`` is non-Optional in the
+        model, so the guard is purely defensive.
+        """
+        expiry_iso = (
+            sig.pm_quote.expiry.isoformat() if sig.pm_quote.expiry else None
+        )
+        return {
+            "id": f"{sig.pm_quote.contract_id}:{sig.trade_side}:{expiry_iso or ''}",
+            "name": sig.pm_quote.contract_id,
+            "contract": sig.pm_quote.contract_id,
+            "platform": sig.pm_quote.source.value,
+            "expiry": expiry_iso,
+            "side": "yes" if sig.trade_side == "buy_yes" else "no",
+            "edge": sig.adjusted_edge,
+            "fill_adjusted_edge": sig.fill_adjusted_edge,
+            "actionable": True,
+            "filtered": False,
+            "implied_prob": sig.options_quote.mid_prob,
+            "market_prob": sig.pm_quote.mid_prob,
+            "confidence": sig.confidence,
+        }
+
+    @staticmethod
+    def _rejected_to_payload(edge: EdgeResult, reason: str) -> dict:
+        """Render a filter-rejected EdgeResult as the dashboard schema dict.
+
+        Used for the ALL SIGNALS tab to surface why an edge didn't pass.
+        ``confidence`` is None (not scored — saves CPU on rejected items).
+        """
+        pm = edge.match.pm_tick
+        # ``best_side`` is Literal["buy_yes", "buy_no"] | None; default
+        # to "yes" display when None (no positive edge on either side).
+        side = "yes" if (edge.best_side or "buy_yes") == "buy_yes" else "no"
+        expiry_iso = pm.expiry.isoformat() if pm.expiry else None
+        return {
+            "id": f"{pm.contract_id}:{edge.best_side or 'none'}:{expiry_iso or ''}",
+            "name": pm.question or pm.contract_id,
+            "contract": pm.contract_id,
+            "platform": pm.source.value,
+            "expiry": expiry_iso,
+            "side": side,
+            "edge": edge.best_conservative_edge,
+            "fill_adjusted_edge": edge.fill_adjusted_edge,
+            "actionable": False,
+            "filtered": True,
+            "rejection_reasons": [reason],
+            "implied_prob": edge.match.options_entry.mid_prob,
+            "market_prob": edge.match.pm_quote.mid_prob,
+            "confidence": None,
+        }
+
     async def _push_state_update(self) -> None:
         """Push current layer state into SharedState for the dashboard."""
         import math
@@ -306,6 +491,9 @@ class Agent:
             s.feeds = feeds
             s.vol_surface = vol_surface
             s.volatility_regime = volatility_regime
+            # Defensive copy: keeps the snapshot independent of any
+            # subsequent run_scan_pipeline rewrite of _latest_signals.
+            s.signals = list(self._latest_signals)
             s.positions = positions
             s.positions_summary = perf
             s.settlements = settlements
@@ -436,6 +624,14 @@ async def _scan_task(agent: Agent, stop_event: asyncio.Event) -> None:
             dirty = agent.flush_ticks()
             if dirty:
                 agent.update_cache_from_surface(dirty)
+
+            # Round 7c step 2: drain PM-tick buffer and run the dormant
+            # matcher → edge → filter → confidence pipeline.  Populates
+            # agent._latest_signals which _push_state_update copies into
+            # the dashboard payload below.  DRY-OBSERVATION ONLY — no
+            # orders are placed in this round (Round 8 work).
+            pm_ticks = agent.flush_pm_ticks()
+            agent.run_scan_pipeline(pm_ticks)
 
             # Push state update to dashboard
             await agent._push_state_update()
