@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     # Strike increment δ for digital pricer finite-difference approximation (USD)
     strike_delta: float = Field(default=500.0, gt=0)
 
+    # ── Paper-trading ledger (Round 8) ────────────────────────────────────────
+    # Append-only JSONL files persist would-be-trade records across restarts.
+    # See execution/paper_ledger.py module docstring for storage rationale.
+    paper_ledger_dir: str = "./paper_ledger"
+
     # ── Logging ───────────────────────────────────────────────────────────────
     log_level: str = "INFO"
     log_format: str = "json"

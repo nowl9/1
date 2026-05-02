@@ -16,3 +16,4 @@ venv/
 .ruff_cache/
 agent*.log
 agent-trace*.txt
+paper_ledger/
