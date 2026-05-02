@@ -50,8 +50,11 @@ def signed_headers(method: str, path: str, key: Any, key_id: str) -> dict[str, s
 
     Args:
         method:  HTTP method (e.g. "GET", "POST", "DELETE").
-        path:    Request path including any query string (e.g.
-                 "/trade-api/v2/markets?series_ticker=KXBTC").
+        path:    Request path RELATIVE TO settings.kalshi_base_url, including
+                 any query string (e.g. "/markets?series_ticker=KXBTC" — NOT
+                 "/trade-api/v2/markets...", since the base URL already ends
+                 in /trade-api/v2 by convention).  Caller is responsible for
+                 keeping the path consistent with the base URL.
         key:     The loaded RSA private key (from :func:`load_key`).  If
                  None, returns an empty dict — caller's request will fail
                  auth, which is the right user-visible signal for a

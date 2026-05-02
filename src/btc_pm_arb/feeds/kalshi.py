@@ -6,14 +6,20 @@ Architecture
   feed (Issue 5) and avoids Kalshi's more involved WS auth handshake.
 * Two cadences run concurrently inside one connection cycle:
     - Discovery loop, every ``_DISCOVERY_INTERVAL`` (60 s):
-      ``GET /trade-api/v2/markets?series_ticker=KXBTC&status=open``
+      ``GET {base_url}/markets?series_ticker=KXBTC&status=open``
       refreshes the set of active BTC contract tickers and their
       metadata (title, subtitle, close_time).
     - Poll loop, every ``_POLL_INTERVAL`` (5 s): for each tracked
-      ticker, ``GET /trade-api/v2/markets/{ticker}/orderbook`` pulls
+      ticker, ``GET {base_url}/markets/{ticker}/orderbook`` pulls
       the current best bid/ask, normalises into a
       :class:`PredictionMarketTick` and yields it via the public
       :meth:`ticks` async generator.
+* URL-construction convention: ``settings.kalshi_base_url`` already ends
+  in ``/trade-api/v2`` (see ``config.Settings.kalshi_demo_url`` /
+  ``kalshi_prod_url``).  Request paths in this module are therefore
+  written as ``/markets``, ``/markets/{ticker}/orderbook``, etc., NOT
+  ``/trade-api/v2/markets``.  Doubling the prefix produces a 404 (caught
+  at runtime in round 6 verification).
 * Liveness reporting is via an optional ``on_alive`` callback fired on
   every successful HTTP response (discovery and orderbook polls
   alike).  This is how the dashboard's ``feed_health`` shows alive even
@@ -224,8 +230,12 @@ class KalshiFeed:
         Replaces self._tracked atomically; tickers no longer present in
         the response (e.g. closed) are dropped.
         """
+        # Path is relative to settings.kalshi_base_url, which already
+        # ends in /trade-api/v2 by convention.  Do NOT prepend the API
+        # prefix here — that's the doubled-path regression caught at
+        # runtime in round 6 verification.
         path = (
-            f"/trade-api/v2/markets"
+            f"/markets"
             f"?series_ticker={_BTC_SERIES_TICKER}"
             f"&status=open"
             f"&limit=200"
@@ -276,8 +286,9 @@ class KalshiFeed:
                 if meta is None:
                     continue
                 try:
+                    # Path relative to base_url; see _discover_markets.
                     book_body = await self._http_get(
-                        f"/trade-api/v2/markets/{ticker}/orderbook"
+                        f"/markets/{ticker}/orderbook"
                     )
                 except Exception as exc:
                     # One ticker's failure shouldn't break the loop.  Log
