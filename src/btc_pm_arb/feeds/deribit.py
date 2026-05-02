@@ -31,7 +31,6 @@ from typing import Any
 
 import structlog
 import websockets
-from websockets.exceptions import ConnectionClosed
 
 from btc_pm_arb.models import Greeks, OptionTick, OptionType
 
@@ -263,7 +262,7 @@ class DeribitFeed:
             "params": params,
         })
         t_send = time.monotonic()
-        logger.info(
+        logger.debug(
             "deribit_rpc_sent",
             rpc_id=rpc_id,
             rpc_id_type=type(rpc_id).__name__,
@@ -273,7 +272,7 @@ class DeribitFeed:
         try:
             result = await asyncio.wait_for(fut, timeout=30.0)
             elapsed_ms = round((time.monotonic() - t_send) * 1000, 1)
-            logger.info(
+            logger.debug(
                 "deribit_rpc_completed",
                 rpc_id=rpc_id,
                 method=method,
@@ -362,7 +361,7 @@ class DeribitFeed:
                 # the loop is alive and the bug is elsewhere.
                 now = time.monotonic()
                 if now - self._loop_alive_log_ts >= 5.0:
-                    logger.info(
+                    logger.debug(
                         "deribit_message_loop_alive",
                         frames=self._frames_processed,
                         rpc_responses_dispatched=self._rpc_responses_dispatched,
@@ -437,7 +436,7 @@ class DeribitFeed:
                 )
             else:
                 self._rpc_responses_dispatched += 1
-                logger.info(
+                logger.debug(
                     "deribit_rpc_response_dispatched",
                     response_id=rpc_id,
                     method=sent_method,
@@ -471,7 +470,7 @@ class DeribitFeed:
             # auto-discard on completion — no further lifecycle management.
             self._heartbeats_received += 1
             params = msg.get("params", {}) or {}
-            logger.info(
+            logger.debug(
                 "deribit_heartbeat_received",
                 hb_type=params.get("type", "?"),
                 count=self._heartbeats_received,
@@ -548,9 +547,22 @@ class DeribitFeed:
     # ── Internal: heartbeat ───────────────────────────────────────────────────
 
     async def _heartbeat_loop(self) -> None:
-        """Send set_heartbeat every HEARTBEAT_INTERVAL seconds."""
+        """Configure Deribit's server-initiated heartbeats and idle.
+
+        Once ``public/set_heartbeat`` is configured, Deribit periodically
+        pushes ``test_request`` notifications and we reply via
+        :meth:`_respond_to_heartbeat` (dispatched from the message loop as
+        a background task).  No client-side periodic ``public/test`` probe
+        is needed — the server's own protocol is sufficient for liveness.
+
+        An earlier version of this loop sent ``public/test`` every
+        ``_HEARTBEAT_INTERVAL`` seconds in addition to relying on the
+        server-initiated heartbeats.  That probe was redundant noise and
+        complicated diagnosis during round 4–5 (its 30 s wait_for timeout
+        was an early symptom of the real underlying event-loop starvation
+        bug, not a transport-layer issue).  Round 6 / Fix C removes it.
+        """
         assert self._ws is not None
-        # Enable server heartbeats so we detect stale connections quickly.
         try:
             await self._rpc(
                 "public/set_heartbeat",
@@ -560,16 +572,13 @@ class DeribitFeed:
             logger.warning("deribit_heartbeat_setup_failed", error=str(exc))
             return
 
+        # Idle until shutdown or disconnect.  Server-initiated test_requests
+        # arriving via the message loop are responded to in
+        # _respond_to_heartbeat; this loop merely keeps a task alive so
+        # _setup_then_heartbeat in _connect_and_run doesn't return early.
         while self._running:
             await asyncio.sleep(_HEARTBEAT_INTERVAL)
             if not _ws_open(self._ws):
-                break
-            # test_request triggers a heartbeat response from the server;
-            # if it doesn't respond the connection dies and we reconnect.
-            try:
-                await self._rpc("public/test", {})
-            except (ConnectionClosed, TimeoutError) as exc:
-                logger.warning("deribit_heartbeat_failed", error=str(exc))
                 break
 
     async def _respond_to_heartbeat(self) -> None:
