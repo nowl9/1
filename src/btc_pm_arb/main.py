@@ -40,6 +40,7 @@ import logging
 import os
 import secrets
 import signal
+from collections import deque
 from datetime import datetime, timezone
 from typing import AsyncIterator
 
@@ -54,7 +55,8 @@ from btc_pm_arb.execution.settlement import SettlementMonitor
 from btc_pm_arb.feeds.deribit import DeribitFeed
 from btc_pm_arb.feeds.discovery import MarketDiscovery, run_discovery_loop
 from btc_pm_arb.feeds.health import FeedHealthTracker
-from btc_pm_arb.models import ArbitrageSignal, DataSource, OptionTick
+from btc_pm_arb.feeds.kalshi import KalshiFeed
+from btc_pm_arb.models import ArbitrageSignal, DataSource, OptionTick, PredictionMarketTick
 from btc_pm_arb.pricing.cache import ProbabilityCache
 from btc_pm_arb.pricing.digital_pricer import DigitalPricer
 from btc_pm_arb.pricing.realized_vol import RealizedVolTracker
@@ -135,6 +137,12 @@ class Agent:
         self.shared_state = SharedState(dry_run=dry_run, live_mode_token=live_token)
 
         self._pending_ticks: list[OptionTick] = []
+        # Buffer of prediction-market ticks awaiting matcher consumption.
+        # Populated by Kalshi (Round 6) and Polymarket (Issue 5, deferred)
+        # feed tasks via ``ingest_pm_tick``.  The matcher pipeline that
+        # drains this buffer is queued as a future round; bounded deque
+        # prevents unbounded growth in the meantime.
+        self._pending_pm_ticks: deque[PredictionMarketTick] = deque(maxlen=10_000)
 
     def ingest_tick(self, tick: OptionTick) -> None:
         self._pending_ticks.append(tick)
@@ -157,6 +165,25 @@ class Agent:
         dirty = self.surface.update(self._pending_ticks)
         self._pending_ticks.clear()
         return dirty
+
+    def ingest_pm_tick(self, tick: PredictionMarketTick) -> None:
+        """Stage a prediction-market tick for matcher consumption.
+
+        Called from ``_kalshi_task`` (Round 6) and ``_polymarket_task``
+        (Issue 5, deferred).  Today this just buffers the tick; the
+        matcher → edge → filter → confidence → orders pipeline that
+        drains the buffer is wired up in a future round.  ``ContractMatcher``
+        is constructed in ``Agent.__init__`` but not yet invoked anywhere.
+        """
+        self._pending_pm_ticks.append(tick)
+
+    def flush_pm_ticks(self) -> list[PredictionMarketTick]:
+        """Drain pending PM ticks for batch matcher processing (future)."""
+        if not self._pending_pm_ticks:
+            return []
+        out = list(self._pending_pm_ticks)
+        self._pending_pm_ticks.clear()
+        return out
 
     def update_cache_from_surface(self, dirty_expiries: set) -> None:
         for expiry in dirty_expiries:
@@ -296,6 +323,41 @@ async def _deribit_task(agent: Agent, stop_event: asyncio.Event) -> None:
     log.info("deribit_task.stopped")
 
 
+async def _kalshi_task(agent: Agent, stop_event: asyncio.Event) -> None:
+    """Kalshi REST market-data feed task — Round 6 / Issue 4.
+
+    Routes every successful HTTP response into ``feed_health.record_tick``
+    via the feed's ``on_alive`` callback.  This is what makes the dashboard
+    show Kalshi as OK even when the demo BTC market universe is empty
+    (zero markets returned → zero ticks yielded; without the callback the
+    feed would look DISCONNECTED forever despite working correctly).
+    """
+    log.info("kalshi_task.starting", base_url=settings.kalshi_base_url)
+
+    def _on_alive() -> None:
+        agent.feed_health.record_tick(DataSource.KALSHI)
+
+    while not stop_event.is_set():
+        try:
+            feed = KalshiFeed(
+                base_url=settings.kalshi_base_url,
+                key_path=settings.kalshi_private_key_path,
+                key_id=settings.kalshi_api_key_id,
+                on_alive=_on_alive,
+            )
+            async with feed:
+                async for tick in feed.ticks():
+                    if stop_event.is_set():
+                        return
+                    agent.ingest_pm_tick(tick)
+        except Exception as exc:
+            if stop_event.is_set():
+                return
+            log.warning("kalshi_task.reconnecting", error=str(exc))
+            await asyncio.sleep(5.0)
+    log.info("kalshi_task.stopped")
+
+
 async def _scan_task(agent: Agent, stop_event: asyncio.Event) -> None:
     log.info("scan_task.starting", interval_secs=_SCAN_INTERVAL_SECS)
     while not stop_event.is_set():
@@ -384,6 +446,7 @@ async def run(dry_run: bool = True) -> None:
     try:
         async with asyncio.TaskGroup() as tg:
             tg.create_task(_deribit_task(agent, stop_event), name="deribit-feed")
+            tg.create_task(_kalshi_task(agent, stop_event), name="kalshi-feed")
             tg.create_task(_scan_task(agent, stop_event), name="scan")
             tg.create_task(_order_refresh_task(agent, stop_event), name="order-refresh")
             tg.create_task(agent.settlement_monitor.run(stop_event), name="settlement")

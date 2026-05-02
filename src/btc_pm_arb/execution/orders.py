@@ -28,9 +28,7 @@ Design notes
 from __future__ import annotations
 
 import asyncio
-import base64
 import hashlib
-import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -131,36 +129,16 @@ class KalshiExecutor:
         self._dry_run = dry_run
         self._base_url = settings.kalshi_base_url
         self._key_id = settings.kalshi_api_key_id
-        self._private_key = self._load_key()
+        # Shared with feeds.kalshi.KalshiFeed via feeds._kalshi_auth so
+        # signing logic has exactly one source of truth.
+        from btc_pm_arb.feeds._kalshi_auth import load_key as _load_kalshi_key
+        self._private_key = _load_kalshi_key(settings.kalshi_private_key_path)
         self._client = httpx.AsyncClient(base_url=self._base_url, timeout=10.0)
 
-    def _load_key(self) -> Any:
-        """Load RSA private key from PEM file; return None on failure."""
-        try:
-            from cryptography.hazmat.primitives.serialization import load_pem_private_key
-            with open(settings.kalshi_private_key_path, "rb") as f:
-                return load_pem_private_key(f.read(), password=None)
-        except Exception as exc:
-            logger.warning("kalshi.key_load_failed", error=str(exc))
-            return None
-
     def _sign(self, method: str, path: str) -> dict[str, str]:
-        """Build Kalshi auth headers using RSA-PSS."""
-        ts_ms = str(int(time.time() * 1000))
-        msg = (ts_ms + method.upper() + path).encode()
-        if self._private_key is None:
-            return {}
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.asymmetric import padding
-        sig = self._private_key.sign(msg, padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.DIGEST_LENGTH,
-        ), hashes.SHA256())
-        return {
-            "KALSHI-ACCESS-KEY": self._key_id,
-            "KALSHI-ACCESS-TIMESTAMP": ts_ms,
-            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
-        }
+        """Build Kalshi auth headers using RSA-PSS (delegated to shared helper)."""
+        from btc_pm_arb.feeds._kalshi_auth import signed_headers
+        return signed_headers(method, path, self._private_key, self._key_id)
 
     @staticmethod
     def _to_cents(prob: float) -> int:
