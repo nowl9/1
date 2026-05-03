@@ -159,15 +159,15 @@ def test_clear_arb_signal_fields():
 # ── Marginal edge filtered out ────────────────────────────────────────────────
 
 def test_marginal_edge_below_threshold_rejected():
-    """2 % conservative edge < 3 % default threshold → rejected."""
-    e = _edge(conservative_edge=0.02, adj_yes=0.02, mid_yes=0.05)
+    """0.5 % conservative edge < 1 % default threshold (Round 9a) → rejected."""
+    e = _edge(conservative_edge=0.005, adj_yes=0.005, mid_yes=0.02)
     filt = SignalFilter()
     signals = filt.filter([e])
     assert len(signals) == 0
 
 
 def test_explains_gives_reason_for_marginal_edge():
-    e = _edge(conservative_edge=0.02, adj_yes=0.02, mid_yes=0.05)
+    e = _edge(conservative_edge=0.005, adj_yes=0.005, mid_yes=0.02)
     filt = SignalFilter()
     reason = filt.explains(e)
     assert reason is not None
@@ -372,7 +372,9 @@ def test_multiple_signals_all_pass():
 
 def test_mixed_batch_some_pass_some_fail():
     good = _edge(conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
-    bad = _edge(conservative_edge=0.01, adj_yes=0.01, mid_yes=0.02)
+    # Round 9a: bad edge updated from 0.01 → 0.005 to remain below the
+    # new 1 % default conservative-edge floor.
+    bad = _edge(conservative_edge=0.005, adj_yes=0.005, mid_yes=0.02)
     filt = SignalFilter()
     signals = filt.filter([good, bad])
     assert len(signals) == 1
@@ -383,3 +385,89 @@ def test_mixed_batch_some_pass_some_fail():
 def test_empty_input_returns_empty():
     filt = SignalFilter()
     assert filt.filter([]) == []
+
+
+# ── Round 9a: data-collection-floor defaults ──────────────────────────────────
+
+def test_default_thresholds_are_round9a_floors():
+    """Default FilterConfig matches the Round 9a pipeline-noise floor.
+
+    Locks in the data-collection thresholds so a future tweak that
+    moves them without explicit recalibration trips the test rather
+    than silently changing the dataset shape.
+    """
+    cfg = FilterConfig()
+    assert cfg.min_conservative_edge == 0.01
+    assert cfg.min_mid_edge == 0.005
+
+
+def test_one_percent_edge_passes_default():
+    """1.1 % conservative edge passes the new default 1 % floor."""
+    e = _edge(conservative_edge=0.011, adj_yes=0.011, mid_yes=0.012)
+    filt = SignalFilter()
+    signals = filt.filter([e])
+    assert len(signals) == 1
+
+
+def test_edge_at_old_three_percent_threshold_still_passes():
+    """A 3 % edge — formerly at the floor — remains a clear pass.
+
+    Sanity check that the lowering is purely additive: anything that
+    used to pass at 3 % still passes at 1 %.  Important because tests
+    elsewhere that explicitly construct ``FilterConfig(min_conservative_edge=0.03)``
+    are unaffected by this change.
+    """
+    e = _edge(conservative_edge=0.03, adj_yes=0.03, mid_yes=0.05)
+    filt = SignalFilter()
+    assert len(filt.filter([e])) == 1
+
+
+# ── Round 9a: rejection counter telemetry ─────────────────────────────────────
+
+def test_rejection_counts_increments_on_filter():
+    """Rejecting edges increment rejection_counts by reason bucket key."""
+    bad1 = _edge(conservative_edge=0.005, adj_yes=0.005, mid_yes=0.02)
+    bad2 = _edge(conservative_edge=0.003, adj_yes=0.003, mid_yes=0.02)
+    filt = SignalFilter()
+    filt.filter([bad1, bad2])
+    assert filt.rejection_counts.get("conservative_edge") == 2
+
+
+def test_rejection_counts_buckets_separate_reasons():
+    """Different rejection reasons end up in different bucket keys."""
+    edge_below = _edge(conservative_edge=0.005, adj_yes=0.005, mid_yes=0.02)
+    m = _match(pm_yes_bid=0.30, pm_yes_ask=0.50)   # 20% spread > 12% max
+    edge_wide = _edge(match=m, conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
+    filt = SignalFilter()
+    filt.filter([edge_below, edge_wide])
+    assert filt.rejection_counts.get("conservative_edge") == 1
+    assert filt.rejection_counts.get("pm_spread") == 1
+
+
+def test_rejection_counts_starts_empty():
+    """Fresh SignalFilter has an empty counter — no implicit pre-population."""
+    filt = SignalFilter()
+    assert filt.rejection_counts == {}
+
+
+def test_explains_does_not_increment_rejection_counts():
+    """explains() is diagnostic — must NOT touch the cumulative counter.
+
+    Round 9a invariant: the scan pipeline calls filter() and then
+    explains() on the rejected set to decorate dashboard payloads;
+    if explains() also incremented, every rejected edge would be
+    counted twice.  This test locks the no-increment guarantee.
+    """
+    bad = _edge(conservative_edge=0.005, adj_yes=0.005, mid_yes=0.02)
+    filt = SignalFilter()
+    reason = filt.explains(bad)
+    assert reason is not None
+    assert filt.rejection_counts == {}
+
+
+def test_passing_signals_do_not_increment_rejection_counts():
+    """A purely-passing batch leaves the counter empty."""
+    e = _edge(conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
+    filt = SignalFilter()
+    filt.filter([e])
+    assert filt.rejection_counts == {}

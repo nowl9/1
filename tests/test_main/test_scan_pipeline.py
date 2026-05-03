@@ -263,7 +263,7 @@ class TestRunScanPipelineEndToEnd:
 
         Edge math:
           options mid = 0.55, pm yes_ask = 0.42
-          edge_yes_conservative = 0.55 - 0.42 = +0.13 (well above default 0.03)
+          edge_yes_conservative = 0.55 - 0.42 = +0.13 (well above default 0.01)
 
         Round 8 Commit 3 made ``run_scan_pipeline`` async (it now awaits
         ``OrderManager.place``).  Test was synchronous; converted to
@@ -345,3 +345,65 @@ class TestRunScanPipelineEndToEnd:
 
         # Stale state cleared by the matcher short-circuit branch.
         assert agent._latest_signals == []
+
+    @pytest.mark.asyncio
+    async def test_missing_originating_data_increments_counter(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        """Round 9a: when a passing signal's contract_id is not present in
+        ``edges_by_id`` / ``tick_by_contract``, the defensive branch in
+        ``run_scan_pipeline`` increments
+        ``_funnel["paper_ledger_missing_originating_data"]``.
+
+        In healthy operation this branch never fires — signals come from
+        the same ``edges`` list that builds both lookups, so the keys
+        always match.  The only realistic way to exercise the branch is
+        to monkeypatch ``signal_filter.filter`` to return a signal whose
+        ``pm_quote.contract_id`` is foreign to the edges list.
+
+        Why this test exists: defensive code without coverage rots.  The
+        Round 9a operational-telemetry contract says this counter must
+        increment whenever the warning fires; a future refactor that
+        accidentally desynchronises the counter from the warning would
+        otherwise pass CI.
+        """
+        monkeypatch.setattr(
+            "btc_pm_arb.config.settings.paper_ledger_dir", str(tmp_path),
+        )
+        agent = Agent(dry_run=True)
+        agent.feed_health.record_tick(DataSource.DERIBIT)
+        agent.feed_health.record_tick(DataSource.KALSHI)
+
+        expiry = datetime.now(timezone.utc) + timedelta(days=7)
+        agent.cache.update(
+            strike=100_000.0, expiry=expiry,
+            bid_prob=0.55, ask_prob=0.55, mid_prob=0.55,
+            source=DataSource.DERIBIT,
+        )
+        # A real tick so the matcher produces a real edge — but the filter
+        # output we substitute in next refers to a different contract_id,
+        # so the lookups built from this edge won't contain it.
+        tick = _make_pm_tick(
+            expiry=expiry, yes_bid=0.40, yes_ask=0.42,
+            no_bid=0.58, no_ask=0.60,
+        )
+        agent.ingest_pm_tick(tick)
+
+        # Phantom signal whose contract_id is NOT among the produced edges.
+        # Forces the originating_edge / originating_tick lookups to miss.
+        phantom_signal = _make_arbitrage_signal(
+            pm_contract_id="KXBTC-PHANTOM-NOT-IN-LOOKUP",
+            source=DataSource.KALSHI,
+        )
+        monkeypatch.setattr(
+            agent.signal_filter, "filter",
+            lambda *args, **kwargs: [phantom_signal],
+        )
+
+        await agent.run_scan_pipeline(agent.flush_pm_ticks())
+
+        # Counter incremented exactly once for the phantom signal.
+        assert agent._funnel["paper_ledger_missing_originating_data"] == 1
+        # Placement still counted — the increment occurs before the
+        # defensive lookup, mirroring the real code path.
+        assert agent._funnel["paper_orders_placed"] == 1

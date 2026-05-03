@@ -51,8 +51,18 @@ class FilterConfig:
     """Configurable thresholds for the signal filter chain."""
 
     # Edge thresholds
-    min_conservative_edge: float = 0.03    # 3 % — minimum post-spread edge
-    min_mid_edge: float = 0.01             # 1 % — also require a mid edge
+    # Round 9 Commit 9a: lowered from 3% / 1% to unblock paper-trade data
+    # flow for Round 9c calibration.  At the old thresholds the ledger
+    # stayed empty after a 5-min smoke test.  1% is a "pipeline noise
+    # floor" — below it the signal is plausibly artifact of basis-adjuster
+    # approximation error, BS-to-probability rounding, or IV smile
+    # interpolation.  0.5% mid is the proportional companion (mid is
+    # naturally laxer than conservative; halving keeps it as a sanity
+    # check, not the binding constraint).  These are data-collection
+    # floors, NOT calibrated thresholds; Round 9c replaces them with
+    # values backed by realized P&L analysis on the accumulated dataset.
+    min_conservative_edge: float = 0.01    # 1 % — minimum post-spread edge
+    min_mid_edge: float = 0.005            # 0.5 % — also require a mid edge
 
     # Time-to-expiry bounds (in days)
     min_days_to_expiry: float = 1.0        # avoid expiry-day gamma spikes
@@ -285,6 +295,17 @@ _CRITERIA: list[_Criterion] = [
 
 # ── Filter class ──────────────────────────────────────────────────────────────
 
+# Reasons returned by criterion functions are formatted as
+# ``"<key> <details>"`` (e.g., ``"conservative_edge 0.0050 < min 0.01"``)
+# or as bare keys (e.g., ``"no_positive_edge"``).  ``_extract_reason_key``
+# returns the first whitespace-delimited token — the stable bucket name
+# used in :attr:`SignalFilter.rejection_counts`.  Keeping the full message
+# in DEBUG logs for forensics; using the bucket key for telemetry.
+def _extract_reason_key(reason: str) -> str:
+    """Return the stable bucket key for a rejection reason string."""
+    return reason.split(maxsplit=1)[0] if reason else "unknown"
+
+
 class SignalFilter:
     """Apply the criterion chain and convert surviving EdgeResults to ArbitrageSignals.
 
@@ -292,10 +313,25 @@ class SignalFilter:
 
         filt = SignalFilter(FilterConfig(min_conservative_edge=0.04))
         signals = filt.filter(edge_results, surface=surface)
+
+    Rejection telemetry
+    -------------------
+    :attr:`rejection_counts` is a cumulative counter of rejection reasons
+    over the lifetime of the instance, keyed by the stable bucket name
+    extracted from each reason string (see :func:`_extract_reason_key`).
+    Counters are incremented inside :meth:`filter` only — :meth:`explains`
+    is diagnostic and does NOT increment, so the same edge being inspected
+    via ``explains()`` after being rejected by ``filter()`` won't double-
+    count.  Surfaced on the dashboard via ``main.Agent`` so operators can
+    see at a glance which gate is the dominant blocker.  Cumulative across
+    the agent's process lifetime; restart resets.
     """
 
     def __init__(self, config: FilterConfig | None = None) -> None:
         self.config = config or FilterConfig()
+        # Cumulative counter keyed by reason bucket (e.g., "conservative_edge",
+        # "pm_spread", "deribit_feed_stale").  See class docstring.
+        self.rejection_counts: dict[str, int] = {}
 
     def filter(
         self,
@@ -332,6 +368,10 @@ class SignalFilter:
         for edge in edge_results:
             rejection = self._first_rejection(edge, ctx)
             if rejection is not None:
+                # Increment cumulative telemetry counter (filter-pass only —
+                # explains() does NOT increment; see class docstring).
+                key = _extract_reason_key(rejection)
+                self.rejection_counts[key] = self.rejection_counts.get(key, 0) + 1
                 logger.debug(
                     "signal.filtered",
                     contract=edge.match.pm_tick.contract_id,

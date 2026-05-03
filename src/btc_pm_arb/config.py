@@ -41,7 +41,14 @@ class Settings(BaseSettings):
         return self.kalshi_demo_url if self.kalshi_use_demo else self.kalshi_prod_url
 
     # ── Strategy ──────────────────────────────────────────────────────────────
-    min_edge: float = Field(default=0.03, ge=0.0, le=1.0)
+    # Round 9 Commit 9a: lowered from 0.03 to 0.01 to unblock paper-trade
+    # data flow.  At 3% the paper ledger stayed empty after Round 8's smoke
+    # test (5 min runtime, no orders).  1% is a "noise floor" — below it the
+    # signal is plausibly artifact of pipeline noise (basis-adjuster error,
+    # BS rounding, IV smile interpolation).  This is a data-collection floor,
+    # NOT a calibrated threshold; Round 9c replaces it with values backed
+    # by realized P&L analysis on the accumulated paper-trade dataset.
+    min_edge: float = Field(default=0.01, ge=0.0, le=1.0)
     min_days_to_expiry: int = Field(default=1, ge=0)
     max_days_to_expiry: int = Field(default=90, ge=1)
     max_position_usd: float = Field(default=1000.0, gt=0)

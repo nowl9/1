@@ -42,7 +42,7 @@ import secrets
 import signal
 from collections import deque
 from datetime import datetime, timezone
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 import structlog
 import uvicorn
@@ -188,6 +188,13 @@ class Agent:
             "paper_orders_placed": 0,
             "paper_orders_filled": 0,
             "paper_orders_no_fill": 0,
+            # Round 9 Commit 9a: counter for the defensive
+            # paper_ledger.missing_originating_data warning at the place()
+            # → record() handoff in run_scan_pipeline.  Should always
+            # remain 0 in healthy operation; non-zero indicates a
+            # passing-signal contract_id that wasn't in the
+            # edges_by_id / tick_by_contract lookups (a bug worth seeing).
+            "paper_ledger_missing_originating_data": 0,
         }
         # Replay paper-trading state from disk so positions and the orders
         # registry persist across restarts (the load-bearing
@@ -440,6 +447,11 @@ class Agent:
                     if originating_edge is None or originating_tick is None:
                         # Defensive: should never happen — the signal came
                         # from a passing edge whose tick is in the lookup.
+                        # Round 9 Commit 9a: increment counter so the
+                        # condition is visible on the dashboard rather than
+                        # only in the log stream — silent fires were the
+                        # explicit Round 8 Commit 2 deferral.
+                        self._funnel["paper_ledger_missing_originating_data"] += 1
                         log.warning(
                             "paper_ledger.missing_originating_data",
                             contract_id=sig.pm_quote.contract_id,
@@ -718,7 +730,20 @@ class Agent:
         )
         paper_settled = paper_settled[:50]
         paper_perf = self.paper_positions.performance_summary()
-        funnel = dict(self._funnel)
+        funnel: dict[str, Any] = dict(self._funnel)
+        # Round 9 Commit 9a: surface per-reason filter rejection counts on
+        # the dashboard as flat ``reject_<key>`` entries (NOT a nested
+        # dict).  Operational telemetry — without it, the next time the
+        # ledger is unexpectedly empty we're back to grepping DEBUG logs.
+        # Flat shape chosen because the dashboard rendering code was
+        # written against a flat funnel dict; nesting would require
+        # frontend changes to display.  The ``reject_`` prefix is
+        # namespace-safe against the existing keys in ``self._funnel``
+        # (none of which start with ``reject_``).  Bucket keys are the
+        # stable single-token names from signals/filters.py:_extract_reason_key
+        # (e.g. ``conservative_edge``, ``pm_spread``, ``deribit_feed_stale``).
+        for reason_key, count in self.signal_filter.rejection_counts.items():
+            funnel[f"reject_{reason_key}"] = count
 
         async with self.shared_state.write() as s:
             s.feeds = feeds
