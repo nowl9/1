@@ -140,6 +140,37 @@ def test_paper_order_record_round_trip(tmp_path: Path):
     assert loaded[0] == original
 
 
+def test_paper_order_record_feed_staleness_preserves_none(tmp_path: Path):
+    """Regression: PaperOrderRecord.feed_staleness_ms must round-trip values
+    of None (e.g. ``{"polymarket": None, "kalshi": 12.3}``) through JSONL.
+
+    Surfaced in Round 8 Commit 3: _build_paper_order_record copied the
+    signal's feed_staleness_ms verbatim, which contained per-feed Nones
+    when a feed had been queried but no tick was observed yet.  The
+    original schema (``dict[str, float]``) accepted None on Python
+    construction but rejected it on replay validation, breaking the
+    load-bearing replay invariant from Commit 1.  Schema loosened to
+    ``dict[str, float | None]`` so the absent-vs-None distinction
+    survives — Round 9 calibration decides what to do with each.
+    """
+    ledger = PaperLedger(tmp_path)
+    original = _make_order()
+    # Replace staleness dict with one that mixes float and None.
+    original_with_none = original.model_copy(update={
+        "feed_staleness_ms": {"polymarket": None, "kalshi": 12.3, "deribit": 5.0},
+    })
+    ledger.append_order(original_with_none)
+
+    loaded = list(ledger.replay_orders())
+    assert len(loaded) == 1
+    rec = loaded[0]
+    # None is preserved as None, not silently dropped or coerced.
+    assert rec.feed_staleness_ms == {
+        "polymarket": None, "kalshi": 12.3, "deribit": 5.0,
+    }
+    assert rec.feed_staleness_ms["polymarket"] is None
+
+
 def test_paper_fill_record_round_trip(tmp_path: Path):
     ledger = PaperLedger(tmp_path)
     original = _make_fill()

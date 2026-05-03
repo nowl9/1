@@ -71,6 +71,19 @@ class AgentState:
     # ── Risk config (live mirror of RiskManager config) ───────────────────────
     risk_config: dict[str, Any] = field(default_factory=dict)
 
+    # ── Round 8 Commit 3: Paper-trading panels ────────────────────────────────
+    # Open paper positions in dashboard PositionRow schema.  Populated by
+    # main.Agent._paper_position_payload from PaperPositionTracker.open_positions().
+    paper_open_positions: list[dict[str, Any]] = field(default_factory=list)
+    # Closed paper positions in dashboard settle-row schema.  Populated by
+    # main.Agent._paper_settlement_payload from PaperPositionTracker.closed_positions().
+    paper_settlements: list[dict[str, Any]] = field(default_factory=list)
+    # Aggregate stats from PaperPositionTracker.performance_summary().
+    paper_performance: dict[str, Any] = field(default_factory=dict)
+    # Signal funnel counters (observed → passed → placed → filled/no_fill).
+    # Populated by main.Agent._funnel.
+    signal_fired_skipped: dict[str, Any] = field(default_factory=dict)
+
 
 # ── SharedState ────────────────────────────────────────────────────────────────
 
@@ -143,4 +156,9 @@ class SharedState:
                 "performance": s.performance,
 
                 "risk_config": s.risk_config,
+
+                "paper_open_positions": s.paper_open_positions,
+                "paper_settlements": s.paper_settlements,
+                "paper_performance": s.paper_performance,
+                "signal_fired_skipped": s.signal_fired_skipped,
             }

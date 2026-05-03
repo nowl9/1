@@ -254,14 +254,26 @@ class TestSignalPayloadIdStability:
 
 
 class TestRunScanPipelineEndToEnd:
-    def test_pipeline_produces_signal_for_clear_edge(self) -> None:
+    @pytest.mark.asyncio
+    async def test_pipeline_produces_signal_for_clear_edge(
+        self, monkeypatch, tmp_path,
+    ) -> None:
         """Seed a single matching cache entry + a clearly-edged PM tick;
         assert the full chain emits exactly one passing signal payload.
 
         Edge math:
           options mid = 0.55, pm yes_ask = 0.42
           edge_yes_conservative = 0.55 - 0.42 = +0.13 (well above default 0.03)
+
+        Round 8 Commit 3 made ``run_scan_pipeline`` async (it now awaits
+        ``OrderManager.place``).  Test was synchronous; converted to
+        async + await with ``@pytest.mark.asyncio``.  Monkeypatches the
+        paper_ledger_dir to ``tmp_path`` so the agent's paper-trading
+        side effects don't leak into the test runner's CWD.
         """
+        monkeypatch.setattr(
+            "btc_pm_arb.config.settings.paper_ledger_dir", str(tmp_path),
+        )
         agent = Agent(dry_run=True)
 
         # Seed feed-health timestamps so the freshness gate doesn't reject.
@@ -294,7 +306,7 @@ class TestRunScanPipelineEndToEnd:
 
         # Drain + run the pipeline (the body of what _scan_task calls).
         pm_ticks = agent.flush_pm_ticks()
-        agent.run_scan_pipeline(pm_ticks)
+        await agent.run_scan_pipeline(pm_ticks)
 
         # Exactly one passing signal, on YES side, with edge > 10 %.
         assert len(agent._latest_signals) == 1
@@ -308,13 +320,19 @@ class TestRunScanPipelineEndToEnd:
         # Confidence was scored (not the 0.5 placeholder, but in [0, 1]).
         assert 0.0 <= sig["confidence"] <= 1.0
 
-    def test_pipeline_clears_signals_on_empty_cache(self) -> None:
+    @pytest.mark.asyncio
+    async def test_pipeline_clears_signals_on_empty_cache(
+        self, monkeypatch, tmp_path,
+    ) -> None:
         """Cold-start: empty cache → matcher returns no matches → empty signals.
 
         Verifies the clear-on-empty branch in run_scan_pipeline so a
         previous scan's signals don't linger when the matcher finds
         nothing on the next tick.
         """
+        monkeypatch.setattr(
+            "btc_pm_arb.config.settings.paper_ledger_dir", str(tmp_path),
+        )
         agent = Agent(dry_run=True)
         # Pre-stash signals as if a prior scan had populated them.
         agent._latest_signals = [{"id": "stale", "actionable": True}]
@@ -323,7 +341,7 @@ class TestRunScanPipelineEndToEnd:
         tick = _make_pm_tick()
         agent.ingest_pm_tick(tick)
 
-        agent.run_scan_pipeline(agent.flush_pm_ticks())
+        await agent.run_scan_pipeline(agent.flush_pm_ticks())
 
         # Stale state cleared by the matcher short-circuit branch.
         assert agent._latest_signals == []

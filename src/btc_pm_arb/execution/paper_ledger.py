@@ -159,7 +159,17 @@ class PaperOrderRecord(BaseModel):
     fill_adjusted_edge: float | None = None
     confidence: float = Field(ge=0.0, le=1.0)
     vol_regime: str
-    feed_staleness_ms: dict[str, float] = Field(default_factory=dict)
+    # Per-feed staleness at order time (ms).  Values are nullable: None
+    # means "feed entry present in dict but no staleness measurement
+    # available" (e.g. Polymarket queried but no tick observed yet);
+    # absence from the dict means "feed wasn't queried at all."  The
+    # distinction matters for Round 9 calibration — see Commit-2
+    # self-audit note about not prematurely tightening this schema.
+    # Without nullable values, a record like {"polymarket": None, ...}
+    # writes successfully through pydantic on Python construction but
+    # fails to round-trip from JSONL, breaking the load-bearing replay
+    # invariant from Commit 1's idempotency test.
+    feed_staleness_ms: dict[str, float | None] = Field(default_factory=dict)
 
     # ── From MatchResult ──────────────────────────────────────────────────────
     strike_gap_pct: float

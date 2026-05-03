@@ -48,7 +48,15 @@ import structlog
 import uvicorn
 
 from btc_pm_arb.config import settings
-from btc_pm_arb.execution.orders import OrderManager
+from btc_pm_arb.execution.fill_simulator import BookSnapshot, FillSimulator
+from btc_pm_arb.execution.orders import OrderManager, Order
+from btc_pm_arb.execution.paper_ledger import (
+    BookLevel,
+    PaperLedger,
+    PaperOrderRecord,
+)
+from btc_pm_arb.execution.paper_positions import PaperPosition, PaperPositionTracker
+from btc_pm_arb.execution.paper_settlement import KalshiSettlementPoller
 from btc_pm_arb.execution.positions import PositionTracker
 from btc_pm_arb.execution.risk import RiskConfig, RiskManager
 from btc_pm_arb.execution.settlement import SettlementMonitor
@@ -131,7 +139,11 @@ class Agent:
             max_position_per_contract_usd=settings.max_position_usd,
             max_total_exposure_usd=settings.max_total_exposure_usd,
         ))
-        self.order_mgr = OrderManager(dry_run=dry_run)
+        # Round 8 Commit 2: dry_run_paper_mode=True suppresses
+        # KalshiExecutor's optimistic auto-fill on refresh() so the paper
+        # FillSimulator owns the FILLED transition instead.  See
+        # execution/orders.py KalshiExecutor docstring.
+        self.order_mgr = OrderManager(dry_run=dry_run, dry_run_paper_mode=dry_run)
         self.settlement_monitor = SettlementMonitor(self.tracker)
 
         live_token = secrets.token_urlsafe(16)
@@ -139,10 +151,10 @@ class Agent:
 
         self._pending_ticks: list[OptionTick] = []
         # Buffer of prediction-market ticks awaiting matcher consumption.
-        # Populated by Kalshi (Round 6) and Polymarket (Issue 5, deferred)
-        # feed tasks via ``ingest_pm_tick``.  The matcher pipeline that
-        # drains this buffer is queued as a future round; bounded deque
-        # prevents unbounded growth in the meantime.
+        # Populated by Kalshi (Round 6) and Polymarket (Round 7b) feed tasks
+        # via ``ingest_pm_tick``.  Drained per scan tick by
+        # ``run_scan_pipeline`` and ``mark_to_market``; bounded deque
+        # prevents unbounded growth across feed disconnections.
         self._pending_pm_ticks: deque[PredictionMarketTick] = deque(maxlen=10_000)
         # First-observed PM tick per source — gates the diagnostic log in
         # ``ingest_pm_tick`` so we get exactly ONE shape sample per source
@@ -156,6 +168,57 @@ class Agent:
         # list during cold-start (no fitted smiles → empty cache → no
         # matches).  Defensive copy on read keeps shared-state independent.
         self._latest_signals: list[dict] = []
+
+        # ── Round 8 Commit 3: Paper-trading components ────────────────────────
+        self.paper_ledger = PaperLedger(settings.paper_ledger_dir)
+        self.fill_simulator = FillSimulator()
+        self.paper_positions = PaperPositionTracker()
+        # Order registry keyed by client_order_id — populated as the agent
+        # places paper orders, and re-populated from disk on startup so the
+        # settlement poller can still look up theoretical_edge for positions
+        # opened in a previous process lifetime.
+        self._paper_orders_by_id: dict[str, PaperOrderRecord] = {}
+        # Signal-funnel counters surfaced via SharedState.signal_fired_skipped.
+        # All increments happen from the scan task (via run_scan_pipeline);
+        # serialized by the single event loop, no locking required.
+        self._funnel: dict[str, int] = {
+            "signals_observed_total": 0,
+            "signals_passed_filter": 0,
+            "signals_rejected_filter": 0,
+            "paper_orders_placed": 0,
+            "paper_orders_filled": 0,
+            "paper_orders_no_fill": 0,
+        }
+        # Replay paper-trading state from disk so positions and the orders
+        # registry persist across restarts (the load-bearing
+        # replay/idempotency invariant from Commit 1's tests).  Done inline
+        # rather than via PaperPositionTracker.replay_from_disk so we can
+        # populate _paper_orders_by_id from the same file scan — avoids
+        # double-reading orders.jsonl and double-incrementing the ledger's
+        # n_records_loaded counter.
+        for _order_rec in self.paper_ledger.replay_orders():
+            self._paper_orders_by_id[_order_rec.client_order_id] = _order_rec
+        for _fill_rec in self.paper_ledger.replay_fills():
+            _matched = self._paper_orders_by_id.get(_fill_rec.client_order_id)
+            if _matched is not None:
+                self.paper_positions.record_fill(
+                    order_record=_matched, fill_record=_fill_rec,
+                )
+        for _settle_rec in self.paper_ledger.replay_settlements():
+            self.paper_positions.settle(_settle_rec)
+
+        # Kalshi paper-settlement poller — runs every 60 s in its own
+        # task.  Detects contract resolutions and calls back into
+        # paper_positions.settle() + paper_ledger.append_settlement().
+        # Looks up theoretical_edge via the orders registry above.
+        self.paper_settlement_poller = KalshiSettlementPoller(
+            tracker=self.paper_positions,
+            ledger=self.paper_ledger,
+            get_order_record=lambda cid: self._paper_orders_by_id.get(cid),
+            base_url=settings.kalshi_base_url,
+            key_path=settings.kalshi_private_key_path,
+            key_id=settings.kalshi_api_key_id,
+        )
 
     def ingest_tick(self, tick: OptionTick) -> None:
         self._pending_ticks.append(tick)
@@ -183,10 +246,13 @@ class Agent:
         """Stage a prediction-market tick for matcher consumption.
 
         Called from ``_kalshi_task`` (Round 6) and ``_polymarket_task``
-        (Issue 5, deferred).  Today this just buffers the tick; the
-        matcher → edge → filter → confidence → orders pipeline that
-        drains the buffer is wired up in a future round.  ``ContractMatcher``
-        is constructed in ``Agent.__init__`` but not yet invoked anywhere.
+        (Round 7b).  Buffers the tick; the matcher → edge → filter →
+        confidence → place + simulate + record paper-trading pipeline
+        drains the buffer once per scan tick (5 s cadence) inside
+        :meth:`run_scan_pipeline`.  As of Round 8 Commit 3 the dry-run
+        gate is lifted: passing signals flow through ``OrderManager.place``
+        and the FillSimulator records intent/fill/position into the
+        paper-trading ledger.
 
         The first tick observed per source is logged at INFO under
         ``pm_tick.first_observed`` with the full pydantic dump — a
@@ -235,19 +301,26 @@ class Agent:
                     source=DataSource.DERIBIT,
                 )
 
-    # ── Round 7c step 2: matcher → edge → filter → confidence pipeline ────────
+    # ── Round 7c step 2 / Round 8 Commit 3: matcher → edge → filter → ────────
+    # confidence → place + simulate + record paper-trading pipeline.
 
-    def run_scan_pipeline(self, pm_ticks: list[PredictionMarketTick]) -> None:
-        """Drain → match → edge → filter → confidence → emit.
+    async def run_scan_pipeline(self, pm_ticks: list[PredictionMarketTick]) -> None:
+        """Drain → match → edge → filter → confidence → emit + paper-trade.
 
         Called from ``_scan_task`` once per scan cadence with the buffered
         PM ticks.  Populates ``self._latest_signals`` with a unified list
         of passing + rejected signal payloads for the dashboard.
 
-        DRY-OBSERVATION ONLY (Round 7c step 2): signals are logged at
-        INFO under ``signal.observed`` and pushed to the dashboard.
-        Order placement deferred to Round 8 — do NOT add a call to
-        ``self.order_mgr.place(...)`` here without lifting that gate.
+        Round 8 Commit 3: lifted the dry-observation gate.  Each passing
+        signal flows through ``OrderManager.place()`` (still
+        Polymarket-short-circuited and dedup-gated as before).  When dry_run
+        is True, the resulting order is recorded in the paper-trading ledger
+        and the FillSimulator evaluates an at-or-better-than-best fill
+        against the originating tick's snapshot.  When dry_run is False
+        (live mode — out of scope this round), the place call still happens
+        but the paper-trading recording branch is skipped.
+
+        Async because :meth:`OrderManager.place` is async.
         """
         # Feed the velocity tracker.  ``yes_mid`` is a @property that
         # returns None unless both yes_bid and yes_ask are non-None;
@@ -267,8 +340,22 @@ class Agent:
 
         edges = [self.edge_calc.compute(m, surface=self.surface) for m in matches]
 
-        # ``positions`` is empty until Round 8 places orders.  Passed to
-        # the correlated-exposure filter; criterion no-ops on empty dict.
+        # Funnel: every match-resulting edge counts as one observed signal.
+        self._funnel["signals_observed_total"] += len(edges)
+
+        # Originating-tick lookup for paper-order snapshot capture.  Built
+        # from each edge's stored ``match.pm_tick`` rather than from
+        # ``pm_ticks`` directly so the snapshot is guaranteed to be the
+        # exact tick the matcher consumed (defends against duplicate-tick
+        # reordering in the input list).
+        tick_by_contract: dict[str, PredictionMarketTick] = {
+            e.match.pm_tick.contract_id: e.match.pm_tick for e in edges
+        }
+
+        # ``positions`` is the input to the correlated-exposure filter.
+        # Round 8 Commit 3 keeps it empty (paper positions are tracked
+        # separately in self.paper_positions and don't feed this gate);
+        # the criterion no-ops on empty dict.
         positions: dict[str, float] = {}
 
         passing = self.signal_filter.filter(
@@ -279,6 +366,8 @@ class Agent:
             odds_tracker=self.odds_tracker,
             rv_tracker=self.rv_tracker,
         )
+
+        self._funnel["signals_passed_filter"] += len(passing)
 
         # Backfill confidence onto each passing signal from its
         # originating EdgeResult.  ArbitrageSignal is mutable (no
@@ -314,6 +403,8 @@ class Agent:
             if reason is not None:
                 rejected.append((e, reason))
 
+        self._funnel["signals_rejected_filter"] += len(rejected)
+
         self._latest_signals = self._build_signal_payloads(passing, rejected)
 
         for sig in passing:
@@ -331,6 +422,129 @@ class Agent:
                 pm_mid=round(sig.pm_quote.mid_prob, 4),
                 options_mid=round(sig.options_quote.mid_prob, 4),
             )
+
+            # ── Round 8 Commit 3: dry-run-gated paper-order pipeline ─────────
+            # In dry_run mode: place the order through OrderManager (which
+            # still short-circuits Polymarket and dedupes by signal
+            # fingerprint), then record + simulate + persist.  In live mode
+            # this branch is skipped — live execution wiring is a future
+            # round.
+            if self.dry_run:
+                order = await self.order_mgr.place(
+                    sig, size_usd=_BASE_SIZE_USD,
+                )
+                if order is not None:
+                    self._funnel["paper_orders_placed"] += 1
+                    originating_edge = edges_by_id.get(sig.pm_quote.contract_id)
+                    originating_tick = tick_by_contract.get(sig.pm_quote.contract_id)
+                    if originating_edge is None or originating_tick is None:
+                        # Defensive: should never happen — the signal came
+                        # from a passing edge whose tick is in the lookup.
+                        log.warning(
+                            "paper_ledger.missing_originating_data",
+                            contract_id=sig.pm_quote.contract_id,
+                            edge_present=originating_edge is not None,
+                            tick_present=originating_tick is not None,
+                        )
+                    else:
+                        self._record_paper_order(
+                            order=order,
+                            signal=sig,
+                            edge_result=originating_edge,
+                            tick=originating_tick,
+                        )
+
+    def _record_paper_order(
+        self,
+        *,
+        order: Order,
+        signal: ArbitrageSignal,
+        edge_result: EdgeResult,
+        tick: PredictionMarketTick,
+    ) -> None:
+        """Build the paper order record, simulate fill, and persist both.
+
+        Called from ``run_scan_pipeline``'s dry-run gate.  Single source
+        of truth for the order intent → fill simulation → ledger
+        round-trip; keeps the scan pipeline body readable.
+        """
+        order_record = self._build_paper_order_record(
+            order=order, signal=signal, edge_result=edge_result, tick=tick,
+        )
+        self.paper_ledger.append_order(order_record)
+        self._paper_orders_by_id[order.client_order_id] = order_record
+
+        snapshot = BookSnapshot.from_order_record(order_record)
+        evaluation = self.fill_simulator.evaluate(
+            side=order.side,  # type: ignore[arg-type]
+            limit_price=order.limit_price,
+            size_usd=order.size_usd,
+            snapshot=snapshot,
+        )
+        fill_record = self.fill_simulator.build_fill_record(
+            client_order_id=order.client_order_id,
+            evaluation=evaluation,
+            filled_at=datetime.now(timezone.utc),
+        )
+        self.paper_ledger.append_fill(fill_record)
+        self.paper_positions.record_fill(
+            order_record=order_record, fill_record=fill_record,
+        )
+
+        if evaluation.outcome == "full":
+            self._funnel["paper_orders_filled"] += 1
+        elif evaluation.outcome == "no_fill":
+            self._funnel["paper_orders_no_fill"] += 1
+
+    def _build_paper_order_record(
+        self,
+        *,
+        order: Order,
+        signal: ArbitrageSignal,
+        edge_result: EdgeResult,
+        tick: PredictionMarketTick,
+    ) -> PaperOrderRecord:
+        """Synthesise a :class:`PaperOrderRecord` from runtime objects.
+
+        Match-quality fields come from the originating ``EdgeResult.match``
+        so Round 9 calibration can study the relationship between match
+        gap and realised P&L.  Order-book depth is converted from the
+        tick's ``list[tuple[float, float]]`` shape into named-field
+        :class:`BookLevel` instances per the Commit-1 forward-compat
+        decision (see paper_ledger.py BookLevel docstring).
+        """
+        m = edge_result.match
+        return PaperOrderRecord(
+            client_order_id=order.client_order_id,
+            signal_fingerprint=self.order_mgr._signal_fingerprint(signal),
+            created_at=order.created_at,
+            platform=order.platform,
+            contract_id=order.contract_id,
+            side=order.side,  # type: ignore[arg-type]
+            size_usd=order.size_usd,
+            limit_price=order.limit_price,
+            raw_edge=signal.raw_edge,
+            adjusted_edge=signal.adjusted_edge,
+            fill_adjusted_edge=signal.fill_adjusted_edge,
+            confidence=signal.confidence,
+            vol_regime=signal.vol_regime,
+            feed_staleness_ms=dict(signal.feed_staleness_ms),
+            strike_gap_pct=m.strike_gap_pct,
+            expiry_gap_hours=m.expiry_gap_hours,
+            match_quality=m.match_quality,
+            pm_yes_bid=tick.yes_bid,
+            pm_yes_ask=tick.yes_ask,
+            pm_no_bid=tick.no_bid,
+            pm_no_ask=tick.no_ask,
+            order_book_yes=[
+                BookLevel(price=p, size_usd=s) for p, s in tick.order_book_yes
+            ],
+            order_book_no=[
+                BookLevel(price=p, size_usd=s) for p, s in tick.order_book_no
+            ],
+            expiry=signal.pm_quote.expiry,
+            dry_run=self.dry_run,
+        )
 
     def _build_signal_payloads(
         self,
@@ -487,6 +701,25 @@ class Agent:
         perf = self.tracker.performance_summary()
         settlements = [p.snapshot() for p in self.tracker.closed_positions()]
 
+        # ── Round 8 Commit 3: Paper-trading dashboard payload ──────────────────
+        paper_open = [
+            self._paper_position_payload(p)
+            for p in self.paper_positions.open_positions()
+        ]
+        paper_settled = [
+            self._paper_settlement_payload(p)
+            for p in self.paper_positions.closed_positions()
+        ]
+        # Cap settled list at 50 most-recent for the dashboard.  Sort by
+        # updated_at so the most recently settled appear first.
+        paper_settled.sort(
+            key=lambda d: d.get("settled_at") or "",
+            reverse=True,
+        )
+        paper_settled = paper_settled[:50]
+        paper_perf = self.paper_positions.performance_summary()
+        funnel = dict(self._funnel)
+
         async with self.shared_state.write() as s:
             s.feeds = feeds
             s.vol_surface = vol_surface
@@ -498,6 +731,12 @@ class Agent:
             s.positions_summary = perf
             s.settlements = settlements
             s.performance = perf
+
+            # Round 8 Commit 3: paper-trading panels.
+            s.paper_open_positions = paper_open
+            s.paper_settlements = paper_settled
+            s.paper_performance = paper_perf
+            s.signal_fired_skipped = funnel
 
             # Risk config snapshot
             cfg = self.risk.config
@@ -511,6 +750,82 @@ class Agent:
             # Latest BTC price
             if self.rv_tracker.newest_ts is not None and self.rv_tracker.n_points > 0:
                 s.btc_price = math.exp(self.rv_tracker._data[-1][1])
+
+    def _paper_position_payload(self, pos: PaperPosition) -> dict:
+        """Render a paper position in the dashboard's PositionRow schema.
+
+        Adds the alias keys that ``server/static/index.html``'s
+        ``PositionRow`` reads (``name``, ``contract``, ``mark_price``,
+        ``size``, ``notional``, ``pnl``) on top of the canonical
+        :meth:`PaperPosition.snapshot` fields.
+        """
+        snap = pos.snapshot()
+        return {
+            **snap,
+            "id": f"{pos.contract_id}:{pos.side}",
+            "name": pos.contract_id,
+            "contract": pos.contract_id,
+            "mark_price": snap["current_mid"],
+            "size": snap["filled_size_usd"],
+            "notional": snap["filled_size_usd"],
+            "pnl": snap["unrealized_pnl"],
+        }
+
+    def _paper_settlement_payload(self, pos: PaperPosition) -> dict:
+        """Render a closed paper position in the dashboard's settle-row schema.
+
+        Derives ``outcome``, ``edge_captured``, and ``theoretical_edge``
+        from the position's stored realized_pnl + the originating order
+        record's adjusted_edge.  The dashboard's existing settlement
+        renderer reads ``result``/``outcome``, ``pnl``/``realized_pnl``,
+        ``edge_captured``, ``edge_theoretical``/``theoretical_edge``.
+        """
+        order_record = None
+        if pos.order_ids:
+            order_record = self._paper_orders_by_id.get(pos.order_ids[0])
+        theoretical_edge = order_record.adjusted_edge if order_record else 0.0
+
+        if pos.realized_pnl > 1e-4:
+            outcome = "win"
+        elif pos.realized_pnl < -1e-4:
+            outcome = "loss"
+        else:
+            outcome = "push"
+
+        # edge_captured = realised payout-vs-entry / theoretical edge.
+        # Guard against zero edge (avoid div-by-zero); 0.0 is the
+        # well-defined sentinel the existing renderer treats as "—".
+        if pos.settlement_price is not None:
+            payout = (
+                pos.settlement_price if pos.side == "yes"
+                else 1.0 - pos.settlement_price
+            )
+            actual_edge = payout - pos.entry_price
+            edge_captured = (
+                actual_edge / theoretical_edge
+                if abs(theoretical_edge) > 1e-9 else 0.0
+            )
+        else:
+            edge_captured = 0.0
+
+        return {
+            "id": f"{pos.contract_id}:{pos.side}:settled",
+            "name": pos.contract_id,
+            "contract": pos.contract_id,
+            "platform": pos.platform.value,
+            "side": pos.side,
+            "outcome": outcome,
+            "result": outcome,
+            "realized_pnl": pos.realized_pnl,
+            "pnl": pos.realized_pnl,
+            "theoretical_edge": theoretical_edge,
+            "edge_theoretical": theoretical_edge,
+            "edge_captured": edge_captured,
+            "settlement_price": pos.settlement_price,
+            "settled_at": (
+                pos.updated_at.isoformat() if pos.updated_at else None
+            ),
+        }
 
 
 # ── Tasks ──────────────────────────────────────────────────────────────────────
@@ -625,13 +940,19 @@ async def _scan_task(agent: Agent, stop_event: asyncio.Event) -> None:
             if dirty:
                 agent.update_cache_from_surface(dirty)
 
-            # Round 7c step 2: drain PM-tick buffer and run the dormant
-            # matcher → edge → filter → confidence pipeline.  Populates
-            # agent._latest_signals which _push_state_update copies into
-            # the dashboard payload below.  DRY-OBSERVATION ONLY — no
-            # orders are placed in this round (Round 8 work).
+            # Drain PM-tick buffer and run the matcher → edge → filter →
+            # confidence pipeline.  Round 8 Commit 3 lifted the
+            # dry-observation gate: passing signals now flow through
+            # OrderManager.place + paper-trading record/simulate inside
+            # run_scan_pipeline.  Async because place() is async.
             pm_ticks = agent.flush_pm_ticks()
-            agent.run_scan_pipeline(pm_ticks)
+            await agent.run_scan_pipeline(pm_ticks)
+
+            # Mark all open paper positions against the latest ticks.  Per
+            # the freshness-of-observation contract from Commit 1:
+            # last_mark_at bumps on every observation, even when the side
+            # mid is unchanged or the book is one-sided.
+            agent.paper_positions.mark_to_market(pm_ticks)
 
             # Push state update to dashboard
             await agent._push_state_update()
@@ -653,6 +974,20 @@ async def _order_refresh_task(agent: Agent, stop_event: asyncio.Event) -> None:
                 agent.tracker.record_fill(o)
         except Exception as exc:
             log.error("order_refresh.error", error=str(exc))
+
+
+async def _paper_settlement_task(agent: Agent, stop_event: asyncio.Event) -> None:
+    """Run the Kalshi paper-settlement poller (Commit 2) until stop_event fires.
+
+    The poller's own ``run`` loop owns its 60-second cadence and
+    error-recovery; this task is just a thin async-context wrapper so
+    ``aclose`` runs on shutdown for any HTTP client the poller
+    constructed.
+    """
+    try:
+        await agent.paper_settlement_poller.run(stop_event)
+    finally:
+        await agent.paper_settlement_poller.aclose()
 
 
 async def _dashboard_task(agent: Agent, stop_event: asyncio.Event) -> None:
@@ -709,6 +1044,9 @@ async def run(dry_run: bool = True) -> None:
             tg.create_task(_scan_task(agent, stop_event), name="scan")
             tg.create_task(_order_refresh_task(agent, stop_event), name="order-refresh")
             tg.create_task(agent.settlement_monitor.run(stop_event), name="settlement")
+            tg.create_task(
+                _paper_settlement_task(agent, stop_event), name="paper-settlement",
+            )
             tg.create_task(_dashboard_task(agent, stop_event), name="dashboard")
     except* KeyboardInterrupt:
         stop_event.set()

@@ -1082,45 +1082,97 @@ function PositionRow({ pos }) {
 }
 
 function TabPositions({ snap }) {
-  const positions = snap?.positions || [];
-  const settlements = snap?.settlements || [];
-  const perf = snap?.performance || {};
+  // Round 8 Commit 3: in dry_run mode, source positions/settlements/perf
+  // from the paper-trading panels populated by main.Agent's
+  // _push_state_update.  Live mode keeps the existing (untouched) sources.
+  const isDryRun = snap?.agent_status === "dry_run";
+  const positions = isDryRun ? (snap?.paper_open_positions || []) : (snap?.positions || []);
+  const settlements = isDryRun ? (snap?.paper_settlements || []) : (snap?.settlements || []);
+  const perf = isDryRun ? (snap?.paper_performance || {}) : (snap?.performance || {});
   const summary = snap?.positions_summary || {};
+  const funnel = snap?.signal_fired_skipped || {};
 
-  const settled = perf.settled_pnl ?? 0;
+  // Stat-cell values normalised across live vs paper schemas.
+  const settledPnl = isDryRun ? (perf.total_realized_pnl ?? 0) : (perf.settled_pnl ?? 0);
+  const unrealizedPnl = isDryRun ? (perf.total_unrealized_pnl ?? 0) : null;
+  const totalPnl = isDryRun ? (perf.total_paper_pnl ?? 0) : null;
   const winRate = perf.win_rate;
-  const ecr = perf.edge_capture_ratio ?? perf.edge_capture ?? null;
+  const ecr = isDryRun ? null : (perf.edge_capture_ratio ?? perf.edge_capture ?? null);
+  const tradeCount = isDryRun
+    ? (perf.closed_paper_positions ?? null)
+    : (perf.trade_count ?? null);
 
   return (
     <>
+      {isDryRun && (
+        <div className="card" style={{marginBottom: "0.75rem"}}>
+          <div className="card-header">
+            <div className="card-title">PAPER (DRY-RUN)</div>
+            <Pill kind="amber">SIMULATED</Pill>
+          </div>
+          <div className="settle-meta" style={{padding: "0 0.5rem 0.5rem"}}>
+            Signal funnel — observed: <b>{funnel.signals_observed_total ?? 0}</b>
+            {" → "} passed: <b>{funnel.signals_passed_filter ?? 0}</b>
+            {" → "} placed: <b>{funnel.paper_orders_placed ?? 0}</b>
+            {" → "} filled: <b>{funnel.paper_orders_filled ?? 0}</b>
+            {" · "} no-fill: <b>{funnel.paper_orders_no_fill ?? 0}</b>
+          </div>
+        </div>
+      )}
+
       <div className="stat-grid">
         <StatCell
-          label="SETTLED P&L"
-          value={fmtUsd(settled, { signed: true, digits: 2 })}
-          valueClass={pnlClass(settled)}
+          label={isDryRun ? "REALIZED P&L (PAPER)" : "SETTLED P&L"}
+          value={fmtUsd(settledPnl, { signed: true, digits: 2 })}
+          valueClass={pnlClass(settledPnl)}
         />
-        <StatCell
-          label="WIN RATE"
-          value={winRate != null ? fmtPct(winRate, 0) : "—"}
-          sub={perf.trade_count != null ? `${perf.trade_count} trades` : null}
-          valueClass="bright"
-        />
-        <StatCell
-          label="EDGE CAPTURE"
-          value={ecr != null ? fmtPct(ecr, 0) : "—"}
-          valueClass="bright"
-        />
-        <StatCell
-          label="OPEN"
-          value={positions.length}
-          sub={summary.total_exposure != null ? fmtUsd(summary.total_exposure, { digits: 0 }) : null}
-          valueClass="bright"
-        />
+        {isDryRun ? (
+          <StatCell
+            label="UNREALIZED P&L (PAPER)"
+            value={fmtUsd(unrealizedPnl, { signed: true, digits: 2 })}
+            valueClass={pnlClass(unrealizedPnl)}
+          />
+        ) : (
+          <StatCell
+            label="WIN RATE"
+            value={winRate != null ? fmtPct(winRate, 0) : "—"}
+            sub={tradeCount != null ? `${tradeCount} trades` : null}
+            valueClass="bright"
+          />
+        )}
+        {isDryRun ? (
+          <StatCell
+            label="TOTAL P&L (PAPER)"
+            value={fmtUsd(totalPnl, { signed: true, digits: 2 })}
+            valueClass={pnlClass(totalPnl)}
+          />
+        ) : (
+          <StatCell
+            label="EDGE CAPTURE"
+            value={ecr != null ? fmtPct(ecr, 0) : "—"}
+            valueClass="bright"
+          />
+        )}
+        {isDryRun ? (
+          <StatCell
+            label="WIN RATE (PAPER)"
+            value={winRate != null ? fmtPct(winRate, 0) : "—"}
+            sub={tradeCount != null ? `${tradeCount} settled` : null}
+            valueClass="bright"
+          />
+        ) : (
+          <StatCell
+            label="OPEN"
+            value={positions.length}
+            sub={summary.total_exposure != null ? fmtUsd(summary.total_exposure, { digits: 0 }) : null}
+            valueClass="bright"
+          />
+        )}
       </div>
 
       <div className="card">
         <div className="card-header">
-          <div className="card-title">OPEN POSITIONS</div>
+          <div className="card-title">{isDryRun ? "OPEN POSITIONS (PAPER)" : "OPEN POSITIONS"}</div>
           <Pill kind="dim">{positions.length}</Pill>
         </div>
         {positions.length === 0 ? (
@@ -1130,7 +1182,7 @@ function TabPositions({ snap }) {
 
       <div className="card">
         <div className="card-header">
-          <div className="card-title">SETTLEMENT LOG</div>
+          <div className="card-title">{isDryRun ? "SETTLEMENT LOG (PAPER)" : "SETTLEMENT LOG"}</div>
           <Pill kind="dim">{settlements.length}</Pill>
         </div>
         {settlements.length === 0 ? (
