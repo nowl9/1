@@ -123,10 +123,23 @@ class KalshiExecutor:
 
     Authentication: RSA-PSS signature over ``timestamp + method + path``.
     The private key is loaded once at construction from the path in settings.
+
+    Round 8 paper-mode flag (``dry_run_paper_mode``)
+    -------------------------------------------------
+    When ``dry_run_paper_mode=True`` (only meaningful with ``dry_run=True``),
+    :meth:`submit` still flips the order PENDING → PLACED so order-lifecycle
+    consumers see consistent state, but :meth:`refresh` becomes a no-op —
+    the paper :class:`fill_simulator.FillSimulator` owns the FILLED
+    transition.  Default is False so existing callers (and the existing
+    test_integration.py suite) continue to see the optimistic instant-fill
+    behaviour on ``refresh()``.
     """
 
-    def __init__(self, dry_run: bool = True) -> None:
+    def __init__(
+        self, dry_run: bool = True, dry_run_paper_mode: bool = False
+    ) -> None:
         self._dry_run = dry_run
+        self._dry_run_paper_mode = dry_run_paper_mode
         self._base_url = settings.kalshi_base_url
         self._key_id = settings.kalshi_api_key_id
         # Shared with feeds.kalshi.KalshiFeed via feeds._kalshi_auth so
@@ -197,6 +210,12 @@ class KalshiExecutor:
 
     async def refresh(self, order: Order) -> None:
         if self._dry_run:
+            if self._dry_run_paper_mode:
+                # Paper mode (Round 8): the FillSimulator owns the FILLED
+                # transition.  Refresh is intentionally a no-op so the
+                # executor doesn't double-fill orders the simulator has
+                # already evaluated.  See fill_simulator.py module docstring.
+                return
             # Simulate immediate fill in dry-run mode
             order.transition(
                 OrderState.FILLED,
@@ -293,11 +312,22 @@ class OrderManager:
         mgr = OrderManager(dry_run=True)
         order = await mgr.place(signal, size_usd=200.0)
         await mgr.refresh_all()
+
+    The ``dry_run_paper_mode`` flag is forwarded to the underlying
+    :class:`KalshiExecutor`.  When True (only meaningful with
+    ``dry_run=True``), ``refresh()`` becomes a no-op so the Round 8 paper
+    fill simulator owns the FILLED transition.  Default is False to
+    preserve existing test behaviour.
     """
 
-    def __init__(self, dry_run: bool = True) -> None:
+    def __init__(
+        self, dry_run: bool = True, dry_run_paper_mode: bool = False
+    ) -> None:
         self._dry_run = dry_run
-        self._kalshi = KalshiExecutor(dry_run=dry_run)
+        self._dry_run_paper_mode = dry_run_paper_mode
+        self._kalshi = KalshiExecutor(
+            dry_run=dry_run, dry_run_paper_mode=dry_run_paper_mode
+        )
         self._orders: dict[str, Order] = {}          # client_order_id → Order
         self._seen_signals: set[str] = set()         # deduplication by signal fingerprint
 
