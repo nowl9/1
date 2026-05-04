@@ -200,7 +200,13 @@ def bootstrap_mean_ci(
     if n == 1:
         v = float(finite[0])
         return (v, v, "degenerate_n=1")
-    if float(np.std(finite)) == 0.0:
+    if finite.min() == finite.max():
+        # Exact-equality check on min/max rather than ``np.std == 0``:
+        # for arithmetically-identical inputs ``[v, v, v]``, np.std
+        # computes ``mean = 3v/3`` which doesn't recover v exactly in
+        # float64 (1-ULP residual), leaving a ~1e-17 std that the
+        # ``== 0.0`` guard misses.  min == max is exact because
+        # subtraction of identical floats is exactly zero.
         v = float(finite[0])
         return (v, v, "degenerate_zero_variance")
     rng = np.random.default_rng(seed)
