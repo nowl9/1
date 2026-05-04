@@ -30,6 +30,21 @@ dev = [
     "pytest-asyncio>=0.23",
     "pytest-mock>=3.12",
     "anyio[trio]>=4.3",
+    # Round 9b1: analysis tooling tests need pandas + pyarrow (parquet)
+    # to exercise tools/analyze_paper_ledger.py.  Adding to ``dev`` so
+    # ``pip install -e .[dev]`` covers the full test suite.  The
+    # ``analysis`` extras group below is for users who only want the
+    # tooling without the test dependencies.
+    "pandas>=2.0",
+    "pyarrow>=14.0",
+]
+# Round 9b: paper-ledger analysis tooling.  Optional extras so the
+# runtime agent doesn't pull in pandas / pyarrow unnecessarily.
+# Install with ``pip install -e .[analysis]``.  Round 9b2 will append
+# matplotlib + statsmodels for charts and inferential statistics.
+analysis = [
+    "pandas>=2.0",
+    "pyarrow>=14.0",
 ]
 
 [project.scripts]
