@@ -1,0 +1,22 @@
+{
+  "expo": {
+    "name": "StreamBridge",
+    "slug": "streambridge",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "scheme": "streambridge",
+    "userInterfaceStyle": "automatic",
+    "newArchEnabled": true,
+    "splash": { "backgroundColor": "#0A0E1A", "resizeMode": "contain" },
+    "assetBundlePatterns": ["**/*"],
+    "ios": { "supportsTablet": true, "bundleIdentifier": "com.streambridge.app", "usesAppleSignIn": false },
+    "android": { "package": "com.streambridge.app", "adaptiveIcon": { "backgroundColor": "#0A0E1A" } },
+    "plugins": [
+      "expo-secure-store",
+      "expo-notifications",
+      "expo-background-fetch",
+      ["expo-task-manager"]
+    ],
+    "experiments": { "typedRoutes": true }
+  }
+}

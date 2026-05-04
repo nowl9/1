@@ -1,0 +1,186 @@
+// StreamBridge — Prisma schema.
+// Models cover: users, per-platform credentials, normalized playlists/tracks,
+// the join table, sync jobs, per-track sync attempts, and persisted match
+// overrides for the cross-platform matcher.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Platform {
+  SPOTIFY
+  APPLE_MUSIC
+  AMAZON_MUSIC
+  TIDAL
+  YOUTUBE_MUSIC
+  DEEZER
+  PANDORA
+}
+
+enum SyncJobStatus {
+  QUEUED
+  MATCHING
+  WRITING
+  COMPLETED
+  FAILED
+  PARTIAL
+}
+
+enum MatchStrategy {
+  ISRC
+  FUZZY_METADATA
+  AUDIO_FEATURES
+  MANUAL
+}
+
+model User {
+  id           String             @id @default(cuid())
+  email        String             @unique
+  displayName  String
+  passwordHash String?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  connections  ConnectedService[]
+  playlists    Playlist[]
+  syncJobs     SyncJob[]
+  matches      TrackMatch[]
+}
+
+model ConnectedService {
+  id                String   @id @default(cuid())
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId            String
+  platform          Platform
+  platformUserId    String
+  // Tokens are stored encrypted at rest; the column holds ciphertext + IV.
+  accessTokenEnc    String
+  refreshTokenEnc   String?
+  expiresAt         DateTime
+  scopes            String[]
+  tokenType         String   @default("Bearer")
+  lastRefreshedAt   DateTime @default(now())
+  revokedAt         DateTime?
+
+  @@unique([userId, platform])
+  @@index([platform])
+}
+
+model Playlist {
+  id              String         @id @default(cuid())
+  user            User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId          String
+  name            String
+  description     String?
+  artwork         String?
+  isPublic        Boolean        @default(false)
+  sourcePlatform  Platform
+  // Per-platform external IDs for the same logical playlist.
+  externalIds     Json           @default("{}")
+  lastSynced      Json           @default("{}")
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  tracks          PlaylistTrack[]
+  syncJobs        SyncJob[]
+
+  @@index([userId])
+}
+
+model Track {
+  id            String          @id @default(cuid())
+  universalId   String          @unique
+  title         String
+  artists       String[]
+  album         String
+  duration      Int
+  isrc          String?         @unique
+  artwork       String
+  previewUrl    String?
+  explicit      Boolean         @default(false)
+  // platformIds: { spotify: "...", "apple-music": "...", ... }
+  platformIds   Json            @default("{}")
+  availableOn   Platform[]
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+
+  playlistTracks PlaylistTrack[]
+  matchesA       TrackMatch[]    @relation("source")
+  matchesB       TrackMatch[]    @relation("candidate")
+
+  @@index([title])
+  @@index([isrc])
+}
+
+model PlaylistTrack {
+  id         String   @id @default(cuid())
+  playlist   Playlist @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+  playlistId String
+  track      Track    @relation(fields: [trackId], references: [id], onDelete: Cascade)
+  trackId    String
+  position   Int
+  addedAt    DateTime @default(now())
+
+  @@unique([playlistId, position])
+  @@index([trackId])
+}
+
+model SyncJob {
+  id             String         @id @default(cuid())
+  user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId         String
+  playlist       Playlist       @relation(fields: [playlistId], references: [id], onDelete: Cascade)
+  playlistId     String
+  status         SyncJobStatus  @default(QUEUED)
+  progress       Float          @default(0)
+  matched        Int            @default(0)
+  unavailable    Int            @default(0)
+  manualReview   Int            @default(0)
+  total          Int            @default(0)
+  options        Json
+  perPlatform    Json           @default("{}")
+  error          String?
+  startedAt      DateTime       @default(now())
+  finishedAt     DateTime?
+
+  jobTracks      SyncJobTrack[]
+
+  @@index([userId, startedAt])
+}
+
+model SyncJobTrack {
+  id          String        @id @default(cuid())
+  job         SyncJob       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  jobId       String
+  trackId     String
+  platform    Platform
+  status      String
+  confidence  Float?
+  strategy    MatchStrategy?
+  externalId  String?
+  error       String?
+
+  @@index([jobId])
+}
+
+model TrackMatch {
+  id          String         @id @default(cuid())
+  user        User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId      String
+  source      Track          @relation("source", fields: [sourceId], references: [id], onDelete: Cascade)
+  sourceId    String
+  candidate   Track?         @relation("candidate", fields: [candidateId], references: [id])
+  candidateId String?
+  platform    Platform
+  strategy    MatchStrategy
+  confidence  Float
+  manual      Boolean        @default(false)
+  createdAt   DateTime       @default(now())
+
+  @@unique([userId, sourceId, platform])
+}
