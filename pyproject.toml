@@ -37,14 +37,22 @@ dev = [
     # tooling without the test dependencies.
     "pandas>=2.0",
     "pyarrow>=14.0",
+    # Round 9b2a: matplotlib (chart rendering) + statsmodels (binary
+    # logit for outcome calibration) are exercised by the
+    # tests/test_tools/test_analyze_paper_ledger_9b2.py library-direct
+    # tests.  Pinned versions match the [analysis] group.
+    "matplotlib>=3.8",
+    "statsmodels>=0.14",
 ]
 # Round 9b: paper-ledger analysis tooling.  Optional extras so the
-# runtime agent doesn't pull in pandas / pyarrow unnecessarily.
-# Install with ``pip install -e .[analysis]``.  Round 9b2 will append
-# matplotlib + statsmodels for charts and inferential statistics.
+# runtime agent doesn't pull in pandas / pyarrow / matplotlib /
+# statsmodels unnecessarily.  Install with ``pip install -e .[analysis]``.
 analysis = [
     "pandas>=2.0",
     "pyarrow>=14.0",
+    # Round 9b2a: charts + inferential statistics.
+    "matplotlib>=3.8",
+    "statsmodels>=0.14",
 ]
 
 [project.scripts]
