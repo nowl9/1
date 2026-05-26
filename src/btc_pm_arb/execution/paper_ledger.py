@@ -7,11 +7,14 @@ strategy parameters against weeks-to-months of accumulated outcomes.
 
 Storage choice — append-only JSONL, one file per record kind
 ------------------------------------------------------------
-Three files under ``settings.paper_ledger_dir`` (default ``./paper_ledger/``):
+Four files under ``settings.paper_ledger_dir`` (default ``./paper_ledger/``):
 
   - ``orders.jsonl``       — :class:`PaperOrderRecord`
   - ``fills.jsonl``        — :class:`PaperFillRecord`
   - ``settlements.jsonl``  — :class:`PaperSettlementRecord`
+  - ``rejections.jsonl``   — :class:`PaperRejectionRecord` (per-event
+    filter-rejection log; Round 9c addition feeding tail_funnel and
+    Round 9d2 univariate-cuts analysis).
 
 Each line is one ``model_dump_json()``-encoded record.  The choice of JSONL
 over SQLite or SQLAlchemy was deliberate (Round 8 plan §a):
@@ -247,6 +250,41 @@ class PaperSettlementRecord(BaseModel):
     expiry: datetime
 
 
+class PaperRejectionRecord(BaseModel):
+    """Per-event filter-rejection record — written for every rejected edge.
+
+    Round 9c addition.  Persisted to ``rejections.jsonl``.  Captures the
+    per-event time series the in-memory ``SignalFilter.rejection_counts``
+    (cumulative only) cannot — required for tail_funnel's rolling 1h/6h
+    reject-rate surface during 9c, and read directly by 9d2 for
+    univariate cuts on ``best_conservative_edge`` vs ``reason_key``.
+
+    The full reason string is preserved alongside the stable bucket key:
+    bucket key drives counters and grouping (matches the existing
+    dashboard ``reject_<key>`` keys); full reason carries the numeric
+    detail (e.g. ``"conservative_edge 0.0050 < min 0.01"``) for forensics.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["rejection"] = "rejection"
+    schema_version: int = _SCHEMA_VERSION
+
+    timestamp: datetime
+    contract_id: str
+    platform: DataSource
+    reason_key: str
+    full_reason: str
+
+    # Edge value at rejection time — 9d2 reads this for univariate cuts on
+    # adjusted edge vs reject reason.  Source: EdgeResult.best_conservative_edge.
+    best_conservative_edge: float
+
+    # Same shape as PaperOrderRecord.vol_regime ("low" / "normal" / "high");
+    # source-side is rv_tracker.current_regime().value.
+    vol_regime: str
+
+
 # ── PaperLedger ───────────────────────────────────────────────────────────────
 
 T = TypeVar("T", bound=BaseModel)
@@ -271,6 +309,7 @@ class PaperLedger:
     _ORDERS_FILE: str = "orders.jsonl"
     _FILLS_FILE: str = "fills.jsonl"
     _SETTLEMENTS_FILE: str = "settlements.jsonl"
+    _REJECTIONS_FILE: str = "rejections.jsonl"
 
     def __init__(self, base_dir: str | Path) -> None:
         self._base_dir = Path(base_dir)
@@ -280,6 +319,7 @@ class PaperLedger:
         self._orders_path = self._base_dir / self._ORDERS_FILE
         self._fills_path = self._base_dir / self._FILLS_FILE
         self._settlements_path = self._base_dir / self._SETTLEMENTS_FILE
+        self._rejections_path = self._base_dir / self._REJECTIONS_FILE
 
         # Counters for skip-and-warn-with-counter reader policy.  Surfaced
         # via .health(); operators compare against raw line count to verify
@@ -297,6 +337,9 @@ class PaperLedger:
 
     def append_settlement(self, record: PaperSettlementRecord) -> None:
         self._append(self._settlements_path, record)
+
+    def append_rejection(self, record: PaperRejectionRecord) -> None:
+        self._append(self._rejections_path, record)
 
     def _append(self, path: Path, record: BaseModel) -> None:
         """Append one record as a JSON line, flush, and fsync.
@@ -324,6 +367,9 @@ class PaperLedger:
 
     def replay_settlements(self) -> Iterator[PaperSettlementRecord]:
         yield from self._replay(self._settlements_path, PaperSettlementRecord)
+
+    def replay_rejections(self) -> Iterator[PaperRejectionRecord]:
+        yield from self._replay(self._rejections_path, PaperRejectionRecord)
 
     def _replay(self, path: Path, model_cls: type[T]) -> Iterator[T]:
         """Yield records from ``path``; skip-and-warn on malformed lines.
@@ -372,6 +418,7 @@ class PaperLedger:
             "orders_path": str(self._orders_path),
             "fills_path": str(self._fills_path),
             "settlements_path": str(self._settlements_path),
+            "rejections_path": str(self._rejections_path),
         }
 
     @property

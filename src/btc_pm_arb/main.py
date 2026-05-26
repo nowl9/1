@@ -54,6 +54,7 @@ from btc_pm_arb.execution.paper_ledger import (
     BookLevel,
     PaperLedger,
     PaperOrderRecord,
+    PaperRejectionRecord,
 )
 from btc_pm_arb.execution.paper_positions import PaperPosition, PaperPositionTracker
 from btc_pm_arb.execution.paper_settlement import KalshiSettlementPoller
@@ -74,7 +75,7 @@ from btc_pm_arb.server.app import create_app
 from btc_pm_arb.server.state import SharedState
 from btc_pm_arb.signals.confidence import ConfidenceScorer
 from btc_pm_arb.signals.edge import EdgeCalculator, EdgeResult
-from btc_pm_arb.signals.filters import FilterConfig, SignalFilter
+from btc_pm_arb.signals.filters import FilterConfig, SignalFilter, _extract_reason_key
 from btc_pm_arb.signals.matcher import ContractMatcher
 from btc_pm_arb.signals.velocity import OddsVelocityTracker
 
@@ -411,6 +412,25 @@ class Agent:
                 rejected.append((e, reason))
 
         self._funnel["signals_rejected_filter"] += len(rejected)
+
+        # Round 9c: persist per-event rejections for tail_funnel's rolling
+        # 1h/6h reject-rate surface and 9d2's univariate-cuts pass.  Bucket
+        # key matches SignalFilter.rejection_counts' keys; full reason is
+        # kept verbatim for forensics.  vol_regime is taken from the
+        # tracker at write time — consistent with _to_arbitrage_signal's
+        # source-side for the passing-signal path.
+        for _edge, _reason in rejected:
+            self.paper_ledger.append_rejection(
+                PaperRejectionRecord(
+                    timestamp=_edge.timestamp,
+                    contract_id=_edge.match.pm_tick.contract_id,
+                    platform=_edge.match.pm_tick.source,
+                    reason_key=_extract_reason_key(_reason),
+                    full_reason=_reason,
+                    best_conservative_edge=_edge.best_conservative_edge,
+                    vol_regime=self.rv_tracker.current_regime().value,
+                )
+            )
 
         self._latest_signals = self._build_signal_payloads(
             passing, rejected, edges_by_id,
