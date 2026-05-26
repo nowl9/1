@@ -176,6 +176,13 @@ def _refresh_once(
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows console default codepage is cp1252; the table headers
+    # ── and arrow ← are non-cp1252. Force utf-8 so operators on
+    # PowerShell don't have to set PYTHONIOENCODING manually.
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
     parser = argparse.ArgumentParser(
         prog="tail_funnel",
         description=(
