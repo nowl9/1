@@ -220,7 +220,7 @@ def _reject_feed_freshness(e: EdgeResult, cfg: FilterConfig, ctx: dict) -> str |
     pm_source = e.match.pm_tick.source
     pm_s = health.staleness_s(pm_source)
     if pm_s > cfg.max_pm_staleness_s:
-        return f"{pm_source}_feed_stale {pm_s:.1f}s > max {cfg.max_pm_staleness_s}s"
+        return f"{pm_source.value}_feed_stale {pm_s:.1f}s > max {cfg.max_pm_staleness_s}s"
     return None
 
 
@@ -426,7 +426,7 @@ def _to_arbitrage_signal(
     )
     raw = edge.edge_yes_mid if edge.best_side == "buy_yes" else edge.edge_no_mid
     staleness = feed_health.all_staleness_ms() if feed_health is not None else {}
-    regime = str(rv_tracker.current_regime()) if rv_tracker is not None else "normal"
+    regime = rv_tracker.current_regime().value if rv_tracker is not None else "normal"
     return ArbitrageSignal(
         options_quote=options_quote,
         pm_quote=edge.match.pm_quote,

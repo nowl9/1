@@ -191,6 +191,7 @@ class TestSignalToPayload:
         assert payload["contract"] == "KXBTC-26JUN30-B100000"
         assert payload["platform"] == "kalshi"
         assert payload["expiry"] == _utc().isoformat()
+        assert payload["fired_at"] == sig.timestamp.isoformat()
         assert payload["side"] == "yes"
         assert payload["edge"] == pytest.approx(0.13)
         assert payload["fill_adjusted_edge"] is None
@@ -204,6 +205,35 @@ class TestSignalToPayload:
         sig = _make_arbitrage_signal(trade_side="buy_no")
         assert Agent._signal_to_payload(sig)["side"] == "no"
 
+    def test_signal_to_payload_uses_question_when_provided(self) -> None:
+        """Round 9a': passing a question yields a human-readable name;
+        the contract field stays the raw contract_id."""
+        sig = _make_arbitrage_signal()
+        payload = Agent._signal_to_payload(sig, "BTC above $100k by Jun 30?")
+        assert payload["name"] == "BTC above $100k by Jun 30?"
+        assert payload["contract"] == "KXBTC-26JUN30-B100000"
+
+    def test_signal_to_payload_falls_back_to_contract_id_when_question_empty(
+        self,
+    ) -> None:
+        """Realistic Polymarket failure mode: gamma response returns a
+        blank question.  Empty string falls back to contract_id (not
+        rendered as an empty title)."""
+        sig = _make_arbitrage_signal()
+        payload = Agent._signal_to_payload(sig, "")
+        assert payload["name"] == "KXBTC-26JUN30-B100000"
+        assert payload["contract"] == "KXBTC-26JUN30-B100000"
+
+    def test_signal_to_payload_falls_back_to_contract_id_when_question_none(
+        self,
+    ) -> None:
+        """Default-argument contract: one-positional-arg calls preserve
+        the pre-9a' behavior (name == contract_id)."""
+        sig = _make_arbitrage_signal()
+        payload = Agent._signal_to_payload(sig)
+        assert payload["name"] == "KXBTC-26JUN30-B100000"
+        assert payload["contract"] == "KXBTC-26JUN30-B100000"
+
 
 class TestRejectedToPayload:
     def test_rejected_to_payload_shape(self) -> None:
@@ -215,6 +245,7 @@ class TestRejectedToPayload:
         assert payload["contract"] == "KXBTC-26JUN30-B100000"
         assert payload["platform"] == "kalshi"
         assert payload["expiry"] == _utc().isoformat()
+        assert payload["fired_at"] == edge.timestamp.isoformat()
         assert payload["side"] == "yes"
         assert payload["edge"] == pytest.approx(0.05)
         assert payload["fill_adjusted_edge"] is None

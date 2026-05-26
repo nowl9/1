@@ -306,7 +306,10 @@ def test_feed_freshness_rejects_stale_pm(now, expiry):
     filt = SignalFilter(FilterConfig(max_pm_staleness_s=15.0))
     reason = filt.explains(e, feed_health=h)
     assert reason is not None
-    assert "kalshi" in reason.lower() or "feed_stale" in reason
+    # Pins the clean source-side bucket key (Round 9a': pm_source.value
+    # in the reason f-string, not the enum-repr "DataSource.KALSHI").
+    # Trailing space catches accidental concat with the staleness token.
+    assert reason.startswith("kalshi_feed_stale ")
 
 
 def test_feed_freshness_passes_fresh_feeds(now, expiry):
@@ -319,6 +322,27 @@ def test_feed_freshness_passes_fresh_feeds(now, expiry):
     # Should pass the freshness gate (may still fail other gates)
     if reason is not None:
         assert "feed_stale" not in reason
+
+
+def test_feed_freshness_rejection_bucket_key_is_clean(now, expiry):
+    """Round 9a': the rejection_counts bucket label uses the enum's
+    .value (e.g. "kalshi_feed_stale"), not its repr
+    ("DataSource.KALSHI_feed_stale").  Goes through filter(), not
+    explains(), because filter() is what increments the counter."""
+    h = FeedHealthTracker()
+    h.record_tick(DataSource.DERIBIT, ts=now)
+    h.record_tick(DataSource.KALSHI, ts=now - timedelta(seconds=30))
+    # adjusted_edge well above the filter floor so the freshness gate is
+    # the binding rejection.
+    e = _edge(now, expiry, conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
+    filt = SignalFilter(FilterConfig(max_pm_staleness_s=15.0))
+
+    signals = filt.filter([e], feed_health=h)
+
+    assert signals == []
+    # Exact-equality on the dict pins the bucket label — a regression
+    # to "DataSource.KALSHI_feed_stale" would fail here.
+    assert filt.rejection_counts == {"kalshi_feed_stale": 1}
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -546,4 +570,7 @@ def test_signal_vol_regime_flows_from_filter(now, expiry):
     filt = SignalFilter(FilterConfig(min_conservative_edge=0.03))
     signals = filt.filter([e], rv_tracker=rv)
     assert signals
-    assert signals[0].vol_regime == str(VolRegime.HIGH)
+    # Round 9a': source-side cleanup emits .value, so the wire-format
+    # string is "high" (not "VolRegime.HIGH").  Pre-9a' records on disk
+    # still carry the dirty form; normalize_vol_regime (9b1) handles both.
+    assert signals[0].vol_regime == "high"

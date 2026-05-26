@@ -1004,6 +1004,7 @@ function SignalRowFull({ sig }) {
             {(sig.platform || "").toUpperCase()}
             {sig.expiry ? ` · ${sig.expiry}` : ""}
             {stale != null ? ` · ${Math.round(stale)}ms` : ""}
+            {sig.fired_at ? ` · fired ${sig.fired_at.slice(11, 19)}` : ""}
           </div>
         </div>
         <div className="signal-side" style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "flex-end" }}>
@@ -1073,6 +1074,7 @@ function PositionRow({ pos }) {
         {entry != null ? ` · ${fmtPct(entry, 1)}` : ""}
         {cur != null ? ` → ${fmtPct(cur, 1)}` : ""}
         {size != null ? ` · ${fmtUsd(size, { digits: 0 })}` : ""}
+        {pos.opened_at ? ` · op ${pos.opened_at.slice(11, 19)}` : ""}
       </div>
       <div className="pos-bar">
         <div className="pos-bar-fill" style={{ width: barWidth, background: barColor }} />
@@ -1117,6 +1119,16 @@ function TabPositions({ snap }) {
             {" → "} filled: <b>{funnel.paper_orders_filled ?? 0}</b>
             {" · "} no-fill: <b>{funnel.paper_orders_no_fill ?? 0}</b>
           </div>
+          {Object.keys(funnel).some(k => k.startsWith("reject_")) && (
+            <div className="settle-meta" style={{padding: "0 0.5rem 0.5rem", opacity: 0.85}}>
+              Rejects —{" "}
+              {Object.entries(funnel)
+                .filter(([k]) => k.startsWith("reject_"))
+                .sort(([, a], [, b]) => b - a)
+                .map(([k, v]) => `${k.slice(7)}=${v}`)
+                .join(" · ")}
+            </div>
+          )}
         </div>
       )}
 

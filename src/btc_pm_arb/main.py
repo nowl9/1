@@ -412,7 +412,9 @@ class Agent:
 
         self._funnel["signals_rejected_filter"] += len(rejected)
 
-        self._latest_signals = self._build_signal_payloads(passing, rejected)
+        self._latest_signals = self._build_signal_payloads(
+            passing, rejected, edges_by_id,
+        )
 
         for sig in passing:
             log.info(
@@ -562,15 +564,31 @@ class Agent:
         self,
         passing: list[ArbitrageSignal],
         rejected: list[tuple[EdgeResult, str]],
+        edges_by_id: dict[str, EdgeResult],
     ) -> list[dict]:
         """Build a unified, capped, sorted payload list for the dashboard.
 
         Passing signals first (capped at 50), then rejected (capped at
         50), each sorted by ``abs(edge)`` descending so the most
         material entries appear first in their group.
+
+        ``edges_by_id`` lets the passing-side payload recover the
+        human-readable ``pm_tick.question`` (lost when ``ArbitrageSignal``
+        only carries the ``ProbabilityQuote``).  A miss falls back to
+        the contract_id — mirrors ``_rejected_to_payload``'s
+        ``pm.question or pm.contract_id`` shape so Polymarket signals
+        no longer surface raw token IDs as their dashboard title.
         """
+        def _passing_payloads() -> list[dict]:
+            out: list[dict] = []
+            for s in passing:
+                edge = edges_by_id.get(s.pm_quote.contract_id)
+                question = edge.match.pm_tick.question if edge is not None else None
+                out.append(self._signal_to_payload(s, question))
+            return out
+
         pass_payload = sorted(
-            (self._signal_to_payload(s) for s in passing),
+            _passing_payloads(),
             key=lambda d: abs(d.get("edge") or 0.0),
             reverse=True,
         )[:50]
@@ -582,11 +600,20 @@ class Agent:
         return pass_payload + rej_payload
 
     @staticmethod
-    def _signal_to_payload(sig: ArbitrageSignal) -> dict:
+    def _signal_to_payload(
+        sig: ArbitrageSignal, question: str | None = None,
+    ) -> dict:
         """Render a passing ArbitrageSignal as the dashboard schema dict.
 
         Schema mirrors what ``server/static/index.html`` reads from
         ``snap.signals[]`` (TOP SIGNALS panel + ALL SIGNALS tab).
+
+        ``question`` is the human-readable contract title from the
+        originating ``PredictionMarketTick``; falls back to
+        ``contract_id`` when None or empty.  Mirrors the
+        ``pm.question or pm.contract_id`` shape ``_rejected_to_payload``
+        uses, so Polymarket signals no longer surface raw token IDs
+        as their dashboard title.
 
         Expiry None-guard mirrors ``_rejected_to_payload`` for
         consistency.  ``ProbabilityQuote.expiry`` is non-Optional in the
@@ -597,10 +624,11 @@ class Agent:
         )
         return {
             "id": f"{sig.pm_quote.contract_id}:{sig.trade_side}:{expiry_iso or ''}",
-            "name": sig.pm_quote.contract_id,
+            "name": question or sig.pm_quote.contract_id,
             "contract": sig.pm_quote.contract_id,
             "platform": sig.pm_quote.source.value,
             "expiry": expiry_iso,
+            "fired_at": sig.timestamp.isoformat(),
             "side": "yes" if sig.trade_side == "buy_yes" else "no",
             "edge": sig.adjusted_edge,
             "fill_adjusted_edge": sig.fill_adjusted_edge,
@@ -629,6 +657,7 @@ class Agent:
             "contract": pm.contract_id,
             "platform": pm.source.value,
             "expiry": expiry_iso,
+            "fired_at": edge.timestamp.isoformat(),
             "side": side,
             "edge": edge.best_conservative_edge,
             "fill_adjusted_edge": edge.fill_adjusted_edge,
