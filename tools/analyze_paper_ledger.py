@@ -78,6 +78,7 @@ from btc_pm_arb.execution.paper_ledger import (
     PaperOrderRecord,
     PaperSettlementRecord,
 )
+from tools.analysis.report import render_all
 
 logger: structlog.BoundLogger = structlog.get_logger(__name__)
 
@@ -522,6 +523,36 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(f"Power tier: {tier} (N_settled={n_settled}).")
     print(f"Wrote {parquet_path}.")
+
+    # ── 9b2b: hand off to the analysis pipeline ─────────────────────────────
+    # Re-presents the existing skip counters in the shape render_all
+    # accepts; both inner keys mirror the stdout summary above.  Errors
+    # propagate by design — a half-rendered out_dir (some PNGs, no
+    # report.md) is worse than a CLI traceback the operator can act on.
+    schema_skips: dict[str, dict[str, int]] = {
+        "orders": {
+            "unknown_schema": orders_result.n_skipped_unknown_schema,
+            "invalid": orders_result.n_skipped_invalid,
+        },
+        "fills": {
+            "unknown_schema": fills_result.n_skipped_unknown_schema,
+            "invalid": fills_result.n_skipped_invalid,
+        },
+        "settlements": {
+            "unknown_schema": settlements_result.n_skipped_unknown_schema,
+            "invalid": settlements_result.n_skipped_invalid,
+        },
+    }
+    render_all(
+        df,
+        args.out_dir,
+        schema_skips=schema_skips,
+        as_of=as_of,
+        ledger_dir=str(args.ledger_dir),
+    )
+    print(f"Wrote {args.out_dir / 'report.md'}.")
+    print(f"Wrote {args.out_dir / 'summary_stats.json'}.")
+    print(f"Wrote {args.out_dir / 'charts'}/ (21 PNGs).")
     return 0
 
 

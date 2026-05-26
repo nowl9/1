@@ -785,3 +785,95 @@ class TestMainEndToEnd:
         assert (out_dir / "joined.parquet").exists()
         df = pd.read_parquet(out_dir / "joined.parquet")
         assert df.empty
+
+    def test_main_writes_report_and_summary_stats(self, tmp_path: Path) -> None:
+        """9b2b: main() invokes render_all after the parquet write, so
+        report.md, summary_stats.json, and the charts/ bundle land in
+        out_dir alongside joined.parquet from a single CLI invocation."""
+        # Cross-imported here (not at module level) to avoid 9b1 tests
+        # paying the matplotlib import cost.  Future-cleanup candidate:
+        # promote _synthesize_settled_ledger into tests/test_tools/conftest.py.
+        from tests.test_tools.test_analyze_paper_ledger_9b2 import (
+            _synthesize_settled_ledger,
+        )
+
+        ledger_dir = tmp_path / "ledger"
+        out_dir = tmp_path / "out"
+        ledger_dir.mkdir()
+
+        # 40 settled rows: enough for fit_logit / bucket summaries to
+        # exercise their non-degenerate paths (matches 9b2a precedent).
+        orders, fills, settlements = _synthesize_settled_ledger(n=40)
+        _write_records(ledger_dir / "orders.jsonl", orders)
+        _write_records(ledger_dir / "fills.jsonl", fills)
+        _write_records(ledger_dir / "settlements.jsonl", settlements)
+
+        rc = main(["--ledger-dir", str(ledger_dir), "--out-dir", str(out_dir)])
+        assert rc == 0
+
+        # All four deliverables exist.
+        assert (out_dir / "joined.parquet").exists()
+        report_md = out_dir / "report.md"
+        assert report_md.exists()
+        assert report_md.stat().st_size > 0
+        summary_json = out_dir / "summary_stats.json"
+        assert summary_json.exists()
+        charts_dir = out_dir / "charts"
+        assert charts_dir.is_dir()
+        # Canary chart — 9b2a's library-direct tests already cover the
+        # full 21-PNG inventory; here we only confirm the chart pipeline
+        # ran end-to-end through main().
+        assert (charts_dir / "conservative_edge__histogram.png").exists()
+
+        # summary_stats.json is well-formed and carries the documented
+        # top-level keys.
+        summary = json.loads(summary_json.read_text(encoding="utf-8"))
+        assert summary["schema_version"] == 1
+        for key in (
+            "counts",
+            "tier_reached",
+            "bucket_summaries",
+            "schema_skips",
+            "logit_coefficients",
+        ):
+            assert key in summary, f"missing top-level key: {key}"
+
+        # Schema-skip plumbing: synthetic-clean fixture → zero on both
+        # counters for every file type.  Catches a future regression
+        # that accidentally drops the schema_skips=... wiring.
+        assert summary["schema_skips"]["orders"]["unknown_schema"] == 0
+        assert summary["schema_skips"]["orders"]["invalid"] == 0
+        assert summary["schema_skips"]["fills"]["unknown_schema"] == 0
+        assert summary["schema_skips"]["settlements"]["unknown_schema"] == 0
+
+    def test_main_propagates_render_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """9b2b error policy: render_all exceptions propagate out of main()
+        as a CLI traceback rather than leaving a half-rendered out_dir.
+        Also pins call ordering — joined.parquet must exist before
+        render_all runs, so a render-side failure still leaves the
+        parquet for re-analysis."""
+        ledger_dir = tmp_path / "ledger"
+        out_dir = tmp_path / "out"
+        ledger_dir.mkdir()
+
+        orders = [_make_order(client_order_id=f"ord-{i}") for i in range(1, 4)]
+        fills = [_make_fill(client_order_id=f"ord-{i}") for i in range(1, 4)]
+        _write_records(ledger_dir / "orders.jsonl", orders)
+        _write_records(ledger_dir / "fills.jsonl", fills)
+        _write_records(ledger_dir / "settlements.jsonl", [])
+
+        def _boom(*_args: object, **_kwargs: object) -> None:
+            raise RuntimeError("boom")
+
+        # Patch at the import site (where main() resolves the name),
+        # not at tools.analysis.report.render_all.
+        monkeypatch.setattr("tools.analyze_paper_ledger.render_all", _boom)
+
+        with pytest.raises(RuntimeError, match="boom"):
+            main(["--ledger-dir", str(ledger_dir), "--out-dir", str(out_dir)])
+
+        # Parquet was written before the render explosion — the operator
+        # can re-run analysis without re-collecting data.
+        assert (out_dir / "joined.parquet").exists()
