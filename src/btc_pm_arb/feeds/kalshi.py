@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Callable
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -66,7 +67,8 @@ import structlog
 
 from btc_pm_arb.feeds._kalshi_auth import load_key, signed_headers
 from btc_pm_arb.feeds.normalizer import normalize_kalshi_tick
-from btc_pm_arb.models import PredictionMarketTick
+from btc_pm_arb.feeds.recorder import FrameRecorder
+from btc_pm_arb.models import DataSource, PredictionMarketTick
 
 logger: structlog.BoundLogger = structlog.get_logger(__name__)
 
@@ -121,6 +123,7 @@ class KalshiFeed:
         key_id: str,
         on_alive: Callable[[], None] | None = None,
         queue_maxsize: int = 10_000,
+        recorder: FrameRecorder | None = None,
     ) -> None:
         self._base_url = base_url.rstrip("/")
         self._key_path = key_path
@@ -130,6 +133,9 @@ class KalshiFeed:
         self._running = False
         self._private_key: Any | None = None
         self._client: httpx.AsyncClient | None = None
+        # Round 9c Commit 2: optional raw-response recorder for replay.
+        # None by default — opt-in via main.py's ``--record-feeds``.
+        self._recorder = recorder
         # Ticker → market metadata dict (title, subtitle, close_time, …),
         # populated by _discover_markets and consumed by _poll_loop.
         self._tracked: dict[str, dict] = {}
@@ -228,6 +234,20 @@ class KalshiFeed:
         headers = signed_headers("GET", path, self._private_key, self._key_id)
         resp = await self._client.get(path, headers=headers)
         resp.raise_for_status()
+        # Round 9c Commit 2: record the raw response body (decompressed
+        # by httpx already) before json parsing.  4xx/5xx have already
+        # raised above — only successful responses reach the recorder,
+        # which matches the replay-mode use case (failures are visible
+        # via agent.log via structlog).  Recording happens before
+        # on_alive so a recorder failure can't suppress the liveness
+        # signal (recorder.record() never raises — it self-disables).
+        if self._recorder is not None:
+            self._recorder.record(
+                DataSource.KALSHI,
+                resp.content,
+                datetime.now(timezone.utc),
+                endpoint=path,
+            )
         if self._on_alive is not None:
             self._on_alive()
         return resp.json()

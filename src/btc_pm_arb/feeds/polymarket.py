@@ -68,6 +68,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -77,7 +78,8 @@ from btc_pm_arb.feeds.normalizer import (
     _extract_strike_from_question,
     normalize_polymarket_tick,
 )
-from btc_pm_arb.models import PredictionMarketTick
+from btc_pm_arb.feeds.recorder import FrameRecorder
+from btc_pm_arb.models import DataSource, PredictionMarketTick
 
 logger: structlog.BoundLogger = structlog.get_logger(__name__)
 
@@ -134,6 +136,7 @@ class PolymarketFeed:
         clob_url: str,
         on_alive: Callable[[], None] | None = None,
         queue_maxsize: int = 10_000,
+        recorder: FrameRecorder | None = None,
     ) -> None:
         self._gamma_url = gamma_url.rstrip("/")
         self._clob_url = clob_url.rstrip("/")
@@ -144,6 +147,9 @@ class PolymarketFeed:
         self._running = False
         self._gamma_client: httpx.AsyncClient | None = None
         self._clob_client: httpx.AsyncClient | None = None
+        # Round 9c Commit 2: optional raw-response recorder for replay.
+        # None by default — opt-in via main.py's ``--record-feeds``.
+        self._recorder = recorder
         # YES token_id → market metadata dict.  Populated by
         # _discover_markets and consumed by _poll_loop.  Keying on the
         # YES token id matches the contract_id we eventually emit on
@@ -249,6 +255,20 @@ class PolymarketFeed:
         """
         resp = await client.get(path)
         resp.raise_for_status()
+        # Round 9c Commit 2: record the raw response body (decompressed
+        # by httpx already) before json parsing.  Same shape as the
+        # KalshiFeed hook — 4xx/5xx already raised, so the recorder
+        # only sees 2xx bodies; failures land in agent.log via
+        # structlog.  Recording happens before on_alive so a recorder
+        # failure can't suppress the liveness signal (recorder.record()
+        # never raises — it self-disables).
+        if self._recorder is not None:
+            self._recorder.record(
+                DataSource.POLYMARKET,
+                resp.content,
+                datetime.now(timezone.utc),
+                endpoint=path,
+            )
         if self._on_alive is not None:
             self._on_alive()
         return resp.json()

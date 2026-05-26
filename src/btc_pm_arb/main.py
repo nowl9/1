@@ -35,6 +35,7 @@ Start::
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import logging
 import os
@@ -42,6 +43,7 @@ import secrets
 import signal
 from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, AsyncIterator
 
 import structlog
@@ -66,6 +68,7 @@ from btc_pm_arb.feeds.discovery import MarketDiscovery, run_discovery_loop
 from btc_pm_arb.feeds.health import FeedHealthTracker
 from btc_pm_arb.feeds.kalshi import KalshiFeed
 from btc_pm_arb.feeds.polymarket import PolymarketFeed
+from btc_pm_arb.feeds.recorder import FrameRecorder
 from btc_pm_arb.models import ArbitrageSignal, DataSource, OptionTick, PredictionMarketTick
 from btc_pm_arb.pricing.cache import ProbabilityCache
 from btc_pm_arb.pricing.digital_pricer import DigitalPricer
@@ -904,11 +907,18 @@ class Agent:
 
 # ── Tasks ──────────────────────────────────────────────────────────────────────
 
-async def _deribit_task(agent: Agent, stop_event: asyncio.Event) -> None:
+async def _deribit_task(
+    agent: Agent,
+    stop_event: asyncio.Event,
+    *,
+    recorder: FrameRecorder | None = None,
+) -> None:
     log.info("deribit_task.starting", url=settings.deribit_url)
     while not stop_event.is_set():
         try:
-            async with DeribitFeed(url=settings.deribit_url) as feed:
+            async with DeribitFeed(
+                url=settings.deribit_url, recorder=recorder,
+            ) as feed:
                 async for tick in feed.ticks():
                     if stop_event.is_set():
                         return
@@ -921,7 +931,12 @@ async def _deribit_task(agent: Agent, stop_event: asyncio.Event) -> None:
     log.info("deribit_task.stopped")
 
 
-async def _kalshi_task(agent: Agent, stop_event: asyncio.Event) -> None:
+async def _kalshi_task(
+    agent: Agent,
+    stop_event: asyncio.Event,
+    *,
+    recorder: FrameRecorder | None = None,
+) -> None:
     """Kalshi REST market-data feed task — Round 6 / Issue 4.
 
     Routes every successful HTTP response into ``feed_health.record_tick``
@@ -942,6 +957,7 @@ async def _kalshi_task(agent: Agent, stop_event: asyncio.Event) -> None:
                 key_path=settings.kalshi_private_key_path,
                 key_id=settings.kalshi_api_key_id,
                 on_alive=_on_alive,
+                recorder=recorder,
             )
             async with feed:
                 async for tick in feed.ticks():
@@ -956,7 +972,12 @@ async def _kalshi_task(agent: Agent, stop_event: asyncio.Event) -> None:
     log.info("kalshi_task.stopped")
 
 
-async def _polymarket_task(agent: Agent, stop_event: asyncio.Event) -> None:
+async def _polymarket_task(
+    agent: Agent,
+    stop_event: asyncio.Event,
+    *,
+    recorder: FrameRecorder | None = None,
+) -> None:
     """Polymarket public REST market-data feed task — Round 7b / Issue 5.
 
     Public data only — no credentials.  US trading is geoblocked and
@@ -983,6 +1004,7 @@ async def _polymarket_task(agent: Agent, stop_event: asyncio.Event) -> None:
                 gamma_url=settings.polymarket_gamma_url,
                 clob_url=settings.polymarket_clob_url,
                 on_alive=_on_alive,
+                recorder=recorder,
             )
             async with feed:
                 async for tick in feed.ticks():
@@ -1085,8 +1107,20 @@ async def _dashboard_task(agent: Agent, stop_event: asyncio.Event) -> None:
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
-async def run(dry_run: bool = True) -> None:
+async def run(
+    dry_run: bool = True, record_dir: Path | None = None,
+) -> None:
     _configure_logging()
+
+    # Round 9c Commit 2: optional raw-feed recorder.  When ``record_dir``
+    # is set (driven by ``--record-feeds`` on the CLI) every feed task
+    # is wired to record raw frames into a per-source / per-day / per-hour
+    # gzipped JSONL stream for future replay-mode validation.  Off by
+    # default — recording is opt-in.
+    recorder: FrameRecorder | None = None
+    if record_dir is not None:
+        recorder = FrameRecorder(record_dir)
+        log.info("frame_recorder.enabled", base_dir=str(record_dir))
 
     agent = Agent(dry_run=dry_run)
     stop_event = asyncio.Event()
@@ -1112,9 +1146,18 @@ async def run(dry_run: bool = True) -> None:
 
     try:
         async with asyncio.TaskGroup() as tg:
-            tg.create_task(_deribit_task(agent, stop_event), name="deribit-feed")
-            tg.create_task(_kalshi_task(agent, stop_event), name="kalshi-feed")
-            tg.create_task(_polymarket_task(agent, stop_event), name="polymarket-feed")
+            tg.create_task(
+                _deribit_task(agent, stop_event, recorder=recorder),
+                name="deribit-feed",
+            )
+            tg.create_task(
+                _kalshi_task(agent, stop_event, recorder=recorder),
+                name="kalshi-feed",
+            )
+            tg.create_task(
+                _polymarket_task(agent, stop_event, recorder=recorder),
+                name="polymarket-feed",
+            )
             tg.create_task(_scan_task(agent, stop_event), name="scan")
             tg.create_task(_order_refresh_task(agent, stop_event), name="order-refresh")
             tg.create_task(agent.settlement_monitor.run(stop_event), name="settlement")
@@ -1130,12 +1173,37 @@ async def run(dry_run: bool = True) -> None:
         stop_event.set()
     finally:
         await agent.order_mgr.aclose()
+        if recorder is not None:
+            recorder.close()
         summary = agent.tracker.performance_summary()
         log.info("agent.shutdown", **summary)
 
 
 def main() -> None:
-    asyncio.run(run(dry_run=True))
+    parser = argparse.ArgumentParser(
+        prog="btc_pm_arb",
+        description=(
+            "BTC prediction-market <-> Deribit options arbitrage agent. "
+            "Runs in dry-run / paper-trading mode by default."
+        ),
+    )
+    # Round 9c Commit 2: opt-in raw-feed recording.  --dry-run is NOT
+    # exposed as a CLI flag — agent dry_run state is governed by
+    # config / standing orders, not per-invocation.
+    parser.add_argument(
+        "--record-feeds", action="store_true",
+        help=(
+            "Record raw frames from all feeds into --record-dir for "
+            "future replay-mode validation.  Off by default."
+        ),
+    )
+    parser.add_argument(
+        "--record-dir", type=Path, default=Path("data/recordings"),
+        help="Base directory for raw-frame recordings (default: data/recordings).",
+    )
+    args = parser.parse_args()
+    record_dir = args.record_dir if args.record_feeds else None
+    asyncio.run(run(dry_run=True, record_dir=record_dir))
 
 
 if __name__ == "__main__":

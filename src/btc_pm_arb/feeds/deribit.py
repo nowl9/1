@@ -32,7 +32,8 @@ from typing import Any
 import structlog
 import websockets
 
-from btc_pm_arb.models import Greeks, OptionTick, OptionType
+from btc_pm_arb.feeds.recorder import FrameRecorder
+from btc_pm_arb.models import DataSource, Greeks, OptionTick, OptionType
 
 logger: structlog.BoundLogger = structlog.get_logger(__name__)
 
@@ -125,10 +126,15 @@ class DeribitFeed:
         self,
         url: str = "wss://www.deribit.com/ws/api/v2",
         queue_maxsize: int = 10_000,
+        recorder: FrameRecorder | None = None,
     ) -> None:
         self._url = url
         self._queue: asyncio.Queue[OptionTick] = asyncio.Queue(maxsize=queue_maxsize)
         self._running = False
+        # Round 9c Commit 2: optional raw-frame recorder for replay-mode
+        # validation.  None by default — recording is opt-in via main.py's
+        # ``--record-feeds`` flag.
+        self._recorder = recorder
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._rpc_id = 0
         self._pending_rpcs: dict[int, asyncio.Future[Any]] = {}
@@ -347,6 +353,14 @@ class DeribitFeed:
         loop_started = time.monotonic()
         try:
             async for raw in self._ws:
+                # Round 9c Commit 2: record the raw wire frame before any
+                # parsing so a JSONDecodeError still leaves the original
+                # payload on disk for forensic replay.  No-op when
+                # self._recorder is None (the default).
+                if self._recorder is not None:
+                    self._recorder.record(
+                        DataSource.DERIBIT, raw, datetime.now(timezone.utc),
+                    )
                 try:
                     msg = json.loads(raw)
                 except json.JSONDecodeError:

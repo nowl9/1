@@ -110,3 +110,58 @@ class TestBuildTickDollarRoundTrip:
         assert tick.no_bid == pytest.approx(0.99)  # max no_dollars price
         assert tick.yes_ask == pytest.approx(0.01)  # 1 - max(no) = 0.01
         assert tick.no_ask is None                # no yes-side bid → can't derive
+
+
+# ── Round 9c Commit 2: raw-frame recorder hook ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_kalshi_recorder_hook_called_with_body_and_endpoint() -> None:
+    """When constructed with a recorder, _http_get records each
+    successful response body + endpoint path, before json parsing.
+
+    Hook ordering: between resp.raise_for_status() and resp.json() —
+    only 2xx bodies reach the recorder (4xx/5xx raise before us).
+    """
+    from unittest.mock import MagicMock
+    from btc_pm_arb.models import DataSource
+
+    mock_recorder = MagicMock()
+    feed = KalshiFeed(
+        base_url="https://demo-api.kalshi.co/trade-api/v2",
+        key_path="/nonexistent.pem",
+        key_id="dummy",
+        recorder=mock_recorder,
+    )
+
+    async def capture_get(path: str, headers: dict[str, str]) -> Any:
+        resp = AsyncMock()
+        resp.raise_for_status = lambda: None
+        resp.content = b'{"markets": []}'
+        resp.json = lambda: {"markets": []}
+        return resp
+
+    feed._client = AsyncMock()
+    feed._client.get = capture_get
+    feed._private_key = None  # signed_headers returns {} for None — fine
+
+    await feed._discover_markets()
+
+    assert mock_recorder.record.called
+    call = mock_recorder.record.call_args
+    assert call.args[0] == DataSource.KALSHI
+    assert call.args[1] == b'{"markets": []}'
+    # Endpoint kwarg carries the request path so replay can distinguish
+    # /markets from /markets/{ticker}/orderbook.
+    assert call.kwargs.get("endpoint", "").startswith("/markets")
+
+
+def test_kalshi_default_recorder_is_none() -> None:
+    """Constructing without an explicit recorder kwarg leaves it None
+    — the disabled-by-default semantics from Q4."""
+    feed = KalshiFeed(
+        base_url="https://demo-api.kalshi.co/trade-api/v2",
+        key_path="/nonexistent.pem",
+        key_id="dummy",
+    )
+    assert feed._recorder is None

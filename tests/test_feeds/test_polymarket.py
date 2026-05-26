@@ -158,3 +158,53 @@ class TestIsBtcBinaryThreshold:
             clobTokenIds='["yes-tok", "no-tok"]',
         )
         assert _is_btc_binary_threshold(market) is True
+
+
+# ── Round 9c Commit 2: raw-frame recorder hook ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_polymarket_recorder_hook_called_with_body_and_endpoint() -> None:
+    """When constructed with a recorder, _http_get records each
+    successful response body + endpoint path, before json parsing.
+
+    Same hook ordering as KalshiFeed — between raise_for_status() and
+    resp.json() — so only 2xx bodies are recorded.
+    """
+    from unittest.mock import MagicMock
+    from btc_pm_arb.models import DataSource
+
+    mock_recorder = MagicMock()
+    feed = PolymarketFeed(
+        gamma_url="https://gamma-api.polymarket.com",
+        clob_url="https://clob.polymarket.com",
+        recorder=mock_recorder,
+    )
+
+    async def capture_gamma(path: str) -> Any:
+        resp = AsyncMock()
+        resp.raise_for_status = lambda: None
+        resp.content = b'{"data": []}'
+        resp.json = lambda: {"data": []}
+        return resp
+
+    feed._gamma_client = AsyncMock()
+    feed._gamma_client.get = capture_gamma
+
+    await feed._discover_markets()
+
+    assert mock_recorder.record.called
+    call = mock_recorder.record.call_args
+    assert call.args[0] == DataSource.POLYMARKET
+    assert call.args[1] == b'{"data": []}'
+    # Endpoint kwarg distinguishes gamma /markets vs CLOB /book paths.
+    assert call.kwargs.get("endpoint", "").startswith("/markets")
+
+
+def test_polymarket_default_recorder_is_none() -> None:
+    """Constructing without an explicit recorder kwarg leaves it None."""
+    feed = PolymarketFeed(
+        gamma_url="https://gamma-api.polymarket.com",
+        clob_url="https://clob.polymarket.com",
+    )
+    assert feed._recorder is None

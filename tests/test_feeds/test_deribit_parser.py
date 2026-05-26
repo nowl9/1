@@ -262,3 +262,46 @@ class TestDeribitFeedMessageDispatch:
         msg = {"jsonrpc": "2.0", "method": "some.unknown.method", "params": {}}
         await feed._handle_message(msg)  # should not raise
         assert feed._queue.qsize() == 0
+
+
+# ── Round 9c Commit 2: raw-frame recorder hook ────────────────────────────────
+
+
+class TestDeribitFeedRecorderHook:
+    """Recorder hook fires inside _message_loop before any JSON parse.
+
+    Round 9c Commit 2: hooked at deribit.py:_message_loop right after the
+    ``async for raw in self._ws`` yield.  The hook records the raw wire
+    payload so that a malformed JSON frame still leaves the original
+    bytes on disk for forensic replay.
+    """
+
+    @pytest.mark.asyncio
+    async def test_recorder_called_with_raw_frame(self) -> None:
+        from btc_pm_arb.models import DataSource
+
+        mock_recorder = MagicMock()
+        feed = DeribitFeed(url="wss://fake", recorder=mock_recorder)
+        msg = make_ticker_notification("BTC-26APR24-50000-C")
+        feed._ws = FakeWebSocket([msg])  # type: ignore[assignment]
+
+        await feed._message_loop()
+
+        assert mock_recorder.record.called
+        call = mock_recorder.record.call_args
+        assert call.args[0] == DataSource.DERIBIT
+        # Second positional: the raw JSON string from the wire.
+        assert "BTC-26APR24-50000-C" in call.args[1]
+        # Deribit passes no endpoint kwarg.
+        assert call.kwargs.get("endpoint") is None
+
+    @pytest.mark.asyncio
+    async def test_no_recorder_no_op(self) -> None:
+        """Default recorder=None must not break the message loop."""
+        feed = DeribitFeed(url="wss://fake")
+        assert feed._recorder is None
+        msg = make_ticker_notification("BTC-26APR24-50000-C")
+        feed._ws = FakeWebSocket([msg])  # type: ignore[assignment]
+        # No assertion beyond "doesn't raise"; the existing parser
+        # tests cover correct dispatch with no recorder.
+        await feed._message_loop()
