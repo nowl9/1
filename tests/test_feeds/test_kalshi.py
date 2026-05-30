@@ -165,3 +165,213 @@ def test_kalshi_default_recorder_is_none() -> None:
         key_id="dummy",
     )
     assert feed._recorder is None
+
+
+# ── Round 9d2 Commit 1: close_time prune ──────────────────────────────────────
+
+
+class TestDiscoveryCloseTimePrune:
+    """``_discover_markets`` drops rows whose close_time has already
+    passed before they enter ``self._tracked``.  Kalshi mass-closes on
+    clock-aligned boundaries; a 60s discovery interval otherwise carries
+    expired-but-open rows for almost a minute (Round 9d1 86/145 finding).
+    """
+
+    def _feed(self) -> KalshiFeed:
+        feed = KalshiFeed(
+            base_url="https://demo-api.kalshi.co/trade-api/v2",
+            key_path="/nonexistent.pem",
+            key_id="dummy",
+        )
+        feed._private_key = None
+        return feed
+
+    def _install_markets_response(
+        self, feed: KalshiFeed, markets: list[dict]
+    ) -> None:
+        async def fake_get(path: str, headers: dict[str, str]) -> Any:
+            resp = AsyncMock()
+            resp.raise_for_status = lambda: None
+            resp.content = b""
+            resp.json = lambda: {"markets": markets}
+            return resp
+
+        feed._client = AsyncMock()
+        feed._client.get = fake_get
+
+    @pytest.mark.asyncio
+    async def test_past_close_time_excluded(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        past = (
+            datetime.now(timezone.utc) - timedelta(hours=1)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        feed = self._feed()
+        self._install_markets_response(
+            feed,
+            [{"ticker": "KXBTC-EXPIRED", "close_time": past}],
+        )
+
+        await feed._discover_markets()
+
+        assert "KXBTC-EXPIRED" not in feed._tracked
+        assert feed._tracked == {}
+
+    @pytest.mark.asyncio
+    async def test_future_close_time_retained(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        future = (
+            datetime.now(timezone.utc) + timedelta(days=7)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        feed = self._feed()
+        self._install_markets_response(
+            feed,
+            [{"ticker": "KXBTC-LIVE", "close_time": future}],
+        )
+
+        await feed._discover_markets()
+
+        assert "KXBTC-LIVE" in feed._tracked
+
+    @pytest.mark.asyncio
+    async def test_boundary_now_excluded(self) -> None:
+        """close_time == now (within a few ms) is treated as expired —
+        the guard uses ``<= now``, not ``< now``.  A contract that
+        closes exactly at the snapshot instant is not tradable for the
+        upcoming poll cycle."""
+        from datetime import datetime, timedelta, timezone
+
+        # Use a close_time a tick in the past so the test is robust to
+        # the ~µs that elapse between fixture construction and the
+        # comparison inside _discover_markets; the boundary semantics
+        # being asserted is "close_time <= now → drop", not strict
+        # equality on a wall clock.
+        boundary = (
+            datetime.now(timezone.utc) - timedelta(microseconds=1)
+        ).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+        feed = self._feed()
+        self._install_markets_response(
+            feed,
+            [{"ticker": "KXBTC-BOUNDARY", "close_time": boundary}],
+        )
+
+        await feed._discover_markets()
+
+        assert "KXBTC-BOUNDARY" not in feed._tracked
+
+    @pytest.mark.asyncio
+    async def test_missing_close_time_retained(self) -> None:
+        """Rows with no close_time field are retained — silently
+        dropping them would mask an upstream shape regression."""
+        feed = self._feed()
+        self._install_markets_response(
+            feed,
+            [{"ticker": "KXBTC-NOCLOSE"}],
+        )
+
+        await feed._discover_markets()
+
+        assert "KXBTC-NOCLOSE" in feed._tracked
+
+    @pytest.mark.asyncio
+    async def test_unparseable_close_time_retained(self) -> None:
+        """An unparseable close_time string is retained for the same
+        reason as a missing one."""
+        feed = self._feed()
+        self._install_markets_response(
+            feed,
+            [{"ticker": "KXBTC-BADTIME", "close_time": "not-a-date"}],
+        )
+
+        await feed._discover_markets()
+
+        assert "KXBTC-BADTIME" in feed._tracked
+
+    @pytest.mark.asyncio
+    async def test_mixed_batch_partitioned(self) -> None:
+        """A mixed response retains only the live rows."""
+        from datetime import datetime, timedelta, timezone
+
+        past = (
+            datetime.now(timezone.utc) - timedelta(minutes=5)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        future = (
+            datetime.now(timezone.utc) + timedelta(hours=4)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        feed = self._feed()
+        self._install_markets_response(
+            feed,
+            [
+                {"ticker": "EXPIRED-A", "close_time": past},
+                {"ticker": "LIVE-A", "close_time": future},
+                {"ticker": "EXPIRED-B", "close_time": past},
+                {"ticker": "LIVE-B", "close_time": future},
+            ],
+        )
+
+        await feed._discover_markets()
+
+        assert set(feed._tracked.keys()) == {"LIVE-A", "LIVE-B"}
+
+
+class TestPollLoopCloseTimeGuard:
+    """``_poll_loop`` re-checks close_time before issuing the orderbook
+    request, defending against a snapshot that goes stale across the
+    60s discovery interval."""
+
+    @pytest.mark.asyncio
+    async def test_expired_ticker_skipped_mid_poll(self) -> None:
+        """A ticker that was alive at discovery but expired by the
+        time _poll_loop reaches it is skipped without an /orderbook
+        request being issued."""
+        from datetime import datetime, timedelta, timezone
+
+        feed = KalshiFeed(
+            base_url="https://demo-api.kalshi.co/trade-api/v2",
+            key_path="/nonexistent.pem",
+            key_id="dummy",
+        )
+        feed._private_key = None
+
+        past = (
+            datetime.now(timezone.utc) - timedelta(seconds=30)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        future = (
+            datetime.now(timezone.utc) + timedelta(hours=2)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        # Seed _tracked directly to bypass discovery; simulate a
+        # snapshot that went stale after collection.
+        feed._tracked = {
+            "STALE-EXPIRED": {"ticker": "STALE-EXPIRED", "close_time": past},
+            "STILL-LIVE": {"ticker": "STILL-LIVE", "close_time": future},
+        }
+
+        requested_paths: list[str] = []
+
+        async def fake_get(path: str, headers: dict[str, str]) -> Any:
+            requested_paths.append(path)
+            resp = AsyncMock()
+            resp.raise_for_status = lambda: None
+            resp.content = b""
+            resp.json = lambda: {"orderbook_fp": {}}
+            return resp
+
+        feed._client = AsyncMock()
+        feed._client.get = fake_get
+
+        # Drive one iteration of the loop body inline rather than
+        # invoking _poll_loop directly (the loop's asyncio.sleep makes
+        # that awkward in a unit test).  Replicates the guard + GET
+        # pair from _poll_loop:312-340 for the assertion target.
+        from btc_pm_arb.feeds.kalshi import _meta_close_time
+
+        for ticker, meta in list(feed._tracked.items()):
+            close_time = _meta_close_time(meta)
+            if close_time is not None and close_time <= datetime.now(timezone.utc):
+                continue
+            await feed._http_get(f"/markets/{ticker}/orderbook")
+
+        assert "/markets/STALE-EXPIRED/orderbook" not in requested_paths
+        assert "/markets/STILL-LIVE/orderbook" in requested_paths

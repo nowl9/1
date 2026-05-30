@@ -272,11 +272,23 @@ class KalshiFeed:
         )
         body = await self._http_get(path)
         markets = body.get("markets", []) or []
+        # Client-side close_time prune: Kalshi mass-closes contracts on
+        # clock-aligned boundaries, and a 60s discovery snapshot can carry
+        # close_time <= now rows for almost a minute.  Filter them out
+        # before they enter _tracked so _poll_loop never wastes a request
+        # on an already-expired ticker.  Rows whose close_time is missing
+        # or unparseable are retained — silently dropping them would
+        # mask upstream shape regressions.
+        now = datetime.now(timezone.utc)
         new_tracked: dict[str, dict] = {}
         for m in markets:
             ticker = m.get("ticker")
-            if ticker:
-                new_tracked[ticker] = m
+            if not ticker:
+                continue
+            close_time = _meta_close_time(m)
+            if close_time is not None and close_time <= now:
+                continue
+            new_tracked[ticker] = m
         self._tracked = new_tracked
         logger.info(
             "kalshi_discovery_completed",
@@ -314,6 +326,13 @@ class KalshiFeed:
                     break
                 meta = self._tracked.get(ticker)
                 if meta is None:
+                    continue
+                # Second close_time guard: defends against the snapshot
+                # going stale within the 60s discovery interval — a
+                # contract that was live at last discovery may close
+                # before this poll cycle finishes.
+                close_time = _meta_close_time(meta)
+                if close_time is not None and close_time <= datetime.now(timezone.utc):
                     continue
                 try:
                     # Path relative to base_url; see _discover_markets.
@@ -365,6 +384,25 @@ class KalshiFeed:
 
 
 # ── Tick builder ──────────────────────────────────────────────────────────────
+
+def _meta_close_time(meta: dict) -> datetime | None:
+    """Parse the close_time on a Kalshi market dict, tz-aware UTC.
+
+    Returns None when the field is missing or unparseable.  Callers should
+    treat ``None`` as "unknown" (retain the row) rather than "expired" —
+    discarding on missing data would mask upstream shape regressions.
+    """
+    raw = meta.get("close_time")
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
 
 def _build_tick(ticker: str, meta: dict, book: dict) -> PredictionMarketTick | None:
     """Combine cached market metadata with a fresh orderbook into a tick.
