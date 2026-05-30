@@ -10,6 +10,7 @@ from btc_pm_arb.feeds.normalizer import (
     _extract_strike_from_question,
     classify_kalshi_direction,
     classify_kalshi_product_type,
+    is_polymarket_denylisted,
     normalize_kalshi_tick,
     normalize_polymarket_tick,
     pm_tick_to_probability_quote,
@@ -325,3 +326,90 @@ class TestNormalizeKalshiPolarityProductType:
         assert quote is not None
         assert quote.direction == "below"
         assert quote.product_type == "terminal"
+
+
+# ── Polymarket hard denylist (stopgap, independent of the classifier) ────────
+
+# The barrier-class + range BTC markets enumerated in the polarity audit
+# (outputs/fix_polarity_barrier_report.md section 4).  The genuine terminal
+# markets are intentionally NOT denylisted.
+_DENYLISTED_QUESTIONS = [
+    "Will Bitcoin dip to $70,000 May 25-31?",                               # one-touch down (LIVE phantom)
+    "Will Bitcoin reach $150,000 by December 31, 2026?",                    # one-touch up
+    "Will the price of Bitcoin be between $64,000 and $66,000 on June 4?",  # range
+]
+_RETAINED_QUESTIONS = [
+    "Will the price of Bitcoin be less than $68,000 on May 31?",  # terminal below
+    "Will the price of Bitcoin be above $84,000 on May 31?",      # terminal above
+]
+
+
+class TestPolymarketDenylist:
+    @pytest.mark.parametrize("question", _DENYLISTED_QUESTIONS)
+    def test_denylisted_question_predicate(self, question: str) -> None:
+        # The denylist predicate is a pure function of the identifiers a tick
+        # carries -- it does not depend on the free-text classifier.
+        assert is_polymarket_denylisted("0xwhatever", question) is True
+
+    @pytest.mark.parametrize("question", _RETAINED_QUESTIONS)
+    def test_retained_question_not_denylisted(self, question: str) -> None:
+        assert is_polymarket_denylisted("0xwhatever", question) is False
+
+    @pytest.mark.parametrize("question", _DENYLISTED_QUESTIONS)
+    def test_denylisted_market_forced_off_terminal_pricer(self, question: str) -> None:
+        # A denylisted market is tracked but excluded: it must never normalize
+        # to a terminal product (which is what the pricer/signal path trades).
+        raw = {
+            "condition_id": "0xdeny",
+            "question": question,
+            "outcomes": ["Yes", "No"],
+            "outcomePrices": ["0.40", "0.60"],
+            "endDate": "2026-12-31T00:00:00Z",
+        }
+        tick = normalize_polymarket_tick(raw)
+        assert tick.product_type != "terminal"
+
+    def test_denylist_normalizes_whitespace_and_case(self) -> None:
+        # Extra whitespace / casing must not let a phantom slip through.
+        raw = {
+            "condition_id": "0xspacey",
+            "question": "  will   BITCOIN dip to $70,000 MAY 25-31?  ",
+            "outcomes": ["Yes", "No"],
+            "outcomePrices": ["0.40", "0.60"],
+            "endDate": "2026-12-31T00:00:00Z",
+        }
+        tick = normalize_polymarket_tick(raw)
+        assert tick.product_type == "one_touch"
+
+    def test_condition_id_denylist_path(self) -> None:
+        # condition_id matching works even when the question text is benign
+        # (proves the denylist overrides whatever the classifier would decide).
+        from btc_pm_arb.feeds import normalizer as _nz
+
+        cid = "0xCONDITION-PHANTOM"
+        original = _nz._PM_DENYLIST_CONDITION_IDS
+        _nz._PM_DENYLIST_CONDITION_IDS = frozenset({cid})
+        try:
+            raw = {
+                "condition_id": cid,
+                "question": "Will Bitcoin be above $84,000 on May 31?",
+                "outcomes": ["Yes", "No"],
+                "outcomePrices": ["0.40", "0.60"],
+                "endDate": "2026-05-31T00:00:00Z",
+            }
+            tick = _nz.normalize_polymarket_tick(raw)
+            assert tick.product_type == "one_touch"
+        finally:
+            _nz._PM_DENYLIST_CONDITION_IDS = original
+
+    def test_non_denylisted_terminal_above_unchanged(self) -> None:
+        # Sanity: an ordinary terminal-above market is not collaterally excluded.
+        raw = {
+            "condition_id": "0xok",
+            "question": "Will BTC be above $100,000 on Dec 31?",
+            "outcomes": ["Yes", "No"],
+            "outcomePrices": ["0.30", "0.70"],
+            "endDate": "2026-12-31T00:00:00Z",
+        }
+        tick = normalize_polymarket_tick(raw)
+        assert tick.product_type == "terminal"

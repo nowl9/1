@@ -77,6 +77,62 @@ def classify_kalshi_product_type(raw: dict, ticker: str = "") -> str:
     return "terminal"
 
 
+# ── Polymarket hard denylist (stopgap, independent of the classifier) ──────────
+#
+# Polymarket questions are free text with no strike_type / rules metadata, so the
+# structured Kalshi parse does not apply.  Before the free-text classifier exists
+# this denylist hard-excludes the specific barrier-class + range BTC markets
+# enumerated in the polarity audit (outputs/fix_polarity_barrier_report.md
+# section 4), fencing the live "dip to" one-touch-down phantoms.
+#
+# It is matched against the two identifiers a PredictionMarketTick actually
+# carries at runtime: the venue ``condition_id`` (stored as ``contract_id``) and
+# the normalized free-text ``question``.  The live Gamma recordings that carry
+# conditionIds (data/recordings/) are gitignored and absent from the checkout, so
+# the audit's enumerated *question text* is the stable denylist key; the
+# condition_id set is kept as a hook for when those recordings are recaptured.
+#
+# A denylisted market is forced off the terminal pricer (see
+# normalize_polymarket_tick): it is tracked but never produces a signal.
+
+
+def _normalize_question(question: str) -> str:
+    """Collapse whitespace + lowercase a free-text question for stable matching."""
+    return " ".join((question or "").split()).strip().lower()
+
+
+# Venue condition_ids / token_ids to hard-exclude.  Empty until the gitignored
+# Gamma recordings are recaptured; the question denylist below carries the
+# audit's enumerated cases in the meantime.
+_PM_DENYLIST_CONDITION_IDS: frozenset[str] = frozenset()
+
+# Enumerated barrier-class + range BTC markets from the polarity audit.  The
+# genuine terminal-below ("be less than $X on [date]") and terminal-above markets
+# are intentionally NOT denylisted -- they are retained and priced.
+_PM_DENYLIST_QUESTIONS: frozenset[str] = frozenset(
+    _normalize_question(q)
+    for q in (
+        # one-touch DOWN barrier ("dip to ...") -- the LIVE phantom class
+        "Will Bitcoin dip to $70,000 May 25-31?",
+        # one-touch UP barrier ("reach ... by [date]") -- latent
+        "Will Bitcoin reach $150,000 by December 31, 2026?",
+        # range / band product ("between $X and $Y on [date]") -- unpriceable
+        "Will the price of Bitcoin be between $64,000 and $66,000 on June 4?",
+    )
+)
+
+
+def is_polymarket_denylisted(contract_id: str, question: str) -> bool:
+    """True if a Polymarket market is on the hard denylist (track-but-don't-signal).
+
+    Independent of the free-text classifier: matches the venue condition_id or
+    the normalized question text against the audited barrier/range set.
+    """
+    if contract_id and contract_id in _PM_DENYLIST_CONDITION_IDS:
+        return True
+    return _normalize_question(question) in _PM_DENYLIST_QUESTIONS
+
+
 # ── Prediction market normalizers ─────────────────────────────────────────────
 
 def normalize_polymarket_tick(raw: dict) -> PredictionMarketTick:
@@ -144,13 +200,25 @@ def normalize_polymarket_tick(raw: dict) -> PredictionMarketTick:
         except ValueError:
             expiry = None
 
+    question = raw.get("question", "")
     # Try to extract a BTC strike price from the question text
-    strike = _extract_strike_from_question(raw.get("question", ""))
+    strike = _extract_strike_from_question(question)
+    contract_id = raw.get("condition_id") or raw.get("token_id", "")
+
+    # Polarity / product type.  Until the free-text classifier lands these stay
+    # at the above/terminal defaults; the hard denylist force-excludes audited
+    # barrier/range markets by flipping them off the terminal pricer.  The
+    # ``terminal``-only guard keeps the denylist independent of (and additive to)
+    # the classifier: a denylisted market is never left on the terminal pricer.
+    direction = "above"
+    product_type = "terminal"
+    if is_polymarket_denylisted(contract_id, question) and product_type == "terminal":
+        product_type = "one_touch"
 
     return PredictionMarketTick(
         source=DataSource.POLYMARKET,
-        contract_id=raw.get("condition_id") or raw.get("token_id", ""),
-        question=raw.get("question", ""),
+        contract_id=contract_id,
+        question=question,
         strike=strike,
         expiry=expiry,
         yes_bid=yes_bid,
@@ -158,6 +226,8 @@ def normalize_polymarket_tick(raw: dict) -> PredictionMarketTick:
         no_bid=no_bid,
         no_ask=no_ask,
         timestamp=utc_now(),
+        direction=direction,
+        product_type=product_type,
     )
 
 
