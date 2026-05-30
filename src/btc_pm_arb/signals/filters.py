@@ -379,6 +379,34 @@ class SignalFilter:
                 )
                 continue
             signals.append(_to_arbitrage_signal(edge, feed_health, rv_tracker))
+            # Round 9d2: emit an INFO event for every signal that survives
+            # the full criterion chain.  This is the passing-side counterpart
+            # to the DEBUG "signal.filtered" event above and the funnel's
+            # observable proof that discovery → matching → filtering reaches
+            # a tradable contract.  Field names are read straight off the
+            # source dataclasses (do not rename):
+            #   venue         ← PredictionMarketTick.source (DataSource enum)
+            #   contract      ← PredictionMarketTick.contract_id (the ticker)
+            #   adjusted_edge ← EdgeResult.best_conservative_edge — the exact
+            #                   value _to_arbitrage_signal copies into
+            #                   ArbitrageSignal.adjusted_edge
+            # dte_days is derived from the PM expiry the same way
+            # _reject_expiry_bounds computes it; None when expiry is missing
+            # (the expiry_bounds criterion would have rejected a None expiry,
+            # so survivors normally carry one — the guard is defensive).
+            _expiry = edge.match.pm_tick.expiry
+            _dte_days = (
+                (_expiry - datetime.now(timezone.utc)).total_seconds() / 86400.0
+                if _expiry is not None
+                else None
+            )
+            logger.info(
+                "signal.passed",
+                venue=edge.match.pm_tick.source.value,
+                contract=edge.match.pm_tick.contract_id,
+                dte_days=round(_dte_days, 3) if _dte_days is not None else None,
+                adjusted_edge=round(edge.best_conservative_edge, 6),
+            )
 
         signals.sort(key=lambda s: s.adjusted_edge, reverse=True)
         return signals
