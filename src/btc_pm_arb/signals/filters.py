@@ -123,6 +123,20 @@ def _reject_one_touch(e: EdgeResult, cfg: FilterConfig, _: dict) -> str | None:
     return None
 
 
+def _reject_range(e: EdgeResult, cfg: FilterConfig, _: dict) -> str | None:
+    """Reject band / range products (track but never signal).
+
+    A "between $X and $Y" market pays on the terminal price landing inside a
+    band -- a different payoff from the single-threshold digital the pricer
+    computes (P(S_T > K)).  Pricing it against one strike produces a phantom
+    edge, so it is excluded until a range pricer exists (mirrors
+    _reject_one_touch; see outputs/fix_pm_classifier_report.md).
+    """
+    if e.match.pm_quote.product_type == "range":
+        return "range_product"
+    return None
+
+
 def _reject_no_edge(e: EdgeResult, cfg: FilterConfig, _: dict) -> str | None:
     if e.best_side is None or e.best_conservative_edge <= 0:
         return "no_positive_edge"
@@ -317,6 +331,7 @@ def _reject_vol_regime_edge(e: EdgeResult, cfg: FilterConfig, ctx: dict) -> str 
 
 _CRITERIA: list[_Criterion] = [
     _reject_one_touch,
+    _reject_range,
     _reject_no_edge,
     _reject_empty_book,
     _reject_min_conservative_edge,

@@ -504,6 +504,23 @@ def test_terminal_product_not_rejected_by_one_touch_gate():
     assert len(filt.filter([e])) == 1
 
 
+# ── Range (band) product gate ─────────────────────────────────────────────────
+
+def test_range_product_rejected():
+    """A range / band product is skipped even with a huge (phantom) edge."""
+    e = _edge_with_product_type("range")
+    filt = SignalFilter()
+    assert filt.filter([e]) == []
+    assert "range_product" in filt.explains(e)
+
+
+def test_range_rejection_counted():
+    e = _edge_with_product_type("range")
+    filt = SignalFilter()
+    filt.filter([e])
+    assert filt.rejection_counts.get("range_product") == 1
+
+
 # ── Depth gate (empty crossed book) ───────────────────────────────────────────
 
 def _edge_with_book(order_book_yes, order_book_no=None) -> EdgeResult:

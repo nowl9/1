@@ -114,9 +114,11 @@ class PredictionMarketTick(BaseModel):
 
     # Product semantics parsed from venue metadata at normalization time.
     # direction:    YES-leg polarity ("above" | "below").
-    # product_type: "terminal" European digital, or "one_touch" barrier.
+    # product_type: "terminal" European digital, "one_touch" barrier, or
+    #               "range" (band) product.  Only terminal is priceable by the
+    #               digital pricer; one_touch and range are tracked-but-excluded.
     direction: Literal["above", "below"] = "above"
-    product_type: Literal["terminal", "one_touch"] = "terminal"
+    product_type: Literal["terminal", "one_touch", "range"] = "terminal"
 
     timestamp: datetime
 
@@ -161,9 +163,10 @@ class ProbabilityQuote(BaseModel):
     # Whether this is probability of BTC being *above* the strike
     direction: Literal["above", "below"] = "above"
 
-    # Path-dependent products (one-touch barriers) are mispriced by the
-    # terminal digital pricer; tagged here so the signal filter can skip them.
-    product_type: Literal["terminal", "one_touch"] = "terminal"
+    # Path-dependent products (one-touch barriers) and band products (range)
+    # are mispriced by the terminal digital pricer; tagged here so the signal
+    # filter can skip them.
+    product_type: Literal["terminal", "one_touch", "range"] = "terminal"
 
     # Settlement mechanism matters for basis adjustment
     settlement_type: Literal["deribit_twap", "kalshi_rti", "polymarket_spot", "unknown"] = (
