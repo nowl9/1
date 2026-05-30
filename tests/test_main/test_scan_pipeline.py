@@ -114,7 +114,11 @@ def _make_pm_tick(
     yes_ask: float = 0.42,
     no_bid: float = 0.58,
     no_ask: float = 0.60,
+    order_book_yes: list | None = None,
+    order_book_no: list | None = None,
 ) -> PredictionMarketTick:
+    # A realistic Kalshi tick carries some depth on each side; the depth gate
+    # (require_nonempty_book) rejects signals whose crossed book is empty.
     return PredictionMarketTick(
         source=source,
         contract_id=contract_id,
@@ -125,6 +129,8 @@ def _make_pm_tick(
         yes_ask=yes_ask,
         no_bid=no_bid,
         no_ask=no_ask,
+        order_book_yes=order_book_yes if order_book_yes is not None else [(yes_ask, 500.0)],
+        order_book_no=order_book_no if order_book_no is not None else [(no_ask, 500.0)],
         timestamp=datetime.now(timezone.utc),
     )
 

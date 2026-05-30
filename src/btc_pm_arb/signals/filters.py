@@ -72,6 +72,13 @@ class FilterConfig:
     max_pm_spread: float = 0.12            # max YES bid-ask spread (12 %)
     min_pm_liquidity_usd: float = 50.0     # min estimated notional at quoted price
 
+    # Depth gate: require the crossed book side to carry at least one level.
+    # A quote with order_book == None means depth is unknown (gate skipped);
+    # an explicit empty list means known-empty and is rejected.  The diag
+    # (outputs/diag_0p93_signal.md) showed an empty-book signal passing all
+    # gates and placing a dry-run order.
+    require_nonempty_book: bool = True
+
     # Data quality
     min_match_quality: float = 0.40        # minimum match score from ContractMatcher
     max_vol_fit_rmse: float = 0.05         # max SVI RMSE (5 vol-pts as a fraction)
@@ -119,6 +126,25 @@ def _reject_one_touch(e: EdgeResult, cfg: FilterConfig, _: dict) -> str | None:
 def _reject_no_edge(e: EdgeResult, cfg: FilterConfig, _: dict) -> str | None:
     if e.best_side is None or e.best_conservative_edge <= 0:
         return "no_positive_edge"
+    return None
+
+
+def _reject_empty_book(e: EdgeResult, cfg: FilterConfig, _: dict) -> str | None:
+    """Reject signals whose crossed book side is explicitly empty.
+
+    ``best_side == "buy_yes"`` executes against the YES book; ``"buy_no"``
+    against the NO book.  ``order_book_* is None`` means the depth was never
+    captured (skip — don't penalise missing data); an empty list means the
+    book was captured and is empty (no liquidity to trade into → reject).
+    """
+    if not cfg.require_nonempty_book or e.best_side is None:
+        return None
+    q = e.match.pm_quote
+    book = q.order_book_yes if e.best_side == "buy_yes" else q.order_book_no
+    if book is None:
+        return None
+    if len(book) == 0:
+        return "empty_book"
     return None
 
 
@@ -292,6 +318,7 @@ def _reject_vol_regime_edge(e: EdgeResult, cfg: FilterConfig, ctx: dict) -> str 
 _CRITERIA: list[_Criterion] = [
     _reject_one_touch,
     _reject_no_edge,
+    _reject_empty_book,
     _reject_min_conservative_edge,
     _reject_min_mid_edge,
     _reject_expiry_bounds,

@@ -101,6 +101,9 @@ def _pm_tick(
         expiry=_EXPIRY,
         yes_bid=yes_bid,
         yes_ask=yes_ask,
+        # Realistic one-level depth so the require_nonempty_book gate passes.
+        order_book_yes=[(yes_ask, 500.0)],
+        order_book_no=[(round(1.0 - yes_bid, 4), 500.0)],
         timestamp=_NOW,
     )
 

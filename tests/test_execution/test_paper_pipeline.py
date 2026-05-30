@@ -93,6 +93,9 @@ def _make_pm_tick(
         yes_ask=yes_ask,
         no_bid=no_bid,
         no_ask=no_ask,
+        # Realistic one-level depth so the require_nonempty_book gate passes.
+        order_book_yes=[(yes_ask, 500.0)],
+        order_book_no=[(no_ask, 500.0)],
         timestamp=timestamp or datetime.now(timezone.utc),
     )
 

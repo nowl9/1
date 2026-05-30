@@ -502,3 +502,43 @@ def test_terminal_product_not_rejected_by_one_touch_gate():
     e = _edge_with_product_type("terminal")
     filt = SignalFilter()
     assert len(filt.filter([e])) == 1
+
+
+# ── Depth gate (empty crossed book) ───────────────────────────────────────────
+
+def _edge_with_book(order_book_yes, order_book_no=None) -> EdgeResult:
+    """Clear buy_yes EdgeResult whose pm_quote carries the given books."""
+    m = _match()
+    m.pm_quote = m.pm_quote.model_copy(update={
+        "order_book_yes": order_book_yes,
+        "order_book_no": order_book_no,
+    })
+    return _edge(match=m, best_side="buy_yes",
+                 conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
+
+
+def test_empty_crossed_book_rejected():
+    """buy_yes signal with an explicitly empty YES book is filtered."""
+    e = _edge_with_book(order_book_yes=[])
+    filt = SignalFilter()
+    assert filt.filter([e]) == []
+    assert "empty_book" in filt.explains(e)
+
+
+def test_nonempty_crossed_book_passes():
+    e = _edge_with_book(order_book_yes=[(0.44, 500.0)])
+    filt = SignalFilter()
+    assert len(filt.filter([e])) == 1
+
+
+def test_none_book_skips_depth_gate():
+    """Unknown depth (None) is not penalised — gate skipped."""
+    e = _edge_with_book(order_book_yes=None)
+    filt = SignalFilter()
+    assert len(filt.filter([e])) == 1
+
+
+def test_depth_gate_disabled_by_config():
+    e = _edge_with_book(order_book_yes=[])
+    filt = SignalFilter(FilterConfig(require_nonempty_book=False))
+    assert len(filt.filter([e])) == 1
