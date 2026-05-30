@@ -103,7 +103,19 @@ _RECONNECT_FACTOR: float = 2.0
 # threshold gating.  We deliberately don't filter by tag_id here —
 # Polymarket tag IDs have changed historically and content-based
 # filtering is more durable.
-_DISCOVERY_LIMIT: int = 500
+#
+# Gamma /markets silently clamps ``limit`` to 100 server-side regardless
+# of the requested value (Round 9d2 verify report).  Pre-9d2 we asked
+# for limit=500 and silently got the top 100 by volume across all
+# Polymarket categories — BTC binaries were crowded out by politics /
+# sports / other high-volume non-BTC markets, capping discovery at
+# roughly one tracked contract.  Use offset-based pagination instead,
+# walking the volume-ordered tail until we either exhaust BTC binaries
+# (a short page) or hit the page ceiling.  The verify report found BTC
+# binaries within offset 0..2900, so 30 pages of 100 covers it with
+# headroom; a short page short-circuits the loop early.
+_DISCOVERY_PAGE_SIZE: int = 100
+_DISCOVERY_MAX_PAGES: int = 30
 
 
 # ── Feed ──────────────────────────────────────────────────────────────────────
@@ -278,51 +290,85 @@ class PolymarketFeed:
     async def _discover_markets(self) -> None:
         """Refresh the tracked BTC binary-threshold contract set.
 
+        Walks Gamma /markets with offset-based pagination to escape the
+        silent server-side ``limit`` clamp (100, per 9d2 verify) and
+        union-merges all pages' BTC-binary contracts into ``self._tracked``.
+
+        Termination conditions (whichever fires first):
+        * a page returns fewer than ``_DISCOVERY_PAGE_SIZE`` rows
+          (no more markets to fetch);
+        * the page counter hits ``_DISCOVERY_MAX_PAGES`` (defensive
+          ceiling — the verify report found BTC binaries within the
+          top ~2900 by volume, so 30 pages of 100 covers it).
+
         Replaces self._tracked atomically; YES token ids that drop out of
         the response (closed, expired, or no longer matching the BTC
-        binary-threshold filter) are removed.
+        binary-threshold filter) are removed.  Dedupe across pages is
+        automatic: ``new_tracked`` keys on ``yes_token_id`` so a row
+        that appears in two pages contributes once.
         """
-        # Path is relative to settings.polymarket_gamma_url, which has no
-        # path suffix by convention.  Do NOT prepend '/gamma-api/' or
-        # similar — that's the same shape of bug as the doubled-prefix
-        # 404 caught in Round 7a (regression-covered in
-        # tests/test_feeds/test_polymarket.py).
-        path = (
-            "/markets"
-            "?active=true"
-            "&closed=false"
-            f"&limit={_DISCOVERY_LIMIT}"
-            "&order=volume"
-            "&ascending=false"
-        )
-        body = await self._http_get(self._gamma_client, path)
-        # Gamma /markets has historically returned either a bare list or
-        # a {"data": [...]} envelope — accommodate both rather than assume.
-        markets: list[dict]
-        if isinstance(body, list):
-            markets = body
-        elif isinstance(body, dict):
-            markets = body.get("data") or body.get("markets") or []
-        else:
-            markets = []
-
         new_tracked: dict[str, dict] = {}
-        for market in markets:
-            if not _is_btc_binary_threshold(market):
-                continue
-            yes_token_id = _resolve_yes_token(market)
-            if yes_token_id is None:
-                logger.debug(
-                    "polymarket_market_rejected",
-                    reason="missing_yes_token",
-                    question=market.get("question"),
-                )
-                continue
-            new_tracked[yes_token_id] = market
+        seen_market_ids: set[str] = set()  # debug-stat dedupe count
+        for page_idx in range(_DISCOVERY_MAX_PAGES):
+            offset = page_idx * _DISCOVERY_PAGE_SIZE
+            # Path is relative to settings.polymarket_gamma_url, which has
+            # no path suffix by convention.  Do NOT prepend '/gamma-api/'
+            # or similar — that's the same shape of bug as the
+            # doubled-prefix 404 caught in Round 7a (regression-covered
+            # in tests/test_feeds/test_polymarket.py).
+            path = (
+                "/markets"
+                "?active=true"
+                "&closed=false"
+                f"&limit={_DISCOVERY_PAGE_SIZE}"
+                f"&offset={offset}"
+                "&order=volume"
+                "&ascending=false"
+            )
+            body = await self._http_get(self._gamma_client, path)
+            # Gamma /markets has historically returned either a bare list
+            # or a {"data": [...]} envelope — accommodate both rather
+            # than assume.
+            markets: list[dict]
+            if isinstance(body, list):
+                markets = body
+            elif isinstance(body, dict):
+                markets = body.get("data") or body.get("markets") or []
+            else:
+                markets = []
+
+            for market in markets:
+                # Cross-page dedupe by market id (the wire-level identity).
+                # _is_btc_binary_threshold + _resolve_yes_token are pure
+                # functions of `market`, so processing the same row twice
+                # is correctness-neutral but wasted work; skip the second
+                # occurrence and just track the dupe count.
+                m_id = market.get("id") or market.get("conditionId")
+                if m_id is not None:
+                    if m_id in seen_market_ids:
+                        continue
+                    seen_market_ids.add(m_id)
+                if not _is_btc_binary_threshold(market):
+                    continue
+                yes_token_id = _resolve_yes_token(market)
+                if yes_token_id is None:
+                    logger.debug(
+                        "polymarket_market_rejected",
+                        reason="missing_yes_token",
+                        question=market.get("question"),
+                    )
+                    continue
+                new_tracked[yes_token_id] = market
+
+            # Short page → no more rows on the server.  Stop early; the
+            # next discovery interval re-walks from offset 0.
+            if len(markets) < _DISCOVERY_PAGE_SIZE:
+                break
         self._tracked = new_tracked
         logger.info(
             "polymarket_discovery_completed",
             tracked=len(self._tracked),
+            pages_walked=page_idx + 1,
         )
 
     async def _discovery_loop(self) -> None:
