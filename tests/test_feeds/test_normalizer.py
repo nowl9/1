@@ -10,6 +10,8 @@ from btc_pm_arb.feeds.normalizer import (
     _extract_strike_from_question,
     classify_kalshi_direction,
     classify_kalshi_product_type,
+    classify_polymarket_direction,
+    classify_polymarket_product_type,
     is_polymarket_denylisted,
     normalize_kalshi_tick,
     normalize_polymarket_tick,
@@ -412,4 +414,115 @@ class TestPolymarketDenylist:
             "endDate": "2026-12-31T00:00:00Z",
         }
         tick = normalize_polymarket_tick(raw)
+        assert tick.product_type == "terminal"
+
+
+# ── Polymarket free-text question classifier ─────────────────────────────────
+
+# Every enumerated audit case (outputs/fix_polarity_barrier_report.md section 4)
+# as (question, expected_direction, expected_product_type).  Barriers + range
+# are excluded; the terminal-below is retained-and-polarized; terminal-above is
+# unchanged.  Synthetic phrasing variants exercise the full "dip to" (~5),
+# "reach" (~15) and "between" (6) populations the recordings carried.
+_PM_CLASSIFY_CASES = [
+    # 5 "dip to" one-touch-down barriers (LIVE phantom class) -> excluded
+    ("Will Bitcoin dip to $70,000 May 25-31?", "below", "one_touch"),
+    ("Will Bitcoin dip to $80,000 this week?", "below", "one_touch"),
+    ("Will BTC fall to $60,000 before June?", "below", "one_touch"),
+    ("Will Bitcoin drop to $50,000 in May?", "below", "one_touch"),
+    ("Will BTC dip to $90,000 on any day in June?", "below", "one_touch"),
+    # "reach" one-touch-up barriers (latent) -> excluded
+    ("Will Bitcoin reach $150,000 by December 31, 2026?", "above", "one_touch"),
+    ("Will BTC hit $200,000 in 2026?", "above", "one_touch"),
+    ("Will Bitcoin touch $120,000 this year?", "above", "one_touch"),
+    ("Will BTC reach an all-time high in 2026?", "above", "one_touch"),
+    # "between" range / band products -> excluded
+    ("Will the price of Bitcoin be between $64,000 and $66,000 on June 4?", "above", "range"),
+    ("Will Bitcoin be between $100,000 and $110,000 on Dec 31?", "above", "range"),
+    # terminal below ("less than ... on [date]") -> RETAINED, below
+    ("Will the price of Bitcoin be less than $68,000 on May 31?", "below", "terminal"),
+    ("Will BTC be under $90,000 on June 30?", "below", "terminal"),
+    # terminal above ("above/over/exceed ... on [date]") -> RETAINED, above
+    ("Will the price of Bitcoin be above $84,000 on May 31?", "above", "terminal"),
+    ("Will BTC be over $100,000 on Dec 31?", "above", "terminal"),
+    ("Will Bitcoin exceed $120,000 by Dec 31?", "above", "terminal"),
+]
+
+
+class TestClassifyPolymarket:
+    @pytest.mark.parametrize("question,direction,product_type", _PM_CLASSIFY_CASES)
+    def test_product_type(self, question: str, direction: str, product_type: str) -> None:
+        assert classify_polymarket_product_type(question) == product_type
+
+    @pytest.mark.parametrize("question,direction,product_type", _PM_CLASSIFY_CASES)
+    def test_direction(self, question: str, direction: str, product_type: str) -> None:
+        assert classify_polymarket_direction(question) == direction
+
+    # ── FAIL CLOSED ──────────────────────────────────────────────────────────
+    @pytest.mark.parametrize(
+        "question",
+        [
+            "",
+            "asdf qwerty zxcv",                                  # garbled
+            "Will Bitcoin go bananas in 2026?",                 # no comparator
+            "Will BTC be above $90,000?",                       # comparator, no date anchor
+            "Will BTC be above $80,000 but below $90,000 on June 1?",  # two-sided / ambiguous
+            "What happens to Bitcoin this year?",              # vague
+        ],
+    )
+    def test_fail_closed_excludes_not_terminal_above(self, question: str) -> None:
+        # The cardinal guardrail: an ambiguous/unmatched question must NOT
+        # become a tradable terminal -- it is excluded (one_touch).
+        assert classify_polymarket_product_type(question) == "one_touch"
+
+    def test_existing_above_terminal_still_terminal(self) -> None:
+        # Regression: the base PM fixture used across the suite stays terminal.
+        assert classify_polymarket_product_type(
+            "Will BTC be above $100,000 by June 30?"
+        ) == "terminal"
+
+
+class TestNormalizePolymarketPolarityProductType:
+    """normalize_polymarket_tick carries classifier output onto the tick/quote."""
+
+    def _raw(self, question: str, **overrides: object) -> dict:
+        raw = {
+            "condition_id": "0xpm",
+            "question": question,
+            "outcomes": ["Yes", "No"],
+            "outcomePrices": ["0.40", "0.60"],
+            "endDate": "2026-05-31T00:00:00Z",
+        }
+        raw.update(overrides)
+        return raw
+
+    def test_terminal_below_retained_and_polarized(self) -> None:
+        tick = normalize_polymarket_tick(
+            self._raw("Will the price of Bitcoin be less than $68,000 on May 31?")
+        )
+        assert tick.direction == "below"
+        assert tick.product_type == "terminal"
+        quote = pm_tick_to_probability_quote(tick)
+        assert quote is not None
+        assert quote.direction == "below"
+        assert quote.product_type == "terminal"
+
+    def test_dip_to_excluded(self) -> None:
+        tick = normalize_polymarket_tick(
+            self._raw("Will Bitcoin dip to $70,000 May 25-31?")
+        )
+        assert tick.product_type == "one_touch"
+        assert tick.direction == "below"
+
+    def test_between_is_range(self) -> None:
+        tick = normalize_polymarket_tick(
+            self._raw("Will the price of Bitcoin be between $64,000 and $66,000 on June 4?")
+        )
+        assert tick.product_type == "range"
+
+    def test_terminal_above_retained(self) -> None:
+        tick = normalize_polymarket_tick(
+            self._raw("Will the price of Bitcoin be above $84,000 on May 31?")
+        )
+        assert tick.direction == "above"
         assert tick.product_type == "terminal"

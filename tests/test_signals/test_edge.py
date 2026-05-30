@@ -359,3 +359,53 @@ def test_above_contract_unchanged_by_direction_logic():
     calc = EdgeCalculator()
     result = calc.compute(match)
     assert result.edge_yes_conservative == pytest.approx(0.60 - 0.44, abs=1e-9)
+
+
+# ── Polymarket wiring is venue-agnostic (step D verify) ───────────────────────
+
+def test_pm_below_terminal_priced_vs_complement_end_to_end():
+    """A Polymarket terminal-below prices vs (1 - P(above)) with no edge change.
+
+    Proves the existing direction map (_model_yes_prob) and barrier wiring are
+    venue-agnostic: a PM "less than $X on [date]" question normalizes to
+    (below, terminal), carries that onto the quote, and the edge is differenced
+    against 1 - P(above) -- the same complement path the Kalshi terminal-below
+    uses.  P(above)=0.97 -> P(below)=0.03, so edge = 0.03 - 0.04 = -0.01, never
+    the phantom 0.97 - 0.04 = +0.93.
+    """
+    from btc_pm_arb.feeds.normalizer import (
+        normalize_polymarket_tick,
+        pm_tick_to_probability_quote,
+    )
+
+    raw = {
+        "condition_id": "0xpm-below",
+        "question": "Will the price of Bitcoin be less than $100,000 on May 31?",
+        "outcomes": ["Yes", "No"],
+        "outcomePrices": ["0.035", "0.965"],
+        "bids": [{"price": "0.03", "size": "500"}],
+        "asks": [{"price": "0.04", "size": "500"}],
+        "endDate": "2026-05-31T00:00:00Z",
+    }
+    tick = normalize_polymarket_tick(raw)
+    assert (tick.direction, tick.product_type) == ("below", "terminal")
+    quote = pm_tick_to_probability_quote(tick)
+    assert quote is not None
+    assert (quote.direction, quote.product_type) == ("below", "terminal")
+
+    entry = _cache_entry(strike=100_000.0, bid=0.97, ask=0.97)  # P(above)=0.97
+    match = MatchResult(
+        pm_tick=tick,
+        pm_quote=quote,
+        options_entry=entry,
+        matched_strike=100_000.0,
+        matched_expiry=tick.expiry,
+        strike_gap_pct=0.0,
+        expiry_gap_hours=0.0,
+        match_quality=1.0,
+        is_interpolated=False,
+    )
+    result = EdgeCalculator().compute(match)
+    # Differenced against 1 - P(above) = 0.03, NOT 0.97.
+    assert result.edge_yes_conservative == pytest.approx((1.0 - 0.97) - quote.ask_prob, abs=1e-9)
+    assert result.best_conservative_edge < 0.5  # no phantom

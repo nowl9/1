@@ -10,6 +10,7 @@ Full options→probability conversion is delegated to pricing.digital_pricer.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
 from btc_pm_arb.models import DataSource, OptionTick, PredictionMarketTick, ProbabilityQuote
@@ -133,6 +134,88 @@ def is_polymarket_denylisted(contract_id: str, question: str) -> bool:
     return _normalize_question(question) in _PM_DENYLIST_QUESTIONS
 
 
+# ── Polymarket free-text question classifier ───────────────────────────────────
+#
+# Polymarket markets carry only a free-text ``question`` -- no strike_type /
+# yes_sub_title / rules_primary -- so the structured Kalshi parse does not apply.
+# This deterministic keyword classifier is the Polymarket analog of
+# classify_kalshi_direction / classify_kalshi_product_type: it maps the question
+# phrasing to (direction, product_type) so barriers and bands are excluded and
+# genuine terminals are correctly polarized.
+#
+# FAIL CLOSED.  The original defect was fail-OPEN: every PM contract defaulted to
+# direction=above / product_type=terminal, turning "dip to" one-touch-downs into
+# live phantoms.  Here the default for any ambiguous / unmatched / two-sided
+# question is EXCLUDE (product_type=one_touch), never terminal-above.  An idle
+# missed market is acceptable; a phantom is not.
+#
+# Vocabulary (from outputs/fix_polarity_barrier_report.md section 4):
+#   reach / hit / touch / dip-to / fall-to / drop-to  -> one_touch (barrier)
+#   between X and Y / range                            -> range (band)
+#   above / over / exceed ... on|by [date]            -> terminal, above
+#   below / under / less than ... on|by [date]         -> terminal, below
+
+_PM_RANGE = re.compile(r"\bbetween\b.+?\band\b|\brange\b", re.I)
+_PM_ONE_TOUCH = re.compile(
+    r"\b(reach(?:es|ed)?|hits?|hitting|touch(?:es|ed)?|dips?\s+to|falls?\s+to|"
+    r"drops?\s+to|sinks?\s+to|climbs?\s+to|rises?\s+to|gets?\s+to|ever|"
+    r"all[-\s]?time\s+high|record\s+high)\b",
+    re.I,
+)
+_PM_DOWN_TOUCH = re.compile(
+    r"\b(dips?\s+to|falls?\s+to|drops?\s+to|sinks?\s+to|declines?\s+to)\b", re.I
+)
+_PM_BELOW = re.compile(
+    r"\b(below|under|less\s+than|lower\s+than|beneath|at\s+most)\b", re.I
+)
+_PM_ABOVE = re.compile(
+    r"\b(above|over|greater\s+than|higher\s+than|more\s+than|exceeds?|"
+    r"surpass(?:es)?|at\s+least)\b",
+    re.I,
+)
+# A terminal directional market is anchored to a settlement date ("on"/"by").
+_PM_DATED = re.compile(r"\b(on|by)\b", re.I)
+
+
+def classify_polymarket_product_type(question: str) -> str:
+    """Return "terminal" | "one_touch" | "range" for a Polymarket question.
+
+    FAIL CLOSED: anything that is not unambiguously a single-threshold terminal
+    market anchored to a date resolves to "one_touch" (excluded), never
+    "terminal".
+    """
+    q = question or ""
+    if _PM_RANGE.search(q):
+        return "range"
+    if _PM_ONE_TOUCH.search(q):
+        return "one_touch"
+    has_below = bool(_PM_BELOW.search(q))
+    has_above = bool(_PM_ABOVE.search(q))
+    # Terminal only when there is exactly one comparator direction AND a
+    # settlement-date anchor; otherwise exclude.
+    if _PM_DATED.search(q) and (has_below ^ has_above):
+        return "terminal"
+    return "one_touch"
+
+
+def classify_polymarket_direction(question: str) -> str:
+    """Return the YES-leg polarity ("above" | "below") for a Polymarket question.
+
+    "dip to" / "fall to" / "drop to" are down-touches (below); an explicit
+    below comparator with no above comparator is below; everything else
+    (including the excluded default) is above.  Direction only affects pricing
+    for *retained* terminals -- excluded barriers/bands never reach the pricer.
+    """
+    q = question or ""
+    if _PM_DOWN_TOUCH.search(q):
+        return "below"
+    has_below = bool(_PM_BELOW.search(q))
+    has_above = bool(_PM_ABOVE.search(q))
+    if has_below and not has_above:
+        return "below"
+    return "above"
+
+
 # ── Prediction market normalizers ─────────────────────────────────────────────
 
 def normalize_polymarket_tick(raw: dict) -> PredictionMarketTick:
@@ -205,13 +288,15 @@ def normalize_polymarket_tick(raw: dict) -> PredictionMarketTick:
     strike = _extract_strike_from_question(question)
     contract_id = raw.get("condition_id") or raw.get("token_id", "")
 
-    # Polarity / product type.  Until the free-text classifier lands these stay
-    # at the above/terminal defaults; the hard denylist force-excludes audited
-    # barrier/range markets by flipping them off the terminal pricer.  The
-    # ``terminal``-only guard keeps the denylist independent of (and additive to)
-    # the classifier: a denylisted market is never left on the terminal pricer.
-    direction = "above"
-    product_type = "terminal"
+    # Polarity / product type parsed from the free-text question (fail-closed:
+    # ambiguous/unmatched -> one_touch, never terminal-above).  The hard denylist
+    # then force-excludes audited barrier/range markets even if the classifier
+    # would have passed them; the ``terminal``-only guard keeps the denylist
+    # independent of (and additive to) the classifier -- a denylisted market is
+    # never left on the terminal pricer, and a market the classifier already
+    # excluded keeps its more precise one_touch/range tag.
+    direction = classify_polymarket_direction(question)
+    product_type = classify_polymarket_product_type(question)
     if is_polymarket_denylisted(contract_id, question) and product_type == "terminal":
         product_type = "one_touch"
 
