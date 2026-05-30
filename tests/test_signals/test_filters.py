@@ -471,3 +471,34 @@ def test_passing_signals_do_not_increment_rejection_counts():
     filt = SignalFilter()
     filt.filter([e])
     assert filt.rejection_counts == {}
+
+
+# ── One-touch barrier gate (polarity / barrier fix) ───────────────────────────
+
+def _edge_with_product_type(product_type: str) -> EdgeResult:
+    """Clear-edge EdgeResult whose pm_quote carries the given product_type."""
+    m = _match()
+    m.pm_quote = m.pm_quote.model_copy(update={"product_type": product_type})
+    return _edge(match=m, conservative_edge=0.93, adj_yes=0.93, mid_yes=0.95)
+
+
+def test_one_touch_barrier_rejected():
+    """A one-touch barrier signal is skipped even with a huge (phantom) edge."""
+    e = _edge_with_product_type("one_touch")
+    filt = SignalFilter()
+    assert filt.filter([e]) == []
+    assert "one_touch_barrier" in filt.explains(e)
+
+
+def test_one_touch_rejection_counted():
+    e = _edge_with_product_type("one_touch")
+    filt = SignalFilter()
+    filt.filter([e])
+    assert filt.rejection_counts.get("one_touch_barrier") == 1
+
+
+def test_terminal_product_not_rejected_by_one_touch_gate():
+    """A genuine terminal contract with the same edge still passes."""
+    e = _edge_with_product_type("terminal")
+    filt = SignalFilter()
+    assert len(filt.filter([e])) == 1

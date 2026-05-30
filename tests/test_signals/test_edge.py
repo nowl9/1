@@ -297,3 +297,65 @@ def test_edge_result_carries_match_reference():
     calc = EdgeCalculator()
     result = calc.compute(match)
     assert result.match is match
+
+
+# ── Direction-aware pricing (polarity fix) ────────────────────────────────────
+
+def _below_match(
+    options_bid: float = 0.97,
+    options_ask: float = 0.97,
+    pm_yes_bid: float = 0.03,
+    pm_yes_ask: float = 0.04,
+) -> MatchResult:
+    """A 'below' contract: PM YES pays on S_T <= K, modelled vs 1 - P(above)."""
+    from btc_pm_arb.models import ProbabilityQuote
+    pm_tick = _pm_tick(yes_bid=pm_yes_bid, yes_ask=pm_yes_ask)
+    pm_tick = pm_tick.model_copy(update={"direction": "below"})
+    pm_quote = ProbabilityQuote(
+        source=DataSource.KALSHI,
+        contract_id=pm_tick.contract_id,
+        strike=pm_tick.strike,
+        expiry=pm_tick.expiry,
+        bid_prob=pm_yes_bid,
+        ask_prob=pm_yes_ask,
+        mid_prob=(pm_yes_bid + pm_yes_ask) / 2,
+        direction="below",
+        product_type="terminal",
+        settlement_type="kalshi_rti",
+        timestamp=_NOW,
+    )
+    entry = _cache_entry(bid=options_bid, ask=options_ask)
+    return MatchResult(
+        pm_tick=pm_tick,
+        pm_quote=pm_quote,
+        options_entry=entry,
+        matched_strike=100_000.0,
+        matched_expiry=_EXPIRY,
+        strike_gap_pct=0.0,
+        expiry_gap_hours=0.0,
+        match_quality=1.0,
+        is_interpolated=False,
+    )
+
+
+def test_below_contract_priced_vs_one_minus_ndtwo():
+    """strike_type:less terminal — YES leg differenced vs (1 - N(d2)).
+
+    Model P(above) = 0.97 → P(below) = 0.03.  edge_yes_conservative must be
+    0.03 - pm_yes_ask (0.04) = -0.01, NOT the phantom 0.97 - 0.04 = +0.93.
+    """
+    match = _below_match(options_bid=0.97, options_ask=0.97,
+                         pm_yes_bid=0.03, pm_yes_ask=0.04)
+    calc = EdgeCalculator()
+    result = calc.compute(match)
+    assert result.edge_yes_conservative == pytest.approx((1.0 - 0.97) - 0.04, abs=1e-9)
+    # No phantom positive YES edge.
+    assert result.best_conservative_edge < 0.5
+
+
+def test_above_contract_unchanged_by_direction_logic():
+    """Regression: an 'above' contract prices exactly as before."""
+    match = _match(options_bid=0.60, options_ask=0.64, pm_yes_bid=0.40, pm_yes_ask=0.44)
+    calc = EdgeCalculator()
+    result = calc.compute(match)
+    assert result.edge_yes_conservative == pytest.approx(0.60 - 0.44, abs=1e-9)

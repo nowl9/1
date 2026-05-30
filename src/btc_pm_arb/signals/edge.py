@@ -116,9 +116,16 @@ class EdgeCalculator:
         entry = match.options_entry
         pm = match.pm_quote
 
+        # The pricer always emits P(S_T > K) (probability ABOVE the strike).
+        # The PM YES leg, however, can pay on "above" or "below" the strike;
+        # ``pm.direction`` carries the parsed polarity.  ``_model_yes_prob``
+        # maps the options P(above) bid/mid/ask onto the probability of the
+        # PM's YES event (complementing for "below"), so a below-contract is
+        # compared against (1 - P(above)) instead of P(above).
         ops_mid = entry.mid_prob
         ops_bid = entry.bid_prob
         ops_ask = entry.ask_prob
+        my_bid, my_mid, my_ask = _model_yes_prob(pm.direction, ops_bid, ops_mid, ops_ask)
 
         # PM prices — YES side
         pm_yes_ask = pm.ask_prob                             # cost to buy YES
@@ -134,14 +141,14 @@ class EdgeCalculator:
         pm_no_mid = (pm_no_bid + pm_no_ask) / 2.0
 
         # ── mid-to-mid edges ──────────────────────────────────────────────
-        edge_yes_mid = ops_mid - pm_yes_mid
-        edge_no_mid = (1.0 - ops_mid) - pm_no_mid
+        edge_yes_mid = my_mid - pm_yes_mid
+        edge_no_mid = (1.0 - my_mid) - pm_no_mid
 
         # ── conservative edges ────────────────────────────────────────────
-        # YES: use lower options bound (bad for us) vs higher PM ask (bad for us)
-        edge_yes_cons = ops_bid - pm_yes_ask
-        # NO: use upper options bound (bad for us) vs higher PM no-ask (bad for us)
-        edge_no_cons = (1.0 - ops_ask) - pm_no_ask
+        # YES: use lower model-yes bound (bad for us) vs higher PM ask (bad for us)
+        edge_yes_cons = my_bid - pm_yes_ask
+        # NO: use upper model-yes bound (bad for us) vs higher PM no-ask (bad for us)
+        edge_no_cons = (1.0 - my_ask) - pm_no_ask
 
         # ── settlement basis adjustment ───────────────────────────────────
         adj_yes, adj_no = self._apply_basis(
@@ -152,7 +159,9 @@ class EdgeCalculator:
         best_side, best_edge = _pick_best_side(adj_yes, adj_no)
 
         # ── fill-adjusted edge ────────────────────────────────────────────
-        fill_adj = _compute_fill_adjusted_edge(match, best_side, ops_bid, ops_ask)
+        # Pass the direction-mapped model-yes bounds so the fill edge is
+        # polarised the same way as the conservative edge.
+        fill_adj = _compute_fill_adjusted_edge(match, best_side, my_bid, my_ask)
 
         # ── update history ─────────────────────────────────────────────────
         contract_id = match.pm_tick.contract_id
@@ -252,8 +261,13 @@ class EdgeCalculator:
         ops_bid_adj = adj.adjust(ops_bid, forward, K, sigma, T, settlement_type)
         ops_ask_adj = adj.adjust(ops_ask, forward, K, sigma, T, settlement_type)
 
-        adj_edge_yes = ops_bid_adj - pm_yes_ask
-        adj_edge_no = (1.0 - ops_ask_adj) - pm_no_ask
+        # Map the basis-adjusted P(above) bounds onto the PM YES event's
+        # probability for this contract's polarity (complement for "below").
+        my_bid_adj, _, my_ask_adj = _model_yes_prob(
+            match.pm_quote.direction, ops_bid_adj, ops_bid_adj, ops_ask_adj
+        )
+        adj_edge_yes = my_bid_adj - pm_yes_ask
+        adj_edge_no = (1.0 - my_ask_adj) - pm_no_ask
 
         return adj_edge_yes, adj_edge_no
 
@@ -273,6 +287,22 @@ class EdgeCalculator:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def _model_yes_prob(
+    direction: str, p_bid: float, p_mid: float, p_ask: float,
+) -> tuple[float, float, float]:
+    """Map the options P(above) (bid, mid, ask) onto the PM YES event prob.
+
+    The pricer emits P(S_T > K) = P(above).  For an "above" contract the PM
+    YES event IS that probability.  For a "below" contract the PM YES event
+    is the complement P(S_T <= K) = 1 - P(above); complementing flips the
+    bid/ask bounds (the lower bound on P(below) is 1 - upper bound on
+    P(above)) so the conservative ordering bid <= ask is preserved.
+    """
+    if direction == "below":
+        return 1.0 - p_ask, 1.0 - p_mid, 1.0 - p_bid
+    return p_bid, p_mid, p_ask
+
 
 def _pick_best_side(
     adj_yes: float, adj_no: float

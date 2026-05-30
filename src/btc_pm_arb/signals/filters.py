@@ -103,6 +103,19 @@ class FilterConfig:
 _Criterion = Callable[["EdgeResult", FilterConfig, dict], str | None]
 
 
+def _reject_one_touch(e: EdgeResult, cfg: FilterConfig, _: dict) -> str | None:
+    """Reject path-dependent one-touch barriers (track but never signal).
+
+    The pricer computes a terminal European digital P(S_T > K); a one-touch
+    barrier settles if the level is EVER breached, a different product whose
+    terminal-vs-barrier mismatch produces phantom edges (see
+    outputs/diag_0p93_signal.md).  Skip until a barrier pricer exists.
+    """
+    if e.match.pm_quote.product_type == "one_touch":
+        return "one_touch_barrier"
+    return None
+
+
 def _reject_no_edge(e: EdgeResult, cfg: FilterConfig, _: dict) -> str | None:
     if e.best_side is None or e.best_conservative_edge <= 0:
         return "no_positive_edge"
@@ -277,6 +290,7 @@ def _reject_vol_regime_edge(e: EdgeResult, cfg: FilterConfig, ctx: dict) -> str 
 
 
 _CRITERIA: list[_Criterion] = [
+    _reject_one_touch,
     _reject_no_edge,
     _reject_min_conservative_edge,
     _reject_min_mid_edge,

@@ -19,6 +19,64 @@ def utc_now() -> datetime:
     return datetime.now(tz=timezone.utc)
 
 
+# ── Polarity / product-type classification ────────────────────────────────────
+#
+# A Kalshi YES leg can pay on "above" or "below" the strike, and the contract
+# can be a terminal European digital (settles on the price AT expiry) or a
+# path-dependent one-touch barrier (settles if the price is EVER above/below
+# the strike through the period).  The pricer only computes a terminal
+# P(S_T > K); mislabelling a "below" leg as "above", or a one-touch barrier as
+# a terminal digital, produces phantom edges.  We classify both here, at the
+# single shared normalization boundary, from the raw venue metadata when it is
+# present and from the ticker series as a robust fallback when it is not (e.g.
+# replayed price-only frames carry the ticker but no metadata).
+
+def classify_kalshi_direction(raw: dict, ticker: str = "") -> str:
+    """Return the YES-leg polarity ("above" | "below") for a Kalshi market.
+
+    Preference order: explicit ``strike_type`` -> ``yes_sub_title`` text ->
+    ticker series pattern -> default "above".
+    """
+    strike_type = str(raw.get("strike_type") or "").strip().lower()
+    if strike_type in ("greater", "greater_or_equal", "above"):
+        return "above"
+    if strike_type in ("less", "less_or_equal", "below"):
+        return "below"
+
+    sub = str(raw.get("yes_sub_title") or "").strip().lower()
+    if any(w in sub for w in ("below", "under", "less than", "at most", "<=", "<")):
+        return "below"
+    if any(w in sub for w in ("above", "over", "greater", "at least", ">=", ">")):
+        return "above"
+
+    t = (ticker or "").upper()
+    if "MINMON" in t:   # one-touch *minimum* barrier: YES if EVER below
+        return "below"
+    if "MAXMON" in t:   # one-touch *maximum* barrier: YES if EVER above
+        return "above"
+    return "above"
+
+
+def classify_kalshi_product_type(raw: dict, ticker: str = "") -> str:
+    """Return "one_touch" for path-dependent barriers, else "terminal".
+
+    A market is a one-touch barrier when its rules say the level is "ever"
+    breached, OR it exposes an early-close / settlement-timer touch mechanism,
+    OR it belongs to a known barrier series (KXBTCMINMON / KXBTCMAXMON).
+    Genuine terminal series (e.g. KXBTCMAX150, KXBTCD) stay "terminal".
+    """
+    rules = str(raw.get("rules_primary") or "").lower()
+    if "ever" in rules:
+        return "one_touch"
+    if raw.get("early_close_condition") and raw.get("settlement_timer_seconds"):
+        return "one_touch"
+
+    t = (ticker or "").upper()
+    if "MINMON" in t or "MAXMON" in t:
+        return "one_touch"
+    return "terminal"
+
+
 # ── Prediction market normalizers ─────────────────────────────────────────────
 
 def normalize_polymarket_tick(raw: dict) -> PredictionMarketTick:
@@ -145,9 +203,13 @@ def normalize_kalshi_tick(raw: dict) -> PredictionMarketTick:
     subtitle: str = raw.get("subtitle", "") or raw.get("title", "")
     strike = _extract_strike_from_question(subtitle)
 
+    ticker = raw.get("ticker", raw.get("market_id", ""))
+    direction = classify_kalshi_direction(raw, ticker)
+    product_type = classify_kalshi_product_type(raw, ticker)
+
     return PredictionMarketTick(
         source=DataSource.KALSHI,
-        contract_id=raw.get("ticker", raw.get("market_id", "")),
+        contract_id=ticker,
         question=raw.get("title", subtitle),
         strike=strike,
         expiry=expiry,
@@ -156,6 +218,10 @@ def normalize_kalshi_tick(raw: dict) -> PredictionMarketTick:
         no_bid=no_bid,
         no_ask=no_ask,
         timestamp=utc_now(),
+        order_book_yes=list(raw.get("order_book_yes") or []),
+        order_book_no=list(raw.get("order_book_no") or []),
+        direction=direction,
+        product_type=product_type,
     )
 
 
@@ -189,9 +255,12 @@ def pm_tick_to_probability_quote(tick: PredictionMarketTick) -> ProbabilityQuote
         bid_prob=tick.yes_bid,
         ask_prob=tick.yes_ask,
         mid_prob=mid,
-        direction="above",
+        direction=tick.direction,
         settlement_type=settlement_type,  # type: ignore[arg-type]
         timestamp=tick.timestamp,
+        product_type=tick.product_type,
+        order_book_yes=tick.order_book_yes,
+        order_book_no=tick.order_book_no,
     )
 
 

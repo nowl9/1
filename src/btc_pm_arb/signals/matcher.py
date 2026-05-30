@@ -236,9 +236,12 @@ def _pm_tick_to_quote(tick: PredictionMarketTick) -> ProbabilityQuote | None:
         bid_prob=tick.yes_bid,
         ask_prob=tick.yes_ask,
         mid_prob=mid,
-        direction="above",
+        direction=tick.direction,
         settlement_type=settlement_type,  # type: ignore[arg-type]
         timestamp=tick.timestamp,
+        product_type=tick.product_type,
+        order_book_yes=tick.order_book_yes,
+        order_book_no=tick.order_book_no,
     )
 
 

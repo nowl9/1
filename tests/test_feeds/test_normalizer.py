@@ -8,6 +8,8 @@ import pytest
 
 from btc_pm_arb.feeds.normalizer import (
     _extract_strike_from_question,
+    classify_kalshi_direction,
+    classify_kalshi_product_type,
     normalize_kalshi_tick,
     normalize_polymarket_tick,
     pm_tick_to_probability_quote,
@@ -226,3 +228,100 @@ class TestPmTickToProbabilityQuote:
         quote = pm_tick_to_probability_quote(tick)
         assert quote is not None
         assert quote.settlement_type == "polymarket_spot"
+
+
+class TestPolarityClassification:
+    """Direction parse: strike_type / yes_sub_title / ticker-series fallback."""
+
+    def test_strike_type_greater_is_above(self) -> None:
+        assert classify_kalshi_direction({"strike_type": "greater"}, "") == "above"
+
+    def test_strike_type_less_is_below(self) -> None:
+        assert classify_kalshi_direction({"strike_type": "less"}, "") == "below"
+
+    def test_yes_sub_title_below(self) -> None:
+        assert classify_kalshi_direction({"yes_sub_title": "Below $70,000.00"}, "") == "below"
+
+    def test_yes_sub_title_above(self) -> None:
+        assert classify_kalshi_direction({"yes_sub_title": "Above $90,000.00"}, "") == "above"
+
+    def test_minmon_ticker_fallback_below(self) -> None:
+        assert classify_kalshi_direction({}, "KXBTCMINMON-BTC-26MAY31-7000000") == "below"
+
+    def test_maxmon_ticker_fallback_above(self) -> None:
+        assert classify_kalshi_direction({}, "KXBTCMAXMON-BTC-26MAY31-9000000") == "above"
+
+    def test_default_is_above(self) -> None:
+        assert classify_kalshi_direction({}, "KXBTC-24DEC31-B100000") == "above"
+
+
+class TestProductTypeClassification:
+    """Barrier (one-touch) vs terminal classification."""
+
+    def test_rules_ever_is_one_touch(self) -> None:
+        raw = {"rules_primary": "If BTC is ever below $70000.00, resolves Yes."}
+        assert classify_kalshi_product_type(raw, "KXBTCD-X") == "one_touch"
+
+    def test_early_close_plus_timer_is_one_touch(self) -> None:
+        raw = {"early_close_condition": "touch", "settlement_timer_seconds": 1800}
+        assert classify_kalshi_product_type(raw, "KXBTCD-X") == "one_touch"
+
+    def test_minmon_ticker_is_one_touch(self) -> None:
+        assert classify_kalshi_product_type({}, "KXBTCMINMON-BTC-26MAY31-7000000") == "one_touch"
+
+    def test_maxmon_ticker_is_one_touch(self) -> None:
+        assert classify_kalshi_product_type({}, "KXBTCMAXMON-BTC-26MAY31-9000000") == "one_touch"
+
+    def test_max150_terminal_not_one_touch(self) -> None:
+        raw = {
+            "strike_type": "greater",
+            "rules_primary": "If the price of Bitcoin is above 149999.99 by Dec 31 at 11:59PM ET",
+        }
+        assert classify_kalshi_product_type(raw, "KXBTCMAX150-26DEC31") == "terminal"
+
+    def test_plain_terminal(self) -> None:
+        assert classify_kalshi_product_type({}, "KXBTC-24DEC31-B100000") == "terminal"
+
+
+class TestNormalizeKalshiPolarityProductType:
+    """normalize_kalshi_tick carries direction + product_type onto the tick."""
+
+    def _raw(self, **overrides: object) -> dict:
+        raw = {
+            "ticker": "KXBTCD-26MAY31-B90000",
+            "title": "BTC below $90000",
+            "subtitle": "Below $90,000",
+            "yes_bid_dollars": "0.40",
+            "yes_ask_dollars": "0.44",
+            "no_bid_dollars": "0.56",
+            "no_ask_dollars": "0.60",
+            "close_time": "2026-05-31T23:59:00Z",
+        }
+        raw.update(overrides)
+        return raw
+
+    def test_terminal_below_carries_direction(self) -> None:
+        # strike_type "less" with no "ever" → terminal below.
+        tick = normalize_kalshi_tick(self._raw(
+            strike_type="less",
+            rules_primary="If the price of BTC at expiry is below 90000, resolves Yes.",
+        ))
+        assert tick.direction == "below"
+        assert tick.product_type == "terminal"
+
+    def test_minmon_barrier(self) -> None:
+        tick = normalize_kalshi_tick(self._raw(
+            ticker="KXBTCMINMON-BTC-26MAY31-7000000",
+            strike_type="less",
+            yes_sub_title="Below $70,000.00",
+            rules_primary="If BTC is ever below $70000.00, resolves Yes.",
+        ))
+        assert tick.direction == "below"
+        assert tick.product_type == "one_touch"
+
+    def test_quote_inherits_direction_and_product_type(self) -> None:
+        tick = normalize_kalshi_tick(self._raw(strike_type="less"))
+        quote = pm_tick_to_probability_quote(tick)
+        assert quote is not None
+        assert quote.direction == "below"
+        assert quote.product_type == "terminal"

@@ -112,6 +112,12 @@ class PredictionMarketTick(BaseModel):
     order_book_yes: list[tuple[float, float]] = Field(default_factory=list)
     order_book_no: list[tuple[float, float]] = Field(default_factory=list)
 
+    # Product semantics parsed from venue metadata at normalization time.
+    # direction:    YES-leg polarity ("above" | "below").
+    # product_type: "terminal" European digital, or "one_touch" barrier.
+    direction: Literal["above", "below"] = "above"
+    product_type: Literal["terminal", "one_touch"] = "terminal"
+
     timestamp: datetime
 
     @property
@@ -155,10 +161,19 @@ class ProbabilityQuote(BaseModel):
     # Whether this is probability of BTC being *above* the strike
     direction: Literal["above", "below"] = "above"
 
+    # Path-dependent products (one-touch barriers) are mispriced by the
+    # terminal digital pricer; tagged here so the signal filter can skip them.
+    product_type: Literal["terminal", "one_touch"] = "terminal"
+
     # Settlement mechanism matters for basis adjustment
     settlement_type: Literal["deribit_twap", "kalshi_rti", "polymarket_spot", "unknown"] = (
         "unknown"
     )
+
+    # Order-book depth carried from the source tick for the depth gate.
+    # None = depth unknown (gate skipped); [] = known-empty (gate filters).
+    order_book_yes: list[tuple[float, float]] | None = None
+    order_book_no: list[tuple[float, float]] | None = None
 
     timestamp: datetime
 
