@@ -375,3 +375,271 @@ class TestPollLoopCloseTimeGuard:
 
         assert "/markets/STALE-EXPIRED/orderbook" not in requested_paths
         assert "/markets/STILL-LIVE/orderbook" in requested_paths
+
+
+# ── Round 9d2 Commit 2: series allow-list fan-out ─────────────────────────────
+
+
+class TestDiscoverySeriesFanout:
+    """``_discover_markets`` issues one GET per allow-listed series ticker
+    and union-merges live rows into ``self._tracked``.
+
+    The pre-9d2 implementation pinned discovery to ``series_ticker=KXBTC``
+    (a server-side EXACT match) which is the intraday "Bitcoin range"
+    series — not what this agent trades.  The 9d2 verify report
+    identified KXBTCMINMON / KXBTCMAXMON / KXBTCMAX150 as the live,
+    in-window threshold-binary series, with KXBTCW / KXBTCMAXW / BTC /
+    BTCD historically active but currently empty.
+    """
+
+    def _feed(self) -> KalshiFeed:
+        feed = KalshiFeed(
+            base_url="https://demo-api.kalshi.co/trade-api/v2",
+            key_path="/nonexistent.pem",
+            key_id="dummy",
+        )
+        feed._private_key = None
+        return feed
+
+    def _far_future(self) -> str:
+        from datetime import datetime, timedelta, timezone
+
+        return (
+            datetime.now(timezone.utc) + timedelta(days=30)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @pytest.mark.asyncio
+    async def test_fan_out_issues_one_request_per_series(self) -> None:
+        """Each allow-list ticker gets exactly one GET; no extras."""
+        from btc_pm_arb.feeds.kalshi import _BTC_SERIES_TICKERS
+
+        requested: list[str] = []
+
+        async def fake_get(path: str, headers: dict[str, str]) -> Any:
+            requested.append(path)
+            resp = AsyncMock()
+            resp.raise_for_status = lambda: None
+            resp.content = b""
+            resp.json = lambda: {"markets": []}
+            return resp
+
+        feed = self._feed()
+        feed._client = AsyncMock()
+        feed._client.get = fake_get
+
+        await feed._discover_markets()
+
+        # One GET per series ticker, scoped via series_ticker=...
+        assert len(requested) == len(_BTC_SERIES_TICKERS)
+        for series in _BTC_SERIES_TICKERS:
+            assert any(
+                f"series_ticker={series}" in p for p in requested
+            ), f"expected a GET for series_ticker={series}; got {requested!r}"
+
+    @pytest.mark.asyncio
+    async def test_results_union_merged_across_series(self) -> None:
+        """Rows from different series ticker responses union-merge into
+        a single ``_tracked`` dict."""
+        future = self._far_future()
+
+        # Map each series ticker to a distinct contract; the merged
+        # _tracked must contain all of them.
+        responses_by_series: dict[str, list[dict]] = {
+            "KXBTCMINMON": [
+                {
+                    "ticker": "KXBTCMINMON-26JUN-T80000",
+                    "close_time": future,
+                    "series_ticker": "KXBTCMINMON",
+                }
+            ],
+            "KXBTCMAXMON": [
+                {
+                    "ticker": "KXBTCMAXMON-26JUN-T120000",
+                    "close_time": future,
+                    "series_ticker": "KXBTCMAXMON",
+                }
+            ],
+            "KXBTCMAX150": [
+                {
+                    "ticker": "KXBTCMAX150-26JUN-T150000",
+                    "close_time": future,
+                    "series_ticker": "KXBTCMAX150",
+                }
+            ],
+        }
+
+        async def fake_get(path: str, headers: dict[str, str]) -> Any:
+            series = next(
+                (s for s in responses_by_series if f"series_ticker={s}" in path),
+                None,
+            )
+            resp = AsyncMock()
+            resp.raise_for_status = lambda: None
+            resp.content = b""
+            resp.json = lambda: {"markets": responses_by_series.get(series, [])}
+            return resp
+
+        feed = self._feed()
+        feed._client = AsyncMock()
+        feed._client.get = fake_get
+
+        await feed._discover_markets()
+
+        assert "KXBTCMINMON-26JUN-T80000" in feed._tracked
+        assert "KXBTCMAXMON-26JUN-T120000" in feed._tracked
+        assert "KXBTCMAX150-26JUN-T150000" in feed._tracked
+
+    @pytest.mark.asyncio
+    async def test_empty_tier2_response_is_not_an_error(self) -> None:
+        """A series ticker returning zero markets (the Tier-2 case
+        today) is a normal outcome — not an exception, not a log-error,
+        just an empty contribution to the union."""
+        future = self._far_future()
+
+        async def fake_get(path: str, headers: dict[str, str]) -> Any:
+            resp = AsyncMock()
+            resp.raise_for_status = lambda: None
+            resp.content = b""
+            if "series_ticker=KXBTCMINMON" in path:
+                resp.json = lambda: {
+                    "markets": [
+                        {
+                            "ticker": "KXBTCMINMON-LIVE",
+                            "close_time": future,
+                            "series_ticker": "KXBTCMINMON",
+                        }
+                    ]
+                }
+            else:
+                # All other series tickers (Tier-2 + the rest of Tier-1)
+                # return empty — currently the realistic case for Tier-2.
+                resp.json = lambda: {"markets": []}
+            return resp
+
+        feed = self._feed()
+        feed._client = AsyncMock()
+        feed._client.get = fake_get
+
+        # The call should complete normally and yield exactly the one
+        # live contract from KXBTCMINMON.
+        await feed._discover_markets()
+
+        assert feed._tracked == {
+            "KXBTCMINMON-LIVE": {
+                "ticker": "KXBTCMINMON-LIVE",
+                "close_time": future,
+                "series_ticker": "KXBTCMINMON",
+            }
+        }
+
+    @pytest.mark.asyncio
+    async def test_single_series_failure_does_not_sink_others(self) -> None:
+        """A GET that raises for one series ticker leaves the other
+        series' live contracts intact in ``_tracked``."""
+        future = self._far_future()
+
+        async def fake_get(path: str, headers: dict[str, str]) -> Any:
+            if "series_ticker=KXBTCMAXMON" in path:
+                # Simulate a transient 500.
+                raise RuntimeError("simulated upstream failure")
+            resp = AsyncMock()
+            resp.raise_for_status = lambda: None
+            resp.content = b""
+            if "series_ticker=KXBTCMINMON" in path:
+                resp.json = lambda: {
+                    "markets": [
+                        {
+                            "ticker": "KXBTCMINMON-OK",
+                            "close_time": future,
+                            "series_ticker": "KXBTCMINMON",
+                        }
+                    ]
+                }
+            else:
+                resp.json = lambda: {"markets": []}
+            return resp
+
+        feed = self._feed()
+        feed._client = AsyncMock()
+        feed._client.get = fake_get
+
+        # Must not raise — the failure is per-series, isolated.
+        await feed._discover_markets()
+
+        assert "KXBTCMINMON-OK" in feed._tracked
+
+    @pytest.mark.asyncio
+    async def test_excluded_intraday_series_never_tracked(self) -> None:
+        """Defence-in-depth: even if a mocked response carries rows
+        whose ``series_ticker`` is one of the EXCLUDED intraday series
+        (KXBTC / KXBTCD / KXBTC15M), they must not enter ``_tracked``.
+
+        Guards against a future change to the allow-list accidentally
+        re-introducing the pre-9d2 N=0 failure mode.
+        """
+        future = self._far_future()
+
+        async def fake_get(path: str, headers: dict[str, str]) -> Any:
+            resp = AsyncMock()
+            resp.raise_for_status = lambda: None
+            resp.content = b""
+            # Pretend the API also returned a row with an EXCLUDED
+            # series tag (the intraday range series).  Even though it
+            # would never appear in a series_ticker=KXBTCMINMON response
+            # in reality, simulate the worst case where Kalshi's filter
+            # leaks: the client must drop it.
+            resp.json = lambda: {
+                "markets": [
+                    {
+                        "ticker": "KXBTCMINMON-LEGIT",
+                        "close_time": future,
+                        "series_ticker": "KXBTCMINMON",
+                    },
+                    {
+                        "ticker": "KXBTC-RANGE-LEAK",
+                        "close_time": future,
+                        "series_ticker": "KXBTC",
+                    },
+                    {
+                        "ticker": "KXBTCD-INTRADAY-LEAK",
+                        "close_time": future,
+                        "series_ticker": "KXBTCD",
+                    },
+                    {
+                        "ticker": "KXBTC15M-INTRADAY-LEAK",
+                        "close_time": future,
+                        "series_ticker": "KXBTC15M",
+                    },
+                ]
+            }
+            return resp
+
+        feed = self._feed()
+        feed._client = AsyncMock()
+        feed._client.get = fake_get
+
+        await feed._discover_markets()
+
+        assert "KXBTCMINMON-LEGIT" in feed._tracked
+        assert "KXBTC-RANGE-LEAK" not in feed._tracked
+        assert "KXBTCD-INTRADAY-LEAK" not in feed._tracked
+        assert "KXBTC15M-INTRADAY-LEAK" not in feed._tracked
+
+    def test_allow_list_excludes_intraday_series_at_constants(self) -> None:
+        """The allow-list constants themselves must not contain the
+        intraday/range series — a static guard against the configuration
+        regression that caused the pre-9d2 zero-signal smoke."""
+        from btc_pm_arb.feeds.kalshi import (
+            _BTC_SERIES_TICKERS,
+            _BTC_SERIES_TICKERS_TIER1,
+            _BTC_SERIES_TICKERS_TIER2,
+        )
+
+        forbidden = {"KXBTC", "KXBTCD", "KXBTC15M"}
+        assert not forbidden & set(_BTC_SERIES_TICKERS_TIER1)
+        assert not forbidden & set(_BTC_SERIES_TICKERS_TIER2)
+        assert not forbidden & set(_BTC_SERIES_TICKERS)
+        # And the load-bearing Tier-1 series the verify report flagged
+        # are present.
+        for required in ("KXBTCMINMON", "KXBTCMAXMON", "KXBTCMAX150"):
+            assert required in _BTC_SERIES_TICKERS_TIER1

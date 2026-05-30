@@ -82,11 +82,54 @@ _POLL_INTERVAL: float = 5.0
 # HTTP request timeout (seconds).
 _HTTP_TIMEOUT: float = 10.0
 
-# Kalshi series ticker prefix that scopes us to BTC binary contracts.  The
-# `series_ticker` filter on /markets accepts an exact match; KXBTC is the
-# canonical Kalshi BTC index series.  If a future round needs additional
-# series (e.g. KXBTCD for daily), extend this set and the discovery filter.
-_BTC_SERIES_TICKER: str = "KXBTC"
+# Kalshi BTC series allow-list.  `series_ticker` on /markets is a
+# server-side EXACT match, NOT a prefix — so a single GET can scope
+# to only one series at a time.  Round 9d2 verify (live API probe,
+# 2026-05) found that the canonical KXBTC family is split across many
+# series, only some of which match this agent's mandate (threshold
+# binary contracts with close_time in [1, 90] days):
+#
+#   Tier 1 (live, in-window contracts confirmed by 9d2 verify):
+#     KXBTCMINMON  — monthly "min price" thresholds
+#     KXBTCMAXMON  — monthly "max price" thresholds
+#     KXBTCMAX150  — $150k max-price binaries
+#
+#   Tier 2 (series historically active but currently returning zero
+#     open contracts — included so the discovery pipeline picks them
+#     up automatically the next time Kalshi opens contracts on these
+#     series; revisit after a 24-48h re-probe to decide if any are
+#     actually deprecated):
+#     KXBTCW, KXBTCMAXW, BTC, BTCD
+#
+#   EXCLUDED (do NOT re-add without verification — they break this
+#     agent's contract shape or horizon):
+#     KXBTC      — hourly "Bitcoin range" markets, not threshold-binary
+#     KXBTCD     — hourly above/below intraday, outside the [1, 90]d window
+#     KXBTC15M   — 15-minute intraday, outside the [1, 90]d window
+#     KXBTCMAX100, KXBTCMAX125, KXBTCMAX200 — their currently-open
+#       contracts close ~217d out, outside the [1, 90]d window; add
+#       back ONLY when a probe shows in-window contracts.
+#
+# The pre-9d2 implementation pinned discovery to series_ticker=KXBTC
+# alone, which is why the smoke fired zero signals: the canonical
+# "KXBTC" exact match returns the intraday range markets we don't
+# want, while the threshold-binary series that match the mandate sit
+# under different series tickers.  Discovery now fans out one GET
+# per allow-listed ticker and union-merges the results into _tracked.
+_BTC_SERIES_TICKERS_TIER1: tuple[str, ...] = (
+    "KXBTCMINMON",
+    "KXBTCMAXMON",
+    "KXBTCMAX150",
+)
+_BTC_SERIES_TICKERS_TIER2: tuple[str, ...] = (
+    "KXBTCW",
+    "KXBTCMAXW",
+    "BTC",
+    "BTCD",
+)
+_BTC_SERIES_TICKERS: tuple[str, ...] = (
+    _BTC_SERIES_TICKERS_TIER1 + _BTC_SERIES_TICKERS_TIER2
+)
 
 # Reconnection backoff parameters.
 _RECONNECT_BASE: float = 5.0
@@ -257,42 +300,71 @@ class KalshiFeed:
     async def _discover_markets(self) -> None:
         """Refresh the tracked BTC contract list.
 
-        Replaces self._tracked atomically; tickers no longer present in
-        the response (e.g. closed) are dropped.
+        Issues one GET per series ticker in ``_BTC_SERIES_TICKERS`` and
+        union-merges the live rows into ``self._tracked``.  Replaces
+        ``self._tracked`` atomically once all per-series GETs have
+        completed; tickers no longer present in the response (e.g.
+        closed) are dropped.
+
+        A failed GET for one series ticker does NOT abort discovery for
+        the others — the failure is logged and the remaining series
+        proceed.  An empty result for a Tier-2 series is normal (see
+        the allow-list comment at module scope) and not an error.
         """
-        # Path is relative to settings.kalshi_base_url, which already
-        # ends in /trade-api/v2 by convention.  Do NOT prepend the API
-        # prefix here — that's the doubled-path regression caught at
-        # runtime in round 6 verification.
-        path = (
-            f"/markets"
-            f"?series_ticker={_BTC_SERIES_TICKER}"
-            f"&status=open"
-            f"&limit=200"
-        )
-        body = await self._http_get(path)
-        markets = body.get("markets", []) or []
-        # Client-side close_time prune: Kalshi mass-closes contracts on
-        # clock-aligned boundaries, and a 60s discovery snapshot can carry
-        # close_time <= now rows for almost a minute.  Filter them out
-        # before they enter _tracked so _poll_loop never wastes a request
-        # on an already-expired ticker.  Rows whose close_time is missing
-        # or unparseable are retained — silently dropping them would
-        # mask upstream shape regressions.
         now = datetime.now(timezone.utc)
         new_tracked: dict[str, dict] = {}
-        for m in markets:
-            ticker = m.get("ticker")
-            if not ticker:
+        for series_ticker in _BTC_SERIES_TICKERS:
+            # Path is relative to settings.kalshi_base_url, which already
+            # ends in /trade-api/v2 by convention.  Do NOT prepend the API
+            # prefix here — that's the doubled-path regression caught at
+            # runtime in round 6 verification.
+            path = (
+                f"/markets"
+                f"?series_ticker={series_ticker}"
+                f"&status=open"
+                f"&limit=200"
+            )
+            try:
+                body = await self._http_get(path)
+            except Exception as exc:
+                # One series ticker's failure shouldn't break discovery
+                # for the rest of the allow-list.  Log and move on; the
+                # series will retry on the next 60s tick.
+                logger.warning(
+                    "kalshi_discovery_series_error",
+                    series_ticker=series_ticker,
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                )
                 continue
-            close_time = _meta_close_time(m)
-            if close_time is not None and close_time <= now:
-                continue
-            new_tracked[ticker] = m
+            markets = body.get("markets", []) or []
+            for m in markets:
+                ticker = m.get("ticker")
+                if not ticker:
+                    continue
+                # Client-side close_time prune (commit 1): a snapshot can
+                # carry close_time <= now rows for up to the discovery
+                # interval; filter them before they enter _tracked.
+                close_time = _meta_close_time(m)
+                if close_time is not None and close_time <= now:
+                    continue
+                # Defence-in-depth: even if a future change to the
+                # allow-list accidentally lets an excluded series leak
+                # in, never let the intraday/non-threshold series enter
+                # _tracked.  Matches the EXCLUDED block in the
+                # allow-list comment at module scope.
+                if (m.get("series_ticker") or "").upper() in {
+                    "KXBTC",
+                    "KXBTCD",
+                    "KXBTC15M",
+                }:
+                    continue
+                new_tracked[ticker] = m
         self._tracked = new_tracked
         logger.info(
             "kalshi_discovery_completed",
             tracked=len(self._tracked),
+            series_count=len(_BTC_SERIES_TICKERS),
         )
 
     async def _discovery_loop(self) -> None:
