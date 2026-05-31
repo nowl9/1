@@ -49,6 +49,7 @@ from typing import Any, AsyncIterator
 import structlog
 import uvicorn
 
+from btc_pm_arb.clock import SimulatedClock
 from btc_pm_arb.config import settings
 from btc_pm_arb.execution.fill_simulator import BookSnapshot, FillSimulator
 from btc_pm_arb.execution.orders import OrderManager, Order
@@ -122,13 +123,24 @@ def _configure_logging() -> None:
 class Agent:
     """Container for all stateful pipeline components."""
 
-    def __init__(self, dry_run: bool = True) -> None:
+    def __init__(
+        self, dry_run: bool = True, clock: SimulatedClock | None = None,
+    ) -> None:
         self.dry_run = dry_run
+        # Simulated-clock seam (build step 1, Fork 3).  Defaults to a
+        # live clock that delegates to datetime.now(timezone.utc), so a
+        # default Agent() behaves exactly as before.  In replay mode the
+        # orchestrator injects a SimulatedClock("replay") that the replay
+        # reader (build step 5 — separate follow-up) advances off the
+        # recorded "ts" stream.  Threaded into the freshness-sensitive
+        # call sites below: FeedHealthTracker, the SignalFilter freshness
+        # gates (via run_scan_pipeline), and the settlement poller.
+        self.clock = clock or SimulatedClock("live")
         self.surface = VolSurface()
         self.cache = ProbabilityCache()
         self.pricer = DigitalPricer()
         self.rv_tracker = RealizedVolTracker()
-        self.feed_health = FeedHealthTracker()
+        self.feed_health = FeedHealthTracker(clock=self.clock)
         self.odds_tracker = OddsVelocityTracker()
         self.matcher = ContractMatcher()
         self.edge_calc = EdgeCalculator()
@@ -229,6 +241,7 @@ class Agent:
             base_url=settings.kalshi_base_url,
             key_path=settings.kalshi_private_key_path,
             key_id=settings.kalshi_api_key_id,
+            clock=self.clock,
         )
 
     def ingest_tick(self, tick: OptionTick) -> None:
@@ -376,6 +389,7 @@ class Agent:
             feed_health=self.feed_health,
             odds_tracker=self.odds_tracker,
             rv_tracker=self.rv_tracker,
+            clock=self.clock,
         )
 
         self._funnel["signals_passed_filter"] += len(passing)
@@ -410,6 +424,7 @@ class Agent:
                 feed_health=self.feed_health,
                 odds_tracker=self.odds_tracker,
                 rv_tracker=self.rv_tracker,
+                clock=self.clock,
             )
             if reason is not None:
                 rejected.append((e, reason))
@@ -1086,6 +1101,25 @@ async def _paper_settlement_task(agent: Agent, stop_event: asyncio.Event) -> Non
         await agent.paper_settlement_poller.aclose()
 
 
+async def _duration_task(
+    stop_event: asyncio.Event, duration_s: float,
+) -> None:
+    """Bound the run: set ``stop_event`` after ``duration_s`` seconds.
+
+    Build step 1 (``--duration N``) so a run is CI-bounded.  In live mode
+    this is wall-clock seconds; under replay the bound is on simulated
+    time advanced by the replay reader (build step 5) — that reader will
+    own its own stop condition, so this wall-clock fallback only matters
+    for the live path here.  Cancelled cleanly when the run stops for
+    another reason (signal / task error).
+    """
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=duration_s)
+    except asyncio.TimeoutError:
+        log.info("run.duration_reached", duration_s=duration_s)
+        stop_event.set()
+
+
 async def _dashboard_task(agent: Agent, stop_event: asyncio.Event) -> None:
     """Run the FastAPI dashboard server as a uvicorn task."""
     fastapi_app = create_app(shared_state=agent.shared_state)
@@ -1108,7 +1142,11 @@ async def _dashboard_task(agent: Agent, stop_event: asyncio.Event) -> None:
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 async def run(
-    dry_run: bool = True, record_dir: Path | None = None,
+    dry_run: bool = True,
+    record_dir: Path | None = None,
+    *,
+    mode: str = "live",
+    duration_s: float | None = None,
 ) -> None:
     _configure_logging()
 
@@ -1122,7 +1160,18 @@ async def run(
         recorder = FrameRecorder(record_dir)
         log.info("frame_recorder.enabled", base_dir=str(record_dir))
 
-    agent = Agent(dry_run=dry_run)
+    # Build step 1 (Fork 3): construct the simulated-clock seam from the
+    # mode.  Live delegates to wall-clock; replay is advanceable.  In
+    # replay we anchor the clock at construction time so the (feed-less,
+    # reader-pending) scan loop can read it without raising; the replay
+    # reader (build step 5 — SEPARATE follow-up) will drive advance_to off
+    # the recorded "ts" stream.
+    if mode == "replay":
+        clock = SimulatedClock("replay", start=datetime.now(timezone.utc))
+    else:
+        clock = SimulatedClock("live")
+
+    agent = Agent(dry_run=dry_run, clock=clock)
     stop_event = asyncio.Event()
 
     loop = asyncio.get_running_loop()
@@ -1140,24 +1189,40 @@ async def run(
     log.info(
         "agent.starting",
         dry_run=dry_run,
+        mode=mode,
+        duration_s=duration_s,
         min_edge=settings.min_edge,
         max_position_usd=settings.max_position_usd,
     )
 
     try:
         async with asyncio.TaskGroup() as tg:
-            tg.create_task(
-                _deribit_task(agent, stop_event, recorder=recorder),
-                name="deribit-feed",
-            )
-            tg.create_task(
-                _kalshi_task(agent, stop_event, recorder=recorder),
-                name="kalshi-feed",
-            )
-            tg.create_task(
-                _polymarket_task(agent, stop_event, recorder=recorder),
-                name="polymarket-feed",
-            )
+            if mode == "replay":
+                # Replay swaps the live feed tasks for a replay reader
+                # (build step 5).  That reader is a SEPARATE follow-up and
+                # is NOT wired here — only the clock seam lands in this
+                # step.  Until it exists, replay runs against an empty
+                # surface (no feeds) and relies on --duration to bound.
+                log.warning(
+                    "replay_mode.reader_pending",
+                    detail=(
+                        "replay reader not yet wired (build step 5); "
+                        "running feed-less against an empty surface"
+                    ),
+                )
+            else:
+                tg.create_task(
+                    _deribit_task(agent, stop_event, recorder=recorder),
+                    name="deribit-feed",
+                )
+                tg.create_task(
+                    _kalshi_task(agent, stop_event, recorder=recorder),
+                    name="kalshi-feed",
+                )
+                tg.create_task(
+                    _polymarket_task(agent, stop_event, recorder=recorder),
+                    name="polymarket-feed",
+                )
             tg.create_task(_scan_task(agent, stop_event), name="scan")
             tg.create_task(_order_refresh_task(agent, stop_event), name="order-refresh")
             tg.create_task(agent.settlement_monitor.run(stop_event), name="settlement")
@@ -1165,6 +1230,10 @@ async def run(
                 _paper_settlement_task(agent, stop_event), name="paper-settlement",
             )
             tg.create_task(_dashboard_task(agent, stop_event), name="dashboard")
+            if duration_s is not None:
+                tg.create_task(
+                    _duration_task(stop_event, duration_s), name="duration-bound",
+                )
     except* KeyboardInterrupt:
         stop_event.set()
     except* Exception as eg:
@@ -1179,7 +1248,12 @@ async def run(
         log.info("agent.shutdown", **summary)
 
 
-def main() -> None:
+def _build_arg_parser() -> argparse.ArgumentParser:
+    """Construct the CLI parser.
+
+    Factored out of :func:`main` so the ``--mode`` / ``--duration`` wiring
+    is unit-testable without launching the agent.
+    """
     parser = argparse.ArgumentParser(
         prog="btc_pm_arb",
         description=(
@@ -1201,9 +1275,38 @@ def main() -> None:
         "--record-dir", type=Path, default=Path("data/recordings"),
         help="Base directory for raw-frame recordings (default: data/recordings).",
     )
+    # Build step 1 (plan section 3.1): mode switch + bounded-run flag.
+    parser.add_argument(
+        "--mode", choices=("live", "replay"), default="live",
+        help=(
+            "live (default): drive the agent off live feeds and wall-clock. "
+            "replay: drive the simulated clock off recorded frames (the "
+            "replay reader is a separate follow-up; this flag wires the "
+            "clock seam only)."
+        ),
+    )
+    parser.add_argument(
+        "--duration", type=float, default=None, metavar="N",
+        help=(
+            "Bound the run to N seconds (live: wall-clock).  Omit for an "
+            "unbounded run stopped by SIGINT/SIGTERM."
+        ),
+    )
+    return parser
+
+
+def main() -> None:
+    parser = _build_arg_parser()
     args = parser.parse_args()
     record_dir = args.record_dir if args.record_feeds else None
-    asyncio.run(run(dry_run=True, record_dir=record_dir))
+    asyncio.run(
+        run(
+            dry_run=True,
+            record_dir=record_dir,
+            mode=args.mode,
+            duration_s=args.duration,
+        )
+    )
 
 
 if __name__ == "__main__":

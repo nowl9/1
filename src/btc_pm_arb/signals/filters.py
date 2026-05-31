@@ -110,6 +110,22 @@ class FilterConfig:
 _Criterion = Callable[["EdgeResult", FilterConfig, dict], str | None]
 
 
+def _ctx_now(ctx: dict) -> datetime:
+    """Return "now" via the injected sim-clock seam, else wall-clock.
+
+    Build step 1 (Fork 3): the freshness gates read ``ctx["clock"]`` (a
+    ``Callable[[], datetime]``, typically a
+    :class:`btc_pm_arb.clock.SimulatedClock`) instead of calling
+    ``datetime.now(timezone.utc)`` inline.  Absent a clock — the default for
+    every existing caller — this falls back to wall-clock, so default-live
+    behaviour is unchanged.
+    """
+    clock = ctx.get("clock")
+    if clock is not None:
+        return clock()
+    return datetime.now(timezone.utc)
+
+
 def _reject_one_touch(e: EdgeResult, cfg: FilterConfig, _: dict) -> str | None:
     """Reject path-dependent one-touch barriers (track but never signal).
 
@@ -175,11 +191,11 @@ def _reject_min_mid_edge(e: EdgeResult, cfg: FilterConfig, _: dict) -> str | Non
     return None
 
 
-def _reject_expiry_bounds(e: EdgeResult, cfg: FilterConfig, _: dict) -> str | None:
+def _reject_expiry_bounds(e: EdgeResult, cfg: FilterConfig, ctx: dict) -> str | None:
     expiry = e.match.pm_tick.expiry
     if expiry is None:
         return "no_expiry"
-    now = datetime.now(timezone.utc)
+    now = _ctx_now(ctx)
     days = (expiry - now).total_seconds() / 86400.0
     if days < cfg.min_days_to_expiry:
         return f"days_to_expiry {days:.2f} < min {cfg.min_days_to_expiry}"
@@ -213,8 +229,8 @@ def _reject_vol_fit(e: EdgeResult, cfg: FilterConfig, ctx: dict) -> str | None:
     return None
 
 
-def _reject_stale_data(e: EdgeResult, cfg: FilterConfig, _: dict) -> str | None:
-    now = datetime.now(timezone.utc)
+def _reject_stale_data(e: EdgeResult, cfg: FilterConfig, ctx: dict) -> str | None:
+    now = _ctx_now(ctx)
     age = (now - e.match.options_entry.timestamp).total_seconds()
     if age > cfg.max_data_age_seconds:
         return f"options_data_age {age:.0f}s > max {cfg.max_data_age_seconds}s"
@@ -397,6 +413,7 @@ class SignalFilter:
         feed_health: "FeedHealthTracker | None" = None,
         odds_tracker: "OddsVelocityTracker | None" = None,
         rv_tracker: "RealizedVolTracker | None" = None,
+        clock: "Callable[[], datetime] | None" = None,
     ) -> list[ArbitrageSignal]:
         """Filter EdgeResults and return ranked ArbitrageSignal list.
 
@@ -408,6 +425,9 @@ class SignalFilter:
             feed_health:   FeedHealthTracker for the Data Freshness Gate.
             odds_tracker:  OddsVelocityTracker for the Odds Velocity Gate.
             rv_tracker:    RealizedVolTracker for the Vol Regime Filter.
+            clock:         Injectable "now" source for the freshness/expiry
+                           gates (build step 1, Fork 3).  Defaults to
+                           wall-clock when None — default-live unchanged.
 
         Returns:
             Signals ranked by adjusted_edge descending (best opportunity first).
@@ -418,6 +438,7 @@ class SignalFilter:
             "feed_health": feed_health,
             "odds_tracker": odds_tracker,
             "rv_tracker": rv_tracker,
+            "clock": clock,
         }
 
         signals: list[ArbitrageSignal] = []
@@ -452,7 +473,7 @@ class SignalFilter:
             # so survivors normally carry one — the guard is defensive).
             _expiry = edge.match.pm_tick.expiry
             _dte_days = (
-                (_expiry - datetime.now(timezone.utc)).total_seconds() / 86400.0
+                (_expiry - _ctx_now(ctx)).total_seconds() / 86400.0
                 if _expiry is not None
                 else None
             )
@@ -475,6 +496,7 @@ class SignalFilter:
         feed_health: "FeedHealthTracker | None" = None,
         odds_tracker: "OddsVelocityTracker | None" = None,
         rv_tracker: "RealizedVolTracker | None" = None,
+        clock: "Callable[[], datetime] | None" = None,
     ) -> str | None:
         """Return the first rejection reason for a single EdgeResult, or None if it passes."""
         ctx: dict = {
@@ -483,6 +505,7 @@ class SignalFilter:
             "feed_health": feed_health,
             "odds_tracker": odds_tracker,
             "rv_tracker": rv_tracker,
+            "clock": clock,
         }
         return self._first_rejection(edge, ctx)
 

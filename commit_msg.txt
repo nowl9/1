@@ -1,21 +1,35 @@
-docs(paper-trading): capture resolved paper-trade + replay design
+feat(replay): mode switch + simulated-clock seam (paper-trade step 1)
 
-Add docs/paper-trading-plan.md capturing the RESOLVED design for
-Polymarket paper trading and deterministic replay. Documentation only;
-no source changes.
+Build step 1 of docs/paper-trading-plan.md (sections 3.1, 6.1; Fork 3).
+Adds the bounded-run flags and the injectable clock seam that an
+as-fast-as-possible replay (build step 5, separate follow-up) plugs into.
+The replay reader is NOT built here -- only the clock object + seam land.
 
-Contents:
-- Replay-readiness spike (read-only): recordings are format-grade
-  (per-frame recv ts on all three sources; sim-clock injectable) but
-  duration-short (two ~90s windows, ~2.5h gap) so settlement is not
-  reachable by proportional replay. Criterion 6 flagged AT RISK,
-  mitigated by deterministic benchmark settlement + a sim-clock
-  jump-to-expiry; recapture recommended.
-- The six acceptance criteria.
-- Component design, one section each (mode/clock seam, un-short-circuit
-  PM to shared FillSimulator + book-walking, benchmark settlement,
-  run_id/mode + fill-fidelity columns, replay reader + cold smoke,
-  shadow no-op intent).
-- Four resolved forks, each with options/decision/reasoning/flip.
-- Affirmed JSONL append-only persistence, build order, carried gaps
-  (settlement wedge; missing per-case conditionId linkage), out of scope.
+- New btc_pm_arb/clock.py: SimulatedClock. Live delegates to
+  datetime.now(timezone.utc); replay returns an advanceable, monotonic
+  timestamp positioned via advance_to(). Callable[[], datetime] so it is a
+  drop-in for the existing KalshiSettlementPoller.clock precedent.
+
+- main.py: --mode {live,replay} (default live) and --duration N. run()
+  builds the clock from --mode and threads it into the Agent; replay
+  starts feed-less (reader pending) and relies on --duration. Arg parsing
+  factored into _build_arg_parser() for unit testing.
+
+- Clock threaded into the three named freshness call sites, REPLACING
+  inline datetime.now():
+    * filters._reject_stale_data, _reject_expiry_bounds (+ signal.passed
+      dte log) read ctx["clock"]; SignalFilter.filter/explains take an
+      optional clock= kwarg, default wall-clock.
+    * FeedHealthTracker.staleness_ms/record_tick read an injected clock,
+      default wall-clock.
+  Agent passes its clock into FeedHealthTracker, the filter calls, and
+  KalshiSettlementPoller.
+
+Default-live behaviour unchanged: no clock -> wall-clock everywhere.
+
+Tests: tests/test_main/test_clock_seam.py (16) -- SimulatedClock
+behaviour; freshness/expiry gates read the injected sim-clock while
+default still uses real now(); FeedHealthTracker honours the injected
+clock; --mode/--duration parse. Full suite 689 passed (673 baseline + 16).
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
