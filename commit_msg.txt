@@ -1,34 +1,23 @@
-feat(ledger): run_id/mode stamping + fill-fidelity slippage (paper-trade step 4)
+fix(replay): position the replay clock from the first frame, not wall-clock
 
-Build step 4 of docs/paper-trading-plan.md (sections 3.4, 6.4).  Makes runs
-separable/joinable and adds the fill-fidelity column the analysis needs.
+run() anchored the replay-mode SimulatedClock at datetime.now() -- build
+step 1's placeholder for the reader-pending era.  With the ReplayReader now
+driving the clock, that wall-clock anchor sits AFTER the recorded frames
+(which predate "now"), so the reader's monotonic guard never advanced the
+clock onto the recorded timeline: it stayed frozen at wall-time and every
+recorded PM tick looked hours-stale.  The full --mode replay CLI path then
+produced zero fills (only rejections) even though the reader-driven smoke
+(which anchors before the frames) reproduced the chain.
 
-- paper_ledger.py: PaperOrderRecord / PaperFillRecord / PaperSettlementRecord
-  / PaperRejectionRecord gain optional run_id + mode (defaulted, so old
-  records and direct-construction round-trip at schema_version 1).
-  PaperLedger(base_dir, run_id=, mode=) stamps both onto EVERY append via
-  model_copy on the frozen record (caller's object untouched).  A bare
-  PaperLedger(dir) stamps the field defaults, so existing round-trip
-  equality holds.
+- main.py: build the replay clock UNANCHORED (SimulatedClock("replay")); the
+  reader positions it from the first frame's ts.
+- replay.py: advance_to the first frame unconditionally when the clock is
+  still unpositioned (clock.now() raises until positioned), then forward-only.
+- test_replay.py: regression -- a reader with an unanchored clock (exactly as
+  run() builds it) tracks the recorded timeline instead of freezing.
 
-- main.py: Agent generates a per-run run_id (overridable; goal-2 replay will
-  pass a deterministic one) and builds the ledger with run_id + mode (from
-  the clock); run_id logged at agent.starting.
-
-- tools/analyze_paper_ledger.py: join now emits a `slippage` column
-  (fill_price - limit_price, signed; negative = price improvement; NaN on
-  no_fill) alongside the existing realized_pnl / return P&L columns.
-  run_id / mode ride through the model_dump into the parquet so runs are
-  separable.  slippage added to the empty-frame column set.
-
-Tests:
-- test_ledger_run_stamp.py (5): stamping on all four record kinds; stamp is
-  authoritative; default ledger round-trips; caller object not mutated;
-  schema_version stays 1.
-- test_analyze_paper_ledger.py (+6): slippage = fill - limit / zero / NaN;
-  slippage + P&L emitted together; run_id/mode survive the join; empty frame
-  has slippage.
-End-to-end CLI smoke confirmed run_id/mode stamped and slippage in the
-parquet.  Full suite 723 passed (712 prior + 11 net new).
+Verified end-to-end: `--mode replay --replay-date 2026-05-30` now reproduces
+2 orders / 2 intents / 2 fills / 2 settlements (1 win, 1 loss) with no network.
+Full suite: 734 passed.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
