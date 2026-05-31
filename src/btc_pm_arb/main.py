@@ -67,6 +67,11 @@ from btc_pm_arb.execution.paper_settlement import KalshiSettlementPoller
 from btc_pm_arb.execution.positions import PositionTracker
 from btc_pm_arb.execution.risk import RiskConfig, RiskManager
 from btc_pm_arb.execution.settlement import SettlementMonitor
+from btc_pm_arb.feeds.aux_capture import (
+    ChainlinkRoundCapture,
+    DeribitIndexCapture,
+    Polymarket5MinCapture,
+)
 from btc_pm_arb.feeds.deribit import DeribitFeed
 from btc_pm_arb.feeds.discovery import MarketDiscovery, run_discovery_loop
 from btc_pm_arb.feeds.health import FeedHealthTracker
@@ -1125,6 +1130,39 @@ async def _polymarket_task(
     log.info("polymarket_task.stopped")
 
 
+def _start_aux_capture_tasks(
+    tg: asyncio.TaskGroup,
+    stop_event: asyncio.Event,
+    recorder: FrameRecorder,
+) -> None:
+    """Start the capture-only auxiliary latency-analysis streams.
+
+    Called ONLY in live mode under ``--record-feeds`` (``recorder`` non-None).
+    These three streams (fast spot, Chainlink round state, PM 5-minute odds)
+    are recorded for offline latency analysis and feed NOTHING into pricing,
+    signals, gates, or execution -- see ``feeds/aux_capture.py``.  Each task's
+    own run loop is resilient (swallows its errors, self-disables a blocked
+    stream) so it can never raise into the TaskGroup or disturb the live feeds.
+    The default capture (deribit / kalshi / polymarket) is byte-unchanged
+    whether or not these run.
+    """
+    spot = DeribitIndexCapture(recorder, url=settings.deribit_url)
+    chainlink = ChainlinkRoundCapture(
+        recorder,
+        rpc_url=settings.chainlink_polygon_rpc_url,
+        feed_address=settings.chainlink_btc_usd_feed,
+    )
+    pm5min = Polymarket5MinCapture(
+        recorder,
+        gamma_url=settings.polymarket_gamma_url,
+        clob_url=settings.polymarket_clob_url,
+    )
+    tg.create_task(spot.run(stop_event), name="aux-spot")
+    tg.create_task(chainlink.run(stop_event), name="aux-chainlink")
+    tg.create_task(pm5min.run(stop_event), name="aux-pm5min")
+    log.info("aux_capture.enabled", streams=["spot", "chainlink", "pm5min"])
+
+
 async def _scan_task(agent: Agent, stop_event: asyncio.Event) -> None:
     log.info("scan_task.starting", interval_secs=_SCAN_INTERVAL_SECS)
     while not stop_event.is_set():
@@ -1368,6 +1406,11 @@ async def run(
                 _polymarket_task(agent, stop_event, recorder=recorder),
                 name="polymarket-feed",
             )
+            # Capture-only auxiliary streams (fast spot / Chainlink round /
+            # PM 5-min odds) for offline latency analysis -- ONLY under
+            # --record-feeds (recorder set), and they touch no trading path.
+            if recorder is not None:
+                _start_aux_capture_tasks(tg, stop_event, recorder)
             tg.create_task(_scan_task(agent, stop_event), name="scan")
             tg.create_task(_order_refresh_task(agent, stop_event), name="order-refresh")
             tg.create_task(agent.settlement_monitor.run(stop_event), name="settlement")

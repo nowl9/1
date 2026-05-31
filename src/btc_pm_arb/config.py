@@ -29,6 +29,24 @@ class Settings(BaseSettings):
     polymarket_gamma_url: str = "https://gamma-api.polymarket.com"
     polymarket_chain_id: int = 137
 
+    # ── Auxiliary latency-analysis capture (capture-only; --record-feeds) ─────
+    # These streams are recorded ONLY under --record-feeds for offline latency
+    # analysis (fast-spot vs Chainlink push vs Polymarket 5-min repricing lag).
+    # NONE of them flow into pricing, signals, gates, or execution -- they are
+    # recording-only and add no contract to the arb's tracked/signal universe.
+    # See feeds/aux_capture.py and outputs/recorder_widening_report.md.
+    #
+    # Chainlink BTC/USD round state via raw JSON-RPC eth_call (no web3 dep).
+    # Default RPC is publicnode (no API key required, reachable as of the
+    # 2026-05-31 feasibility probe).  polygon-rpc.com returns 401 and Ankr
+    # requires an API key, so neither is the default.  Operators behind a
+    # network allowlist MUST add this host to it; if the RPC is unreachable
+    # the chainlink capture self-disables (logs a warning) without affecting
+    # the live trading path.
+    chainlink_polygon_rpc_url: str = "https://polygon-bor-rpc.publicnode.com"
+    # Chainlink BTC/USD aggregator proxy on Polygon mainnet.
+    chainlink_btc_usd_feed: str = "0xc907E116054Ad103354f2D350FD2514433D57F6f"
+
     # ── Kalshi ────────────────────────────────────────────────────────────────
     kalshi_api_key_id: str = ""
     kalshi_private_key_path: str = "./kalshi_private_key.pem"

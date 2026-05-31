@@ -106,13 +106,23 @@ class FrameRecorder:
 
     def record(
         self,
-        source: DataSource,
+        source: DataSource | str,
         frame: bytes | str | dict,
         ts: datetime,
         *,
         endpoint: str | None = None,
     ) -> None:
         """Append a single frame to the day/hour file for ``source``.
+
+        ``source`` may be a :class:`DataSource` enum member (the three
+        live trading feeds: deribit / kalshi / polymarket) or a bare
+        ``str`` source tag for the capture-only auxiliary streams added
+        under ``--record-feeds`` (e.g. ``"spot"``, ``"chainlink"``,
+        ``"pm5min"``).  Bare-string tags are recording-only labels and
+        deliberately NOT members of :class:`DataSource` -- they never
+        flow into pricing, signals, gates, or execution.  For a
+        ``DataSource`` the on-disk ``source`` field is ``source.value``,
+        byte-identical to before this overload existed.
 
         Encoding of the ``frame`` argument:
         * ``str``: written verbatim.
@@ -127,19 +137,20 @@ class FrameRecorder:
         """
         if self._disabled:
             return
+        source_value = source.value if isinstance(source, DataSource) else source
         try:
             payload = {
                 "ts": ts.isoformat(),
-                "source": source.value,
+                "source": source_value,
                 "endpoint": endpoint,
                 "frame": _to_text(frame),
             }
             data = (json.dumps(payload) + "\n").encode("utf-8")
 
             with self._lock:
-                handle = self._handle_for(source, ts)
+                handle = self._handle_for(source_value, ts)
                 handle.write(data)
-                self._track_daily(source, ts, len(data))
+                self._track_daily(source_value, ts, len(data))
         except (OSError, IOError) as exc:
             self._disable(reason="io_error", exc=exc)
 
@@ -155,19 +166,19 @@ class FrameRecorder:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
-    def _path_for(self, source: DataSource, ts: datetime) -> Path:
+    def _path_for(self, source_value: str, ts: datetime) -> Path:
         day = ts.strftime("%Y-%m-%d")
         hour = ts.strftime("%H")
-        return self._base_dir / source.value / day / f"frames-{hour}.jsonl.gz"
+        return self._base_dir / source_value / day / f"frames-{hour}.jsonl.gz"
 
-    def _handle_for(self, source: DataSource, ts: datetime) -> IO[bytes]:
+    def _handle_for(self, source_value: str, ts: datetime) -> IO[bytes]:
         """Return a writable gzip handle for the (source, hour) of ``ts``.
 
         Rotates on hour boundary: if the cached handle's path differs
         from the target path, close the cached handle and open a new one.
         """
-        target = self._path_for(source, ts)
-        current = self._handles.get(source.value)
+        target = self._path_for(source_value, ts)
+        current = self._handles.get(source_value)
         if current is not None and current[0] == target:
             return current[1]
         # Rotation: close the old handle before opening the new.
@@ -178,12 +189,12 @@ class FrameRecorder:
                 pass
         target.parent.mkdir(parents=True, exist_ok=True)
         new_handle = gzip.open(target, mode="ab")
-        self._handles[source.value] = (target, new_handle)
+        self._handles[source_value] = (target, new_handle)
         return new_handle
 
-    def _track_daily(self, source: DataSource, ts: datetime, n_bytes: int) -> None:
+    def _track_daily(self, source_value: str, ts: datetime, n_bytes: int) -> None:
         day = ts.strftime("%Y-%m-%d")
-        key = (source.value, day)
+        key = (source_value, day)
         self._daily_bytes[key] = self._daily_bytes.get(key, 0) + n_bytes
         if (
             self._daily_bytes[key] > self._max_daily_bytes
@@ -192,7 +203,7 @@ class FrameRecorder:
             self._warned.add(key)
             logger.warning(
                 "frame_recorder.daily_budget_exceeded",
-                source=source.value,
+                source=source_value,
                 day=day,
                 bytes_written=self._daily_bytes[key],
                 max_daily_bytes=self._max_daily_bytes,
