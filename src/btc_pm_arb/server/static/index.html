@@ -770,9 +770,15 @@ function Header({ snap, conn, lastTick }) {
   const paused = status === "paused";
   const running = status === "running";
 
-  const modePill = dryRun
-    ? <Pill kind="amber">DRY RUN</Pill>
-    : <Pill kind="red">LIVE</Pill>;
+  // Run mode (paper / live / replay) from the snapshot.  Fall back to the
+  // dry_run-derived status for older backends that predate the mode field.
+  const mode = (snap?.mode || (dryRun ? "paper" : "live")).toLowerCase();
+  const modeMeta = ({
+    paper:  { kind: "amber", label: "PAPER" },
+    live:   { kind: "red",   label: "LIVE" },
+    replay: { kind: "blue",  label: "REPLAY" },
+  })[mode] || { kind: "dim", label: mode.toUpperCase() };
+  const modePill = <Pill kind={modeMeta.kind}>{modeMeta.label}</Pill>;
   const stsPill = paused
     ? <Pill kind="amber">PAUSED</Pill>
     : <Pill kind="green">RUNNING</Pill>;
@@ -1087,7 +1093,11 @@ function TabPositions({ snap }) {
   // Round 8 Commit 3: in dry_run mode, source positions/settlements/perf
   // from the paper-trading panels populated by main.Agent's
   // _push_state_update.  Live mode keeps the existing (untouched) sources.
-  const isDryRun = snap?.agent_status === "dry_run";
+  // Goal-2: gate on the explicit run mode (paper OR replay) so the paper
+  // panels show whenever the agent is simulating; fall back to the
+  // agent_status dry_run flag for backends without a mode field.
+  const mode = snap?.mode || (snap?.agent_status === "dry_run" ? "paper" : "live");
+  const isDryRun = mode === "paper" || mode === "replay";
   const positions = isDryRun ? (snap?.paper_open_positions || []) : (snap?.positions || []);
   const settlements = isDryRun ? (snap?.paper_settlements || []) : (snap?.settlements || []);
   const perf = isDryRun ? (snap?.paper_performance || {}) : (snap?.performance || {});

@@ -38,6 +38,10 @@ class AgentState:
     # ── Control ───────────────────────────────────────────────────────────────
     paused: bool = False
     dry_run: bool = True
+    # Run flavour fixed at process start: True for a replay run (recorded
+    # frames + simulated clock).  Combined with ``dry_run`` it yields the
+    # operator-facing run mode (paper / live / replay) the dashboard shows.
+    replay_mode: bool = False
     started_at: float = field(default_factory=time.time)
     live_mode_token: str = ""
 
@@ -100,8 +104,17 @@ class SharedState:
         snap = await state.snapshot()   # → JSON-serializable dict
     """
 
-    def __init__(self, dry_run: bool = True, live_mode_token: str = "") -> None:
-        self._state = AgentState(dry_run=dry_run, live_mode_token=live_mode_token)
+    def __init__(
+        self,
+        dry_run: bool = True,
+        live_mode_token: str = "",
+        replay_mode: bool = False,
+    ) -> None:
+        self._state = AgentState(
+            dry_run=dry_run,
+            live_mode_token=live_mode_token,
+            replay_mode=replay_mode,
+        )
         self._lock = asyncio.Lock()
 
     # ── Context managers ──────────────────────────────────────────────────────
@@ -137,10 +150,21 @@ class SharedState:
             else:
                 agent_status = "running"
 
+            # Operator-facing run mode, derived (not stored) so a live/dry
+            # toggle via POST /api/mode updates it immediately.  Replay is
+            # fixed at start; otherwise dry_run distinguishes paper vs live.
+            if s.replay_mode:
+                mode = "replay"
+            elif s.dry_run:
+                mode = "paper"
+            else:
+                mode = "live"
+
             return {
                 "timestamp": time.time(),
                 "btc_price": s.btc_price,
                 "agent_status": agent_status,
+                "mode": mode,
                 "uptime_seconds": round(uptime, 1),
 
                 "feeds": s.feeds,

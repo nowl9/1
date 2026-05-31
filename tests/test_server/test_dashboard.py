@@ -436,3 +436,47 @@ def test_ws_snapshot_agent_status_valid(shared_state: SharedState, monkeypatch):
     with client.websocket_connect("/ws/snapshot") as ws:
         snap = json.loads(ws.receive_text())
     assert snap["agent_status"] in ("running", "paused", "dry_run")
+
+
+# ── Goal-2: run-mode indicator (paper / live / replay) ──────────────────────
+
+@pytest.mark.asyncio
+async def test_snapshot_mode_paper():
+    snap = await SharedState(dry_run=True).snapshot()
+    assert snap["mode"] == "paper"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_mode_live():
+    snap = await SharedState(dry_run=False).snapshot()
+    assert snap["mode"] == "live"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_mode_replay():
+    snap = await SharedState(dry_run=True, replay_mode=True).snapshot()
+    assert snap["mode"] == "replay"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_mode_follows_dry_run_toggle():
+    # Mode is derived (not stored), so toggling dry_run via the live/dry
+    # control flips the operator-facing mode without a restart.
+    state = SharedState(dry_run=True)
+    assert (await state.snapshot())["mode"] == "paper"
+    async with state.write() as s:
+        s.dry_run = False
+    assert (await state.snapshot())["mode"] == "live"
+
+
+def test_status_includes_mode(client):
+    body = client.get("/api/status").json()
+    assert body["mode"] == "paper"
+
+
+def test_spa_served_at_root(client):
+    # The launcher (dashboard.bat) opens the browser at "/"; the static SPA
+    # must be served there so a double-click lands on the dashboard.
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "BTC PM Arb Dashboard" in r.text

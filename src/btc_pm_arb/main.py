@@ -179,7 +179,14 @@ class Agent:
         self.settlement_monitor = SettlementMonitor(self.tracker)
 
         live_token = secrets.token_urlsafe(16)
-        self.shared_state = SharedState(dry_run=dry_run, live_mode_token=live_token)
+        # replay_mode lets the dashboard label the run paper / live / replay.
+        # Derived from the injected clock so it follows the orchestrator's
+        # --mode without a second source of truth.
+        self.shared_state = SharedState(
+            dry_run=dry_run,
+            live_mode_token=live_token,
+            replay_mode=(self.clock.mode == "replay"),
+        )
 
         self._pending_ticks: list[OptionTick] = []
         # Buffer of prediction-market ticks awaiting matcher consumption.

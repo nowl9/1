@@ -108,6 +108,7 @@ def create_app(shared_state: SharedState | None = None) -> FastAPI:
         snap = await state.snapshot()
         return JSONResponse({
             "agent_status": snap["agent_status"],
+            "mode": snap.get("mode"),
             "uptime_seconds": snap["uptime_seconds"],
             "btc_price": snap["btc_price"],
             "volatility_regime": snap.get("volatility_regime", {}),
