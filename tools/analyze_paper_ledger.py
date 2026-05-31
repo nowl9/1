@@ -270,6 +270,7 @@ _EMPTY_DERIVED_COLUMNS: list[str] = [
     "vol_regime_clean",
     "max_feed_staleness_ms",
     "conservative_edge_bucket",
+    "slippage",
     "return",
 ]
 
@@ -288,7 +289,16 @@ def build_joined_dataframe(
       - ``vol_regime_clean``          normalized vol regime ("low"/"normal"/"high")
       - ``max_feed_staleness_ms``     max across the per-feed staleness dict
       - ``conservative_edge_bucket``  fixed-bin label
+      - ``slippage``                  fill_price - limit_price (fill-fidelity;
+                                      signed, negative = price improvement),
+                                      NaN when there is no fill price
       - ``return``                    realized_pnl / size_usd, NaN when not settled
+
+    Fill-fidelity (build step 4): ``slippage`` joins the simulated
+    ``fill_price`` against the intended ``limit_price`` per
+    ``client_order_id``; ``realized_pnl`` / ``return`` carry the settled
+    P&L.  ``run_id`` / ``mode`` ride through from the records so runs are
+    separable in the parquet.
 
     Merge mechanics: pandas left-merge with default suffixing — only
     colliding columns get the suffix.  ``fill_price`` and
@@ -357,6 +367,17 @@ def build_joined_dataframe(
     merged["conservative_edge_bucket"] = merged["adjusted_edge"].map(
         assign_conservative_edge_bucket
     )
+
+    # Derived: slippage = fill_price - limit_price (fill-fidelity, build
+    # step 4).  Signed: negative = the book-walk filled better than the
+    # intended limit; positive = worse.  NaN when there is no fill price
+    # (no_fill or a missing fill row).  fill_price comes from the fills
+    # merge un-suffixed (no order column collides); limit_price is the
+    # order's intended price.
+    if "fill_price" in merged.columns and "limit_price" in merged.columns:
+        merged["slippage"] = merged["fill_price"] - merged["limit_price"]
+    else:
+        merged["slippage"] = float("nan")
 
     # Derived: return = realized_pnl / size_usd; NaN when not settled.
     if "realized_pnl" in merged.columns:

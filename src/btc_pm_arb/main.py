@@ -41,6 +41,7 @@ import logging
 import os
 import secrets
 import signal
+import uuid
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -125,9 +126,17 @@ class Agent:
     """Container for all stateful pipeline components."""
 
     def __init__(
-        self, dry_run: bool = True, clock: SimulatedClock | None = None,
+        self,
+        dry_run: bool = True,
+        clock: SimulatedClock | None = None,
+        run_id: str | None = None,
     ) -> None:
         self.dry_run = dry_run
+        # Build step 4: a per-run id stamped onto every ledger append, so
+        # live vs replay runs (and successive runs) are separable and
+        # joinable.  Generated per process if not supplied; goal-2 replay
+        # will pass a deterministic id so a re-run reproduces the ledger.
+        self.run_id = run_id or uuid.uuid4().hex
         # Simulated-clock seam (build step 1, Fork 3).  Defaults to a
         # live clock that delegates to datetime.now(timezone.utc), so a
         # default Agent() behaves exactly as before.  In replay mode the
@@ -187,7 +196,10 @@ class Agent:
         self._latest_signals: list[dict] = []
 
         # ── Round 8 Commit 3: Paper-trading components ────────────────────────
-        self.paper_ledger = PaperLedger(settings.paper_ledger_dir)
+        # Build step 4: stamp run_id + mode (from the clock) on every append.
+        self.paper_ledger = PaperLedger(
+            settings.paper_ledger_dir, run_id=self.run_id, mode=self.clock.mode,
+        )
         # Build step 2 (Fork 1): the paper FillSimulator walks captured
         # book depth and produces partial fills / explicit no_fills, rather
         # than the legacy top-of-book full-or-nothing.  PM and Kalshi share
@@ -1243,6 +1255,7 @@ async def run(
         "agent.starting",
         dry_run=dry_run,
         mode=mode,
+        run_id=agent.run_id,
         duration_s=duration_s,
         min_edge=settings.min_edge,
         max_position_usd=settings.max_position_usd,

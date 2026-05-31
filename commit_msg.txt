@@ -1,39 +1,34 @@
-feat(execution): deterministic PM benchmark settlement (paper-trade step 3)
+feat(ledger): run_id/mode stamping + fill-fidelity slippage (paper-trade step 4)
 
-Build step 3 of docs/paper-trading-plan.md (sections 3.3, 4.2; Fork 2).
-Polymarket paper positions now settle at expiry against a DETERMINISTIC
-CF-Benchmarks-RTI-style terminal-digital benchmark MODEL -- NOT
-Polymarket's live oracle -- so a replay (build step 5, separate follow-up)
-can reproduce settlement from the recorded surface with no live call.
+Build step 4 of docs/paper-trading-plan.md (sections 3.4, 6.4).  Makes runs
+separable/joinable and adds the fill-fidelity column the analysis needs.
 
-- New btc_pm_arb/execution/benchmark_settlement.py:
-    * benchmark_settlement_price(benchmark_price, strike, direction) -- a
-      pure, total terminal-digital model returning the YES settlement price
-      in {0,1}: above-strike -> 1.0 (>=), below-strike -> 1.0 (<).
-    * PaperBenchmarkSettler.settle_due() -- the deterministic, no-HTTP
-      counterpart to KalshiSettlementPoller.  PM-only; expiry-gated through
-      the injected sim-clock; fail-safe-open skips (non-PM, unexpired,
-      missing strike, missing fixing) with logs, never a guessed settlement.
+- paper_ledger.py: PaperOrderRecord / PaperFillRecord / PaperSettlementRecord
+  / PaperRejectionRecord gain optional run_id + mode (defaulted, so old
+  records and direct-construction round-trip at schema_version 1).
+  PaperLedger(base_dir, run_id=, mode=) stamps both onto EVERY append via
+  model_copy on the frozen record (caller's object untouched).  A bare
+  PaperLedger(dir) stamps the field defaults, so existing round-trip
+  equality holds.
 
-- paper_settlement.py: extracted build_settlement_record() + the
-  win/loss/push classifier as module-level commons; KalshiSettlementPoller
-  now uses them too (record + log byte-identical) -- "only the price SOURCE
-  differs" made literal.
+- main.py: Agent generates a per-run run_id (overridable; goal-2 replay will
+  pass a deterministic one) and builds the ledger with run_id + mode (from
+  the clock); run_id logged at agent.starting.
 
-- paper_ledger.py: PaperOrderRecord gains optional strike + direction
-  (defaulted, schema_version 1 unchanged) so the settler can evaluate the
-  threshold predicate without an oracle.
+- tools/analyze_paper_ledger.py: join now emits a `slippage` column
+  (fill_price - limit_price, signed; negative = price improvement; NaN on
+  no_fill) alongside the existing realized_pnl / return P&L columns.
+  run_id / mode ride through the model_dump into the parquet so runs are
+  separable.  slippage added to the empty-frame column set.
 
-- main.py: order records capture strike/direction; Agent builds a
-  PaperBenchmarkSettler with a deterministic benchmark_price_fn
-  (_benchmark_btc_price -> latest observed Deribit index) and drives
-  settle_due() once per scan tick.  No-op until a position reaches expiry,
-  so short live runs are unaffected.
-
-Tests: tests/test_execution/test_benchmark_settlement.py (11) -- model
-above/below/boundary; settler writes a PaperSettlementRecord and closes the
-position; DETERMINISM (same surface -> same settlement_price + P&L twice);
-idempotent re-pass; skips non-PM / unexpired / missing-strike /
-missing-fixing.  Full suite 712 passed (701 prior + 11).
+Tests:
+- test_ledger_run_stamp.py (5): stamping on all four record kinds; stamp is
+  authoritative; default ledger round-trips; caller object not mutated;
+  schema_version stays 1.
+- test_analyze_paper_ledger.py (+6): slippage = fill - limit / zero / NaN;
+  slippage + P&L emitted together; run_id/mode survive the join; empty frame
+  has slippage.
+End-to-end CLI smoke confirmed run_id/mode stamped and slippage in the
+parquet.  Full suite 723 passed (712 prior + 11 net new).
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>

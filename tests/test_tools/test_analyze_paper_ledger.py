@@ -476,6 +476,58 @@ class TestThreeWayJoin:
             assert col in df.columns
 
 
+# ── Build step 4: fill-fidelity (slippage) + P&L columns ─────────────────────
+
+
+class TestFillFidelityColumns:
+    """The join emits a slippage column (fill_price - limit_price) alongside
+    the realized-P&L columns -- the fill-fidelity surface build step 4 adds."""
+
+    def test_slippage_is_fill_minus_limit(self) -> None:
+        # limit_price 0.42; the book-walk filled better at 0.40 -> -0.02.
+        orders = [_make_order(client_order_id="ord-1")]
+        fills = [_make_fill(client_order_id="ord-1", fill_price=0.40)]
+        df = build_joined_dataframe(orders, fills, [])
+        assert "slippage" in df.columns
+        assert df.iloc[0]["slippage"] == pytest.approx(0.40 - 0.42)
+
+    def test_slippage_zero_when_filled_at_limit(self) -> None:
+        orders = [_make_order(client_order_id="ord-1")]
+        fills = [_make_fill(client_order_id="ord-1", fill_price=0.42)]
+        df = build_joined_dataframe(orders, fills, [])
+        assert df.iloc[0]["slippage"] == pytest.approx(0.0)
+
+    def test_slippage_nan_when_no_fill(self) -> None:
+        """An order with no fill row has NaN slippage (no fill_price)."""
+        orders = [_make_order(client_order_id="ord-1")]
+        df = build_joined_dataframe(orders, [], [])
+        assert "slippage" in df.columns
+        assert pd.isna(df.iloc[0]["slippage"])
+
+    def test_join_emits_slippage_and_pnl_together(self) -> None:
+        """A settled order carries BOTH the slippage and the realized-P&L
+        fill-fidelity columns in the same joined row."""
+        orders = [_make_order(client_order_id="ord-1")]
+        fills = [_make_fill(client_order_id="ord-1", fill_price=0.40)]
+        settlements = [_make_settlement(client_order_id="ord-1", realized_pnl=116.0)]
+        df = build_joined_dataframe(orders, fills, settlements)
+        row = df.iloc[0]
+        assert row["slippage"] == pytest.approx(0.40 - 0.42)
+        assert row["realized_pnl"] == pytest.approx(116.0)
+        assert row["return"] == pytest.approx(116.0 / 200.0)
+
+    def test_run_id_and_mode_ride_through_join(self) -> None:
+        """run_id / mode columns survive the join so runs stay separable."""
+        orders = [_make_order(client_order_id="ord-1")]
+        df = build_joined_dataframe(orders, [], [])
+        assert "run_id" in df.columns
+        assert "mode" in df.columns
+
+    def test_empty_frame_has_slippage_column(self) -> None:
+        df = build_joined_dataframe([], [], [])
+        assert "slippage" in df.columns
+
+
 # ── Test 2: missing-fill handling ────────────────────────────────────────────
 
 

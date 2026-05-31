@@ -144,6 +144,13 @@ class PaperOrderRecord(BaseModel):
     kind: Literal["order"] = "order"
     schema_version: int = _SCHEMA_VERSION
 
+    # Run identity (build step 4): every ledger append is stamped with the
+    # run's id + mode (live|replay) so runs are separable and joinable.
+    # Optional/defaulted so pre-step-4 records round-trip at schema_version 1
+    # and direct-construction (tests) needn't supply them.
+    run_id: str = ""
+    mode: str = "live"
+
     # ── Identity ──────────────────────────────────────────────────────────────
     client_order_id: str
     signal_fingerprint: str
@@ -215,6 +222,13 @@ class PaperFillRecord(BaseModel):
     kind: Literal["fill"] = "fill"
     schema_version: int = _SCHEMA_VERSION
 
+    # Run identity (build step 4): every ledger append is stamped with the
+    # run's id + mode (live|replay) so runs are separable and joinable.
+    # Optional/defaulted so pre-step-4 records round-trip at schema_version 1
+    # and direct-construction (tests) needn't supply them.
+    run_id: str = ""
+    mode: str = "live"
+
     client_order_id: str
     filled_at: datetime
     fill_price: float | None = Field(default=None, ge=0.0, le=1.0)
@@ -237,6 +251,13 @@ class PaperSettlementRecord(BaseModel):
 
     kind: Literal["settlement"] = "settlement"
     schema_version: int = _SCHEMA_VERSION
+
+    # Run identity (build step 4): every ledger append is stamped with the
+    # run's id + mode (live|replay) so runs are separable and joinable.
+    # Optional/defaulted so pre-step-4 records round-trip at schema_version 1
+    # and direct-construction (tests) needn't supply them.
+    run_id: str = ""
+    mode: str = "live"
 
     client_order_id: str
     contract_id: str
@@ -277,6 +298,13 @@ class PaperRejectionRecord(BaseModel):
 
     kind: Literal["rejection"] = "rejection"
     schema_version: int = _SCHEMA_VERSION
+
+    # Run identity (build step 4): every ledger append is stamped with the
+    # run's id + mode (live|replay) so runs are separable and joinable.
+    # Optional/defaulted so pre-step-4 records round-trip at schema_version 1
+    # and direct-construction (tests) needn't supply them.
+    run_id: str = ""
+    mode: str = "live"
 
     timestamp: datetime
     contract_id: str
@@ -319,8 +347,17 @@ class PaperLedger:
     _SETTLEMENTS_FILE: str = "settlements.jsonl"
     _REJECTIONS_FILE: str = "rejections.jsonl"
 
-    def __init__(self, base_dir: str | Path) -> None:
+    def __init__(
+        self, base_dir: str | Path, *, run_id: str = "", mode: str = "live",
+    ) -> None:
         self._base_dir = Path(base_dir)
+        # Build step 4: stamped onto every appended record so live vs replay
+        # runs are separable + joinable.  Defaults ("", "live") keep
+        # round-trip equality for callers that construct a bare
+        # PaperLedger(dir) -- the stamp then equals each record's own
+        # field defaults.
+        self._run_id = run_id
+        self._mode = mode
         # Idempotent: mkdir(parents=True, exist_ok=True) is safe on every
         # construction.  Tests use a fresh tmp_path per case.
         self._base_dir.mkdir(parents=True, exist_ok=True)
@@ -352,8 +389,13 @@ class PaperLedger:
     def _append(self, path: Path, record: BaseModel) -> None:
         """Append one record as a JSON line, flush, and fsync.
 
+        Stamps run_id + mode (build step 4) onto the record before
+        serialising.  model_copy on the frozen record returns a new instance
+        with the run fields set; the caller's object is untouched.
+
         See module docstring for the inline-fsync rationale.
         """
+        record = record.model_copy(update={"run_id": self._run_id, "mode": self._mode})
         line = record.model_dump_json()
         # Open/close per append: cleaner than holding file handles open
         # across the agent's lifetime (no leaked-fd risk on crash, no need
