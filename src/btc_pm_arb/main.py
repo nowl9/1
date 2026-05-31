@@ -51,6 +51,7 @@ import uvicorn
 
 from btc_pm_arb.clock import SimulatedClock
 from btc_pm_arb.config import settings
+from btc_pm_arb.execution.benchmark_settlement import PaperBenchmarkSettler
 from btc_pm_arb.execution.fill_simulator import BookSnapshot, FillSimulator
 from btc_pm_arb.execution.orders import OrderManager, Order
 from btc_pm_arb.execution.paper_ledger import (
@@ -249,6 +250,20 @@ class Agent:
             base_url=settings.kalshi_base_url,
             key_path=settings.kalshi_private_key_path,
             key_id=settings.kalshi_api_key_id,
+            clock=self.clock,
+        )
+
+        # Build step 3: deterministic benchmark settlement for PM paper
+        # positions (Fork 2).  No HTTP / no live oracle: at expiry it reads
+        # the benchmark BTC fixing from self._benchmark_btc_price and
+        # evaluates a terminal-digital model, so a replay reproduces the
+        # settlement from the recorded surface alone.  Driven once per scan
+        # tick (see _scan_task) through the same sim-clock seam.
+        self.paper_benchmark_settler = PaperBenchmarkSettler(
+            tracker=self.paper_positions,
+            ledger=self.paper_ledger,
+            get_order_record=lambda cid: self._paper_orders_by_id.get(cid),
+            benchmark_price_fn=self._benchmark_btc_price,
             clock=self.clock,
         )
 
@@ -605,8 +620,30 @@ class Agent:
                 BookLevel(price=p, size_usd=s) for p, s in tick.order_book_no
             ],
             expiry=signal.pm_quote.expiry,
+            # Build step 3: capture the contract threshold + polarity so the
+            # benchmark settler can evaluate the terminal-digital predicate
+            # deterministically at expiry without a live oracle call.
+            strike=signal.pm_quote.strike,
+            direction=signal.pm_quote.direction,
             dry_run=self.dry_run,
         )
+
+    def _benchmark_btc_price(self, expiry: datetime) -> float | None:
+        """Deterministic benchmark BTC fixing for PM settlement (build step 3).
+
+        v1 uses the latest observed Deribit index price (read the same way
+        the dashboard payload does, via the RV tracker's log-price series).
+        Deterministic given the recorded surface, so a replay reproduces it
+        with no live call.  The ``expiry`` argument is accepted for a future
+        expiry-nearest fixing; v1 ignores it and uses the latest observed
+        index (Carried Gap a: a basis-like sim/real wedge vs. the real PM
+        oracle).  Returns None when no index has been observed yet.
+        """
+        import math
+
+        if self.rv_tracker.n_points <= 0:
+            return None
+        return math.exp(self.rv_tracker._data[-1][1])
 
     def _build_signal_payloads(
         self,
@@ -1074,6 +1111,12 @@ async def _scan_task(agent: Agent, stop_event: asyncio.Event) -> None:
             # last_mark_at bumps on every observation, even when the side
             # mid is unchanged or the book is one-sided.
             agent.paper_positions.mark_to_market(pm_ticks)
+
+            # Build step 3: settle any PM paper positions whose expiry has
+            # passed (sim-clock) against the deterministic benchmark model.
+            # No-op until a position reaches expiry, so short live runs are
+            # unaffected; Kalshi keeps settling via its own poller task.
+            agent.paper_benchmark_settler.settle_due()
 
             # Push state update to dashboard
             await agent._push_state_update()

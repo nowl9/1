@@ -1,37 +1,39 @@
-feat(execution): un-short-circuit PM + book-walking fills (paper-trade step 2)
+feat(execution): deterministic PM benchmark settlement (paper-trade step 3)
 
-Build step 2 of docs/paper-trading-plan.md (sections 3.2, 4.1; Fork 1).
-Routes Polymarket paper signals into the SAME FillSimulator Kalshi uses
-and replaces top-of-book full-or-nothing with book-walking + partial
-fills.  PM clears the identical 12-gate chain Kalshi does -- none skipped.
+Build step 3 of docs/paper-trading-plan.md (sections 3.3, 4.2; Fork 2).
+Polymarket paper positions now settle at expiry against a DETERMINISTIC
+CF-Benchmarks-RTI-style terminal-digital benchmark MODEL -- NOT
+Polymarket's live oracle -- so a replay (build step 5, separate follow-up)
+can reproduce settlement from the recorded surface with no live call.
 
-- orders.py: new venue-agnostic PaperExecutor (Fork 4 -- single executor,
-  no per-venue protocol).  Submits nothing; flips PENDING -> PLACED; no-op
-  refresh (the FillSimulator owns FILLED).  OrderManager.place() lifts the
-  PM drop ONLY in paper mode (dry_run_paper_mode=True), routing PM to the
-  PaperExecutor; in LIVE mode PM is still logged signal.polymarket_data_only
-  and dropped -- the live-trading guardrail is untouched.
+- New btc_pm_arb/execution/benchmark_settlement.py:
+    * benchmark_settlement_price(benchmark_price, strike, direction) -- a
+      pure, total terminal-digital model returning the YES settlement price
+      in {0,1}: above-strike -> 1.0 (>=), below-strike -> 1.0 (<).
+    * PaperBenchmarkSettler.settle_due() -- the deterministic, no-HTTP
+      counterpart to KalshiSettlementPoller.  PM-only; expiry-gated through
+      the injected sim-clock; fail-safe-open skips (non-PM, unexpired,
+      missing strike, missing fixing) with logs, never a guessed settlement.
 
-- fill_simulator.py: FillSimulator gains book_walk flag (default False =
-  legacy top-of-book, preserved for existing callers/tests).  book_walk=True
-  walks captured order_book_yes/no depth (ask-side, cheapest-first),
-  accumulating at-or-below limit up to size_usd.  Outcomes are explicit and
-  diagnosable: book_walk_full / book_walk_partial / empty_book /
-  limit_below_book -- never a silent optimistic full fill on a thin/empty
-  book.
+- paper_settlement.py: extracted build_settlement_record() + the
+  win/loss/push classifier as module-level commons; KalshiSettlementPoller
+  now uses them too (record + log byte-identical) -- "only the price SOURCE
+  differs" made literal.
 
-- main.py: agent FillSimulator constructed with book_walk=True; new
-  paper_orders_partial funnel counter; partial outcome counted in
-  _record_paper_order.
+- paper_ledger.py: PaperOrderRecord gains optional strike + direction
+  (defaulted, schema_version 1 unchanged) so the settler can evaluate the
+  threshold predicate without an oracle.
 
-Tests:
-- test_fill_simulator.py (+10): full/VWAP/partial/empty/limit-below book
-  walks, NO-side walk, defensive cheapest-first sort, ledger round-trip,
-  and a regression that the DEFAULT simulator stays top-of-book.
-- test_paper_pipeline.py: replaced the now-obsolete "PM short-circuit
-  preserved" test with PM-routed-to-paper, PM-clears-same-gates-as-Kalshi
-  parity, and PM-still-dropped-in-live-mode (guardrail).
+- main.py: order records capture strike/direction; Agent builds a
+  PaperBenchmarkSettler with a deterministic benchmark_price_fn
+  (_benchmark_btc_price -> latest observed Deribit index) and drives
+  settle_due() once per scan tick.  No-op until a position reaches expiry,
+  so short live runs are unaffected.
 
-Full suite 701 passed (689 prior + 12 net new).
+Tests: tests/test_execution/test_benchmark_settlement.py (11) -- model
+above/below/boundary; settler writes a PaperSettlementRecord and closes the
+position; DETERMINISM (same surface -> same settlement_price + P&L twice);
+idempotent re-pass; skips non-PM / unexpired / missing-strike /
+missing-fixing.  Full suite 712 passed (701 prior + 11).
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>

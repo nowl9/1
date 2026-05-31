@@ -190,6 +190,14 @@ class PaperOrderRecord(BaseModel):
     # ── Settlement scheduling ─────────────────────────────────────────────────
     expiry: datetime
 
+    # ── Contract threshold + polarity (deterministic benchmark settlement) ────
+    # Captured at order time so the benchmark settler (build step 3) can
+    # evaluate the terminal-digital predicate (BTC above/below strike at
+    # expiry) WITHOUT a live oracle call.  Optional/defaulted so pre-step-3
+    # records and tests that omit them round-trip cleanly at schema_version 1.
+    strike: float | None = None
+    direction: Literal["above", "below"] = "above"
+
     # ── Mode flag (forward-compat: always True for Round 8) ───────────────────
     dry_run: bool = True
 

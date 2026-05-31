@@ -352,19 +352,12 @@ class KalshiSettlementPoller:
         ``paper_settlement.missing_order_record`` and uses 0.0 — the
         record still gets written so the position closes and the JSONL
         stream stays consistent.
-        """
-        payout_price = settlement_price if pos.side == "yes" else 1.0 - settlement_price
-        realized_pnl = (payout_price - pos.entry_price) * pos.filled_size_usd
-        if realized_pnl > 1e-4:
-            outcome = "win"
-        elif realized_pnl < -1e-4:
-            outcome = "loss"
-        else:
-            outcome = "push"
 
-        # Look up theoretical_edge from the originating order.  Default to
-        # 0.0 if the order registry doesn't have it (defensive — should
-        # not happen in production with the Commit-3 wiring).
+        Payout / P&L / outcome mechanics are shared with the deterministic
+        benchmark settler (build step 3) via :func:`build_settlement_record`
+        — only the price SOURCE differs (live oracle here; benchmark model
+        there).
+        """
         theoretical_edge = 0.0
         client_order_id = pos.order_ids[0] if pos.order_ids else ""
         if client_order_id:
@@ -378,21 +371,11 @@ class KalshiSettlementPoller:
                     client_order_id=client_order_id,
                 )
 
-        record = PaperSettlementRecord(
-            client_order_id=client_order_id,
-            contract_id=pos.contract_id,
-            platform=pos.platform,
-            side=pos.side,  # type: ignore[arg-type]
-            settled_at=now,
+        record = build_settlement_record(
+            pos=pos,
             settlement_price=settlement_price,
-            payout_price=payout_price,
-            entry_price=pos.entry_price,
-            size_usd=pos.filled_size_usd,
-            realized_pnl=realized_pnl,
-            fees_usd=pos.fees_usd,
-            outcome=outcome,  # type: ignore[arg-type]
+            now=now,
             theoretical_edge=theoretical_edge,
-            expiry=pos.expiry,
         )
         self._ledger.append_settlement(record)
         self._tracker.settle(record)
@@ -404,13 +387,62 @@ class KalshiSettlementPoller:
             contract=pos.contract_id,
             platform=pos.platform.value,
             side=pos.side,
-            outcome=outcome,
+            outcome=record.outcome,
             settlement_price=settlement_price,
             entry_price=round(pos.entry_price, 4),
-            realized_pnl=round(realized_pnl, 4),
+            realized_pnl=round(record.realized_pnl, 4),
             theoretical_edge=round(theoretical_edge, 4),
             raw_result=raw_result,
         )
+
+
+# ── Settlement-record commons (shared with the benchmark settler) ─────────────
+
+
+def _settlement_outcome(realized_pnl: float) -> str:
+    """Classify realized P&L into the win/loss/push label."""
+    if realized_pnl > 1e-4:
+        return "win"
+    if realized_pnl < -1e-4:
+        return "loss"
+    return "push"
+
+
+def build_settlement_record(
+    *,
+    pos: PaperPosition,
+    settlement_price: float,
+    now: datetime,
+    theoretical_edge: float,
+) -> PaperSettlementRecord:
+    """Construct a :class:`PaperSettlementRecord` from a position + a price.
+
+    Build step 3: the position-close mechanics (payout per side, realized
+    P&L, win/loss/push) are identical whether the settlement price comes
+    from Kalshi's live oracle or the deterministic benchmark model, so they
+    live here once and both settlers call this.  Only the price SOURCE
+    differs between the two callers.
+    """
+    payout_price = settlement_price if pos.side == "yes" else 1.0 - settlement_price
+    realized_pnl = (payout_price - pos.entry_price) * pos.filled_size_usd
+    outcome = _settlement_outcome(realized_pnl)
+    client_order_id = pos.order_ids[0] if pos.order_ids else ""
+    return PaperSettlementRecord(
+        client_order_id=client_order_id,
+        contract_id=pos.contract_id,
+        platform=pos.platform,
+        side=pos.side,  # type: ignore[arg-type]
+        settled_at=now,
+        settlement_price=settlement_price,
+        payout_price=payout_price,
+        entry_price=pos.entry_price,
+        size_usd=pos.filled_size_usd,
+        realized_pnl=realized_pnl,
+        fees_usd=pos.fees_usd,
+        outcome=outcome,  # type: ignore[arg-type]
+        theoretical_edge=theoretical_edge,
+        expiry=pos.expiry,
+    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
