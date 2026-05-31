@@ -332,11 +332,21 @@ class VolSurface:
 
     # ── public ───────────────────────────────────────────────────────────
 
-    def update(self, ticks: list[OptionTick]) -> set[datetime]:
+    def update(
+        self, ticks: list[OptionTick], now: datetime | None = None,
+    ) -> set[datetime]:
         """Ingest new ticks and refit affected expiry slices.
 
         Only refits a slice when the incoming mark IV differs from the
         cached value, so repeated identical updates are cheap.
+
+        ``now`` is the "as-of" instant the per-slice time-to-expiry is
+        measured against.  It defaults to wall-clock (live behaviour
+        unchanged), but the replay path passes the SimulatedClock's sim-time
+        so the SVI fit -- and therefore every derived probability/edge -- is
+        a deterministic function of the recorded surface (the same recorded
+        frames + same sim-time yield bit-identical fits run-to-run), not of
+        the wall-clock instant the replay happens to run at.
 
         Returns the set of expiry datetimes that were actually refitted.
         """
@@ -348,7 +358,7 @@ class VolSurface:
                 dirty.add(tick.expiry)
 
         for expiry in dirty:
-            self._refit_expiry(expiry)
+            self._refit_expiry(expiry, now=now)
 
         return dirty
 
@@ -372,12 +382,13 @@ class VolSurface:
 
     # ── private ───────────────────────────────────────────────────────────
 
-    def _refit_expiry(self, expiry: datetime) -> None:
+    def _refit_expiry(self, expiry: datetime, now: datetime | None = None) -> None:
         expiry_ticks = [t for t in self._ticks.values() if t.expiry == expiry]
         if not expiry_ticks:
             return
 
-        now = datetime.now(timezone.utc)
+        if now is None:
+            now = datetime.now(timezone.utc)
         T = (expiry - now).total_seconds() / _SECONDS_PER_YEAR
         if T <= 0:
             return

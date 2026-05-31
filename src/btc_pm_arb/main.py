@@ -297,7 +297,11 @@ class Agent:
     def flush_ticks(self) -> set:
         if not self._pending_ticks:
             return set()
-        dirty = self.surface.update(self._pending_ticks)
+        # Measure time-to-expiry against the shared clock (sim-time under
+        # replay) so the SVI fit is deterministic and reads the recorded
+        # timeline, not the wall-clock instant the replay runs at.  Live:
+        # clock.now() == datetime.now(utc), so behaviour is unchanged.
+        dirty = self.surface.update(self._pending_ticks, now=self.clock.now())
         self._pending_ticks.clear()
         return dirty
 
@@ -358,6 +362,10 @@ class Agent:
                     ask_prob=price.ask,
                     mid_prob=price.mid,
                     source=DataSource.DERIBIT,
+                    # Sim-time under replay so the cache entry's freshness
+                    # (read by the stale-data gate) tracks the recorded
+                    # timeline; wall-clock in live (unchanged).
+                    timestamp=self.clock.now(),
                 )
 
     # ── Round 7c step 2 / Round 8 Commit 3: matcher → edge → filter → ────────
@@ -1204,6 +1212,48 @@ async def _dashboard_task(agent: Agent, stop_event: asyncio.Event) -> None:
         log.error("dashboard.error", error=str(exc))
 
 
+# ── Replay (build step 5) ──────────────────────────────────────────────────────
+
+
+def _latest_replay_date(base: Path) -> str | None:
+    """Return the latest ``YYYY-MM-DD`` recording dir under ``base``, or None.
+
+    Recordings live at ``base/{source}/{date}/frames-HH.jsonl.gz``; the date
+    is shared across sources for a capture, so the max date across the three
+    source trees is the most recent capture day.
+    """
+    dates: set[str] = set()
+    for source in ("deribit", "polymarket", "kalshi"):
+        src_dir = base / source
+        if src_dir.is_dir():
+            for child in src_dir.iterdir():
+                if child.is_dir():
+                    dates.add(child.name)
+    return max(dates) if dates else None
+
+
+async def _run_replay(
+    agent: "Agent", record_dir: Path | None, replay_date: str | None,
+) -> None:
+    """Drive the agent off recorded frames via :class:`ReplayReader`.
+
+    Build step 5.  The reader is the only clock driver in replay mode; it
+    reaches no network (no feed tasks, no Kalshi settlement poller, no
+    dashboard are started).
+    """
+    from btc_pm_arb.feeds.replay import ReplayReader
+
+    base = record_dir if record_dir is not None else Path("data/recordings")
+    date = replay_date or _latest_replay_date(base)
+    if date is None:
+        log.error("replay.no_recordings", base_dir=str(base))
+        return
+    reader = ReplayReader(record_dir=base, date=date, agent=agent)
+    log.info("replay.starting", base_dir=str(base), date=date, run_id=agent.run_id)
+    stats = await reader.run()
+    log.info("replay.finished", **stats)
+
+
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 async def run(
@@ -1212,6 +1262,7 @@ async def run(
     *,
     mode: str = "live",
     duration_s: float | None = None,
+    replay_date: str | None = None,
 ) -> None:
     _configure_logging()
 
@@ -1220,8 +1271,10 @@ async def run(
     # is wired to record raw frames into a per-source / per-day / per-hour
     # gzipped JSONL stream for future replay-mode validation.  Off by
     # default — recording is opt-in.
+    # Replay mode READS recordings; it never records.  Building a recorder
+    # in replay would risk appending to the very files we read.
     recorder: FrameRecorder | None = None
-    if record_dir is not None:
+    if record_dir is not None and mode != "replay":
         recorder = FrameRecorder(record_dir)
         log.info("frame_recorder.enabled", base_dir=str(record_dir))
 
@@ -1261,34 +1314,34 @@ async def run(
         max_position_usd=settings.max_position_usd,
     )
 
+    # Build step 5: replay swaps the live feed tasks (and the live scan /
+    # settlement-poller / dashboard tasks) for the deterministic ReplayReader,
+    # which ingests recorded frames, runs one scan, and jump-to-expiry settles
+    # -- reaching NO network.  It runs to completion and returns; the live
+    # TaskGroup below is never entered in replay mode.
+    if mode == "replay":
+        try:
+            await _run_replay(agent, record_dir, replay_date)
+        finally:
+            await agent.order_mgr.aclose()
+            summary = agent.paper_positions.performance_summary()
+            log.info("agent.shutdown", **summary)
+        return
+
     try:
         async with asyncio.TaskGroup() as tg:
-            if mode == "replay":
-                # Replay swaps the live feed tasks for a replay reader
-                # (build step 5).  That reader is a SEPARATE follow-up and
-                # is NOT wired here — only the clock seam lands in this
-                # step.  Until it exists, replay runs against an empty
-                # surface (no feeds) and relies on --duration to bound.
-                log.warning(
-                    "replay_mode.reader_pending",
-                    detail=(
-                        "replay reader not yet wired (build step 5); "
-                        "running feed-less against an empty surface"
-                    ),
-                )
-            else:
-                tg.create_task(
-                    _deribit_task(agent, stop_event, recorder=recorder),
-                    name="deribit-feed",
-                )
-                tg.create_task(
-                    _kalshi_task(agent, stop_event, recorder=recorder),
-                    name="kalshi-feed",
-                )
-                tg.create_task(
-                    _polymarket_task(agent, stop_event, recorder=recorder),
-                    name="polymarket-feed",
-                )
+            tg.create_task(
+                _deribit_task(agent, stop_event, recorder=recorder),
+                name="deribit-feed",
+            )
+            tg.create_task(
+                _kalshi_task(agent, stop_event, recorder=recorder),
+                name="kalshi-feed",
+            )
+            tg.create_task(
+                _polymarket_task(agent, stop_event, recorder=recorder),
+                name="polymarket-feed",
+            )
             tg.create_task(_scan_task(agent, stop_event), name="scan")
             tg.create_task(_order_refresh_task(agent, stop_event), name="order-refresh")
             tg.create_task(agent.settlement_monitor.run(stop_event), name="settlement")
@@ -1358,19 +1411,34 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "unbounded run stopped by SIGINT/SIGTERM."
         ),
     )
+    # Build step 5: which recorded capture day to replay (under --record-dir).
+    # Default: the latest date present.  Ignored in live mode.
+    parser.add_argument(
+        "--replay-date", type=str, default=None, metavar="YYYY-MM-DD",
+        help=(
+            "Capture day to replay (--mode replay).  Default: the latest "
+            "date present under --record-dir."
+        ),
+    )
     return parser
 
 
 def main() -> None:
     parser = _build_arg_parser()
     args = parser.parse_args()
-    record_dir = args.record_dir if args.record_feeds else None
+    # Replay reads from --record-dir; recording writes to it.  Either intent
+    # means run() should know the directory.
+    if args.mode == "replay" or args.record_feeds:
+        record_dir = args.record_dir
+    else:
+        record_dir = None
     asyncio.run(
         run(
             dry_run=True,
             record_dir=record_dir,
             mode=args.mode,
             duration_s=args.duration,
+            replay_date=args.replay_date,
         )
     )
 
