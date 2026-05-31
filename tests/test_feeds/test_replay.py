@@ -197,6 +197,43 @@ async def test_book_frame_joined_when_token_tracked(tmp_path, monkeypatch):
     assert stats["pm_ticks"] == 1
 
 
+async def test_reader_positions_an_unanchored_clock_from_first_frame(
+    tmp_path, monkeypatch,
+):
+    """run() builds the replay clock UNANCHORED (no start); the reader must
+    position it from the first recorded frame and track sim-time -- not stay
+    frozen at a wall-clock anchor ahead of the recordings (regression: a
+    wall-clock anchor froze the clock and made every tick hours-stale)."""
+    rec = tmp_path / "recordings"
+    _write_gz(
+        rec / "deribit" / "2026-05-30" / "frames-20.jsonl.gz",
+        [_deribit_frame("2026-05-30T20:00:01+00:00", "BTC-31MAY26-70000-C", 70000)],
+    )
+    _write_gz(
+        rec / "polymarket" / "2026-05-30" / "frames-20.jsonl.gz",
+        [
+            _pm_markets_frame("2026-05-30T20:00:00+00:00", "TOKEN_YES"),
+            _pm_book_frame("2026-05-30T20:00:03+00:00", "TOKEN_YES"),
+        ],
+    )
+    monkeypatch.setattr(
+        "btc_pm_arb.config.settings.paper_ledger_dir", str(tmp_path / "ledger")
+    )
+    monkeypatch.setattr("btc_pm_arb.config.settings.min_edge", 0.01)
+    # Unanchored replay clock, exactly as main.run() constructs it.
+    agent = Agent(dry_run=True, clock=SimulatedClock("replay"), run_id="testrun")
+    reader = ReplayReader(
+        record_dir=rec, date="2026-05-30", agent=agent,
+        sources=("deribit", "polymarket"), jump_to_expiry=False,
+    )
+    stats = await reader.run()
+    assert stats["pm_ticks"] == 1
+    # Clock tracked the recorded timeline, not wall-clock.
+    assert agent.clock.now() == datetime(
+        2026, 5, 30, 20, 0, 3, tzinfo=timezone.utc
+    )
+
+
 async def test_replay_requires_replay_clock(tmp_path, monkeypatch):
     """The reader refuses a live-mode clock -- it is the only clock driver and
     a live clock would silently ignore advance_to."""

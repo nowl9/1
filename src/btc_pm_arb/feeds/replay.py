@@ -265,9 +265,17 @@ class ReplayReader:
         """
         clock = self._agent.clock
         for ts, _order, source, rec in self._merged_frames():
-            # The merged stream is monotonic, but guard defensively so a
-            # single out-of-order line never aborts the whole replay.
-            if ts > clock.now():
+            # Advance the sim-clock onto the recorded timeline.  The clock may
+            # be UNANCHORED (run() leaves replay clocks with no start so the
+            # reader positions them from the first frame) -- clock.now() raises
+            # until positioned, so the first frame advances unconditionally.
+            # Thereafter the merged stream is monotonic; the >= guard tolerates
+            # equal timestamps and never moves backwards.
+            try:
+                current = clock.now()
+            except RuntimeError:
+                current = None
+            if current is None or ts > current:
                 clock.advance_to(ts)
             self.stats["frames"] += 1
             if source == "deribit":

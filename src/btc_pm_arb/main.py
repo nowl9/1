@@ -1303,13 +1303,15 @@ async def run(
         log.info("frame_recorder.enabled", base_dir=str(record_dir))
 
     # Build step 1 (Fork 3): construct the simulated-clock seam from the
-    # mode.  Live delegates to wall-clock; replay is advanceable.  In
-    # replay we anchor the clock at construction time so the (feed-less,
-    # reader-pending) scan loop can read it without raising; the replay
-    # reader (build step 5 — SEPARATE follow-up) will drive advance_to off
-    # the recorded "ts" stream.
+    # mode.  Live delegates to wall-clock; replay is advanceable.  In replay
+    # the clock is left UNANCHORED (no start): the ReplayReader (build step 5)
+    # positions it from the FIRST recorded frame's "ts" and advances it off
+    # the recorded stream.  Anchoring at wall-clock would be a bug -- the
+    # recorded frames predate "now", so the reader's monotonic guard would
+    # never move the clock backwards onto the recorded timeline, freezing it
+    # at wall-time and making every recorded tick look hours-stale.
     if mode == "replay":
-        clock = SimulatedClock("replay", start=datetime.now(timezone.utc))
+        clock = SimulatedClock("replay")
     else:
         clock = SimulatedClock("live")
 
