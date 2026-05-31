@@ -1,34 +1,28 @@
-feat(recorder): widen --record-feeds with 3 capture-only latency streams
+feat(dashboard): one-click Windows launcher (dashboard.bat)
 
-Adds three auxiliary, capture-only feed recorders that run ONLY under
---record-feeds, writing into the SAME gzipped-JSONL format the existing
-recorder uses ({base}/{tag}/{date}/frames-HH.jsonl.gz) with the SAME outer
-per-frame ts stamp the k-way replay merge keys on:
+P2 of the dashboard-launcher goal. The dashboard runs in-process with the
+agent, so the whole startup is a single command. dashboard.bat wraps it for
+double-click use from Explorer:
 
-  * spot      -- Deribit deribit_price_index.btc_usd WS push (fast spot ref),
-                 a dedicated connection so the deribit recording is unchanged.
-  * chainlink -- Polygon BTC/USD aggregator latestRoundData via raw JSON-RPC
-                 eth_call (no web3 dep); captures round_id/answer/updated_at
-                 (the latency-critical on-chain push timestamp, not just price).
-  * pm5min    -- Polymarket BTC 5-minute up/down binaries, discovered by the
-                 btc-updown-5m slug prefix and polled at HIGH frequency (1s)
-                 so the slow repricing lag is visible offline.
+- cd to the repo root (%~dp0), default mode paper.
+- Background-poll /api/health, then open the default browser at the SPA once
+  it answers 200 (falls back to opening after ~30s).
+- Foreground-run `py -3.12 -m btc_pm_arb.main`; closing the window (or Ctrl+C)
+  tears the agent + dashboard down together. goto end guards stop the paper
+  path from falling through into the replay block.
+- `dashboard.bat replay` runs the headless deterministic replay (no dashboard,
+  by design). "live" is intentionally NOT a launch option -- real-money is a
+  guarded runtime toggle, not a CLI flag.
+- HOST/PORT/token hoisted to the top so a later server deploy is a config
+  change (plus the 127.0.0.1 bind in main.py), not a rewrite. Localhost only.
 
-Capture-only guardrails: none of these flow into pricing, signals, gates, or
-execution; the 5-minute contracts are recorded but NOT added to the arb's
-tracked/signal universe (the live PolymarketFeed threshold filter still
-rejects them -- no strike). Default live/paper/replay behavior is unchanged;
-the new tasks start only when a recorder is present (--record-feeds, live
-mode) and each self-disables on a blocked stream without touching the live
-feeds. The replay reader ignores the new tags (its k-way merge keys on the
-outer ts and falls to source-order 99 for unknown tags).
+Tests: test_launcher.py -- static contract checks of the .bat (runs the right
+module, polls health, opens the browser, binds localhost only, ASCII). Kept
+network-free so they are deterministic under pytest-randomly. The runtime
+"dashboard responds on localhost" invariant is covered by test_dashboard.py
+(test_health / test_spa_served_at_root).
 
-Recorder change: FrameRecorder.record now accepts a bare-string source tag in
-addition to a DataSource enum; enum-source output is byte-identical to before.
-
-Tests: +13 (decode incl. signed answer, discovery filter / Up-token
-resolution, network-free discovery+book recording via httpx MockTransport,
-each stream's on-disk format, replay-merge parses widened recordings,
-DataSource byte-identity). Full suite 747 passed.
+No trading behavior changed; the launcher only starts/stops the existing
+entry point and reads state.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
