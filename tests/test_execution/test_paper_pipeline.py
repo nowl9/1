@@ -284,22 +284,22 @@ async def test_paper_state_survives_agent_restart(monkeypatch, tmp_path: Path):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Polymarket short-circuit preserved (no paper state on Polymarket signals)
+# Build step 2: Polymarket un-short-circuited in PAPER mode
 # ══════════════════════════════════════════════════════════════════════════════
 
 
 @pytest.mark.asyncio
-async def test_polymarket_signal_does_not_create_paper_state(
+async def test_polymarket_signal_routed_to_paper_in_paper_mode(
     monkeypatch, tmp_path: Path,
 ):
-    """Polymarket signals are short-circuited at OrderManager.place (returns
-    None).  No paper-trading state should be created — the Round 8 plan's
-    untouched-list invariant.
+    """Build step 2 (plan sections 3.2/4.1): the PM drop in
+    OrderManager.place() is lifted in paper mode.  A passing Polymarket
+    signal with captured depth now routes through the SAME FillSimulator
+    Kalshi uses and produces a paper order + fill + position -- where the
+    Round 8 invariant produced nothing.
     """
     agent, expiry = _seed_agent(monkeypatch, tmp_path)
-    # Seed POLYMARKET feed-health too so the signal isn't rejected by the
-    # freshness gate on its way into the dry-run branch (which is the gate
-    # we actually want to exercise).
+    # Seed POLYMARKET feed-health so the freshness gate doesn't reject.
     agent.feed_health.record_tick(DataSource.POLYMARKET)
 
     poly_tick = PredictionMarketTick(
@@ -312,13 +312,105 @@ async def test_polymarket_signal_does_not_create_paper_state(
         yes_ask=0.42,
         no_bid=0.58,
         no_ask=0.60,
+        # Captured depth so the require_nonempty_book gate passes and the
+        # book-walk has levels to consume.
+        order_book_yes=[(0.42, 500.0)],
+        order_book_no=[(0.60, 500.0)],
         timestamp=datetime.now(timezone.utc),
     )
     agent.ingest_pm_tick(poly_tick)
     await agent.run_scan_pipeline(agent.flush_pm_ticks())
 
-    # No paper order, no fill, no position
-    assert list(agent.paper_ledger.replay_orders()) == []
-    assert list(agent.paper_ledger.replay_fills()) == []
-    assert agent.paper_positions.open_positions() == []
-    assert agent._funnel["paper_orders_placed"] == 0
+    # A paper order + full fill + open position now exist for the PM signal.
+    orders = list(agent.paper_ledger.replay_orders())
+    assert len(orders) == 1
+    assert orders[0].platform == DataSource.POLYMARKET
+    assert orders[0].side == "yes"
+    fills = list(agent.paper_ledger.replay_fills())
+    assert len(fills) == 1
+    assert fills[0].fill_outcome == "full"
+    assert fills[0].fill_price == pytest.approx(0.42)
+    open_positions = agent.paper_positions.open_positions()
+    assert len(open_positions) == 1
+    assert open_positions[0].platform == DataSource.POLYMARKET
+    assert agent._funnel["paper_orders_placed"] == 1
+    assert agent._funnel["paper_orders_filled"] == 1
+
+
+@pytest.mark.asyncio
+async def test_polymarket_clears_same_gates_as_kalshi(monkeypatch, tmp_path: Path):
+    """PM must clear the IDENTICAL gate chain Kalshi does -- the
+    un-short-circuit skips none of them.  Run the same tick shape under both
+    sources and assert each yields exactly one paper order."""
+    results: dict[DataSource, int] = {}
+    for source in (DataSource.KALSHI, DataSource.POLYMARKET):
+        sub_dir = tmp_path / source.value
+        agent, expiry = _seed_agent(monkeypatch, sub_dir)
+        agent.feed_health.record_tick(source)
+        tick = PredictionMarketTick(
+            source=source,
+            contract_id=f"{source.value}-btc-100k",
+            question="BTC above $100k?",
+            strike=100_000.0,
+            expiry=expiry,
+            yes_bid=0.40,
+            yes_ask=0.42,
+            no_bid=0.58,
+            no_ask=0.60,
+            order_book_yes=[(0.42, 500.0)],
+            order_book_no=[(0.60, 500.0)],
+            timestamp=datetime.now(timezone.utc),
+        )
+        agent.ingest_pm_tick(tick)
+        await agent.run_scan_pipeline(agent.flush_pm_ticks())
+        results[source] = len(list(agent.paper_ledger.replay_orders()))
+
+    # Identical gate outcome for both venues: one paper order each.
+    assert results[DataSource.KALSHI] == 1
+    assert results[DataSource.POLYMARKET] == 1
+
+
+@pytest.mark.asyncio
+async def test_polymarket_dropped_in_live_mode(monkeypatch, tmp_path: Path):
+    """Live-trading guardrail unchanged: with dry_run_paper_mode=False the
+    PM drop is still in force -- place() returns None and no paper state is
+    created.  (Exercised directly on OrderManager since the Agent always
+    runs paper mode.)"""
+    from btc_pm_arb.execution.orders import OrderManager
+    from btc_pm_arb.models import ArbitrageSignal, ProbabilityQuote
+
+    expiry = datetime.now(timezone.utc) + timedelta(days=7)
+    pm_quote = ProbabilityQuote(
+        source=DataSource.POLYMARKET,
+        contract_id="poly-btc-100k",
+        strike=100_000.0,
+        expiry=expiry,
+        bid_prob=0.40,
+        ask_prob=0.42,
+        mid_prob=0.41,
+        settlement_type="polymarket_spot",
+        timestamp=datetime.now(timezone.utc),
+    )
+    opt_quote = pm_quote.model_copy(update={"source": DataSource.DERIBIT})
+    signal = ArbitrageSignal(
+        options_quote=opt_quote,
+        pm_quote=pm_quote,
+        raw_edge=0.13,
+        adjusted_edge=0.13,
+        trade_side="buy_yes",
+        confidence=0.7,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    # Live mode: dry_run_paper_mode=False -> PM dropped.
+    mgr_live = OrderManager(dry_run=False, dry_run_paper_mode=False)
+    assert await mgr_live.place(signal, size_usd=200.0) is None
+    await mgr_live.aclose()
+
+    # Paper mode: dry_run_paper_mode=True -> PM routed (order created).
+    mgr_paper = OrderManager(dry_run=True, dry_run_paper_mode=True)
+    order = await mgr_paper.place(signal, size_usd=200.0)
+    assert order is not None
+    assert order.platform == DataSource.POLYMARKET
+    assert order.state.value == "placed"
+    await mgr_paper.aclose()

@@ -187,7 +187,11 @@ class Agent:
 
         # ── Round 8 Commit 3: Paper-trading components ────────────────────────
         self.paper_ledger = PaperLedger(settings.paper_ledger_dir)
-        self.fill_simulator = FillSimulator()
+        # Build step 2 (Fork 1): the paper FillSimulator walks captured
+        # book depth and produces partial fills / explicit no_fills, rather
+        # than the legacy top-of-book full-or-nothing.  PM and Kalshi share
+        # this one instance.
+        self.fill_simulator = FillSimulator(book_walk=True)
         self.paper_positions = PaperPositionTracker()
         # Order registry keyed by client_order_id — populated as the agent
         # places paper orders, and re-populated from disk on startup so the
@@ -203,6 +207,10 @@ class Agent:
             "signals_rejected_filter": 0,
             "paper_orders_placed": 0,
             "paper_orders_filled": 0,
+            # Build step 2: book-walking can fill only part of size_usd when
+            # the crossed book is thin -- counted separately from full fills
+            # and no_fills so the funnel never silently mislabels a partial.
+            "paper_orders_partial": 0,
             "paper_orders_no_fill": 0,
             # Round 9 Commit 9a: counter for the defensive
             # paper_ledger.missing_originating_data warning at the place()
@@ -545,6 +553,8 @@ class Agent:
 
         if evaluation.outcome == "full":
             self._funnel["paper_orders_filled"] += 1
+        elif evaluation.outcome == "partial":
+            self._funnel["paper_orders_partial"] += 1
         elif evaluation.outcome == "no_fill":
             self._funnel["paper_orders_no_fill"] += 1
 

@@ -139,10 +139,131 @@ class FillSimulator:
     """Evaluate paper orders against captured order-book snapshots.
 
     Stateless — every call to :meth:`evaluate` is independent.  Construct
-    once per agent; no per-call configuration this round.
+    once per agent.
+
+    Two fill models (Fork 1, plan section 4.1)
+    ------------------------------------------
+    * ``book_walk=False`` (default): legacy top-of-book, full-or-nothing.
+      Evaluates ``limit_price`` against ``snapshot.yes_ask`` / ``no_ask``
+      only; depth is ignored.  Kept as the default so existing callers and
+      tests see unchanged behaviour.
+    * ``book_walk=True``: walks the captured ``order_book_yes`` /
+      ``order_book_no`` depth (the same ask-side, cheapest-first levels the
+      fill-adjusted-edge calculator consumes), accumulating fills at or
+      below ``limit_price`` up to ``size_usd``.  Yields PARTIAL fills when
+      depth is thin and an explicit, diagnosable no_fill (with a reason) for
+      an empty book or a limit below the whole book -- never a silent
+      optimistic full fill.  This is the paper-mode model: fill realism IS
+      the scalping-strategy validation, not a later refinement.
     """
 
+    def __init__(self, book_walk: bool = False) -> None:
+        self._book_walk = book_walk
+
     def evaluate(
+        self,
+        *,
+        side: Literal["yes", "no"],
+        limit_price: float,
+        size_usd: float,
+        snapshot: BookSnapshot,
+    ) -> FillEvaluation:
+        """Return whether the paper order fills, and at what price.
+
+        Dispatches to the book-walking model when constructed with
+        ``book_walk=True``; otherwise the legacy top-of-book model.
+        """
+        if self._book_walk:
+            return self._evaluate_book_walk(
+                side=side, limit_price=limit_price, size_usd=size_usd,
+                snapshot=snapshot,
+            )
+        return self._evaluate_top_of_book(
+            side=side, limit_price=limit_price, size_usd=size_usd,
+            snapshot=snapshot,
+        )
+
+    # -- Book-walking model (Fork 1) --------------------------------------------
+
+    def _evaluate_book_walk(
+        self,
+        *,
+        side: Literal["yes", "no"],
+        limit_price: float,
+        size_usd: float,
+        snapshot: BookSnapshot,
+    ) -> FillEvaluation:
+        """Walk captured depth, accumulating fills at-or-below ``limit_price``.
+
+        Levels are the ask-side book for the order's side
+        (``order_book_yes`` for a YES buy, ``order_book_no`` for a NO buy)
+        -- the same shape and cheapest-first convention
+        ``edge.fill_adjusted_price`` uses.  Sorted ascending defensively so
+        the walk consumes the best price first regardless of capture order.
+
+        Outcomes (never a silent full fill):
+          * ``empty_book``        -- no captured depth on this side.
+          * ``limit_below_book``  -- depth exists but every level is priced
+                                     above the limit (nothing marketable).
+          * ``book_walk_partial`` -- only part of ``size_usd`` is available
+                                     at-or-below the limit.
+          * ``book_walk_full``    -- the full size fills at the depth VWAP.
+        """
+        levels = (
+            snapshot.order_book_yes if side == "yes" else snapshot.order_book_no
+        )
+        if not levels:
+            return FillEvaluation(
+                outcome="no_fill",
+                fill_price=None,
+                fill_size_usd=0.0,
+                reason="empty_book",
+            )
+
+        # Cheapest ask first.  Defensive sort -- captured order is documented
+        # ascending but we do not rely on it.
+        ordered = sorted(levels, key=lambda lvl: lvl.price)
+        filled = 0.0
+        cost = 0.0
+        for lvl in ordered:
+            if filled + 1e-9 >= size_usd:
+                break
+            if lvl.price > limit_price:
+                # Ascending price -- no cheaper level remains to lift.
+                break
+            take = min(size_usd - filled, lvl.size_usd)
+            if take <= 0.0:
+                continue
+            cost += lvl.price * take
+            filled += take
+
+        if filled <= 0.0:
+            # Depth present but the whole book sits above the limit.
+            return FillEvaluation(
+                outcome="no_fill",
+                fill_price=None,
+                fill_size_usd=0.0,
+                reason="limit_below_book",
+            )
+
+        vwap = cost / filled
+        if filled + 1e-9 >= size_usd:
+            return FillEvaluation(
+                outcome="full",
+                fill_price=vwap,
+                fill_size_usd=size_usd,
+                reason="book_walk_full",
+            )
+        return FillEvaluation(
+            outcome="partial",
+            fill_price=vwap,
+            fill_size_usd=filled,
+            reason="book_walk_partial",
+        )
+
+    # -- Legacy top-of-book model (full-or-nothing) -----------------------------
+
+    def _evaluate_top_of_book(
         self,
         *,
         side: Literal["yes", "no"],

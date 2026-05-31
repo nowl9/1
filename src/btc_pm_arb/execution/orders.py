@@ -14,11 +14,18 @@ Design notes
   httpx against demo-api.kalshi.co by default.  Fixed-point migration:
   API may return _dollars (float) or _fp (int, 10^-4 cents) depending on API
   version; we normalise to float [0, 1] throughout.
-* Polymarket is **data-only** (US-restricted; trading is geoblocked).  Signals
-  whose ``pm_quote.source == DataSource.POLYMARKET`` are logged as
-  ``signal.polymarket_data_only`` in ``OrderManager.place()`` and never reach
-  any executor.  ``PolymarketExecutor`` survives as a stub that raises on
-  ``submit()``; it exists only so legacy imports keep working.
+* Polymarket has no LIVE execution (US-restricted; trading is geoblocked).
+  In LIVE mode (``dry_run_paper_mode=False``) signals whose
+  ``pm_quote.source == DataSource.POLYMARKET`` are still logged as
+  ``signal.polymarket_data_only`` in ``OrderManager.place()`` and never
+  reach any executor -- the live-trading guardrail is untouched.
+  In PAPER mode (``dry_run_paper_mode=True``) that drop is lifted (build
+  step 2, plan sections 3.2 / 4.1): PM orders route to the venue-agnostic
+  :class:`PaperExecutor` (which submits nothing, just flips PENDING ->
+  PLACED) and into the SAME paper :class:`fill_simulator.FillSimulator`
+  Kalshi uses.  PM clears the identical 12 gates upstream in the signal
+  filter -- the un-short-circuit skips none of them.
+  ``PolymarketExecutor`` survives as a disabled stub for legacy imports.
 * Order deduplication: every order gets a UUID client_order_id; the manager
   tracks submitted IDs and will not resubmit the same order.
 * The manager is intentionally *thin*: it does not contain strategy logic,
@@ -302,6 +309,50 @@ class PolymarketExecutor:
         raise RuntimeError(self._DISABLED_MSG)
 
 
+# ── Paper executor (venue-agnostic — Fork 4) ──────────────────────────────────
+
+class PaperExecutor:
+    """Venue-agnostic paper executor (build step 2; Fork 4 = single
+    PaperExecutor, no per-venue protocol).
+
+    Submits NOTHING.  :meth:`submit` flips PENDING -> PLACED so the
+    order-lifecycle consumers see consistent state, and :meth:`refresh` is
+    a no-op because the paper :class:`fill_simulator.FillSimulator`
+    (main.py) owns the FILLED transition -- exactly the contract
+    ``KalshiExecutor`` honours under ``dry_run_paper_mode=True``.
+
+    Used for venues with no live executor when running in paper mode --
+    today only Polymarket (live trading geoblocked / data-only).  Kalshi
+    keeps using ``KalshiExecutor``'s dry-run path; routing it here too would
+    needlessly disturb the existing optimistic-fill regression suite.
+    """
+
+    async def submit(self, order: Order) -> None:
+        logger.info(
+            "paper.dry_run_submit",
+            platform=order.platform,
+            contract=order.contract_id,
+            side=order.side,
+            limit_price=round(order.limit_price, 4),
+            size_usd=order.size_usd,
+        )
+        order.transition(
+            OrderState.PLACED, platform_order_id="paper-" + order.client_order_id,
+        )
+
+    async def cancel(self, order: Order) -> None:
+        order.transition(OrderState.CANCELLED)
+
+    async def refresh(self, order: Order) -> None:
+        # The FillSimulator owns the FILLED transition; refresh is a no-op
+        # so the executor never double-fills an order the simulator has
+        # already evaluated (mirrors KalshiExecutor paper-mode refresh).
+        return
+
+    async def aclose(self) -> None:
+        return
+
+
 # ── Order manager ──────────────────────────────────────────────────────────────
 
 class OrderManager:
@@ -328,17 +379,26 @@ class OrderManager:
         self._kalshi = KalshiExecutor(
             dry_run=dry_run, dry_run_paper_mode=dry_run_paper_mode
         )
+        # Venue-agnostic paper executor (build step 2).  Only used to route
+        # Polymarket orders in paper mode; Kalshi keeps using _kalshi.
+        self._paper = PaperExecutor()
         self._orders: dict[str, Order] = {}          # client_order_id → Order
         self._seen_signals: set[str] = set()         # deduplication by signal fingerprint
 
     def _executor(self, platform: DataSource) -> OrderExecutor:
         if platform == DataSource.KALSHI:
             return self._kalshi  # type: ignore[return-value]
-        # Polymarket is data-only; signals targeting it are intercepted in
-        # place() before reaching here.  Any other platform is unsupported.
+        # Build step 2: in PAPER mode, Polymarket routes to the
+        # venue-agnostic PaperExecutor and into the shared FillSimulator.
+        # In LIVE mode PM is intercepted in place() before reaching here
+        # (geoblocked / data-only), so this branch is paper-only.
+        if platform == DataSource.POLYMARKET and self._dry_run_paper_mode:
+            return self._paper  # type: ignore[return-value]
+        # Any other platform — or PM in live mode (should be unreachable;
+        # place() drops it first) — is unsupported.
         raise RuntimeError(
             f"No executor for platform {platform!r} — Kalshi is the only "
-            f"execution venue."
+            f"live execution venue (Polymarket is paper-only)."
         )
 
     def _signal_fingerprint(self, signal: ArbitrageSignal) -> str:
@@ -352,9 +412,10 @@ class OrderManager:
     async def place(self, signal: ArbitrageSignal, size_usd: float) -> Order | None:
         """Create and submit an order for a signal.
 
-        Returns None if the signal is deduplicated, or if it targets a
-        non-execution venue (currently: Polymarket — geoblocked for US users
-        and therefore data-only in this agent).
+        Returns None if the signal is deduplicated, or (LIVE mode only) if
+        it targets Polymarket -- geoblocked for US users and therefore
+        data-only.  In PAPER mode (build step 2) Polymarket is routed to the
+        shared paper FillSimulator instead of being dropped.
         """
         fp = self._signal_fingerprint(signal)
         if fp in self._seen_signals:
@@ -365,8 +426,12 @@ class OrderManager:
         platform = signal.pm_quote.source
         side = "yes" if signal.trade_side == "buy_yes" else "no"
 
-        # Polymarket is data-only (US-restricted).  Log and skip; do not raise.
-        if platform == DataSource.POLYMARKET:
+        # Polymarket has no live execution (US-restricted).  In LIVE mode,
+        # log and skip -- the live-trading guardrail is untouched.  In PAPER
+        # mode (dry_run_paper_mode=True) the drop is lifted (build step 2):
+        # PM falls through to the PaperExecutor + shared FillSimulator,
+        # having already cleared the same 12 gates Kalshi does.
+        if platform == DataSource.POLYMARKET and not self._dry_run_paper_mode:
             logger.info(
                 "signal.polymarket_data_only",
                 contract=signal.pm_quote.contract_id,
@@ -430,3 +495,4 @@ class OrderManager:
 
     async def aclose(self) -> None:
         await self._kalshi.aclose()
+        await self._paper.aclose()
