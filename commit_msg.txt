@@ -1,0 +1,21 @@
+docs(paper-trading): capture resolved paper-trade + replay design
+
+Add docs/paper-trading-plan.md capturing the RESOLVED design for
+Polymarket paper trading and deterministic replay. Documentation only;
+no source changes.
+
+Contents:
+- Replay-readiness spike (read-only): recordings are format-grade
+  (per-frame recv ts on all three sources; sim-clock injectable) but
+  duration-short (two ~90s windows, ~2.5h gap) so settlement is not
+  reachable by proportional replay. Criterion 6 flagged AT RISK,
+  mitigated by deterministic benchmark settlement + a sim-clock
+  jump-to-expiry; recapture recommended.
+- The six acceptance criteria.
+- Component design, one section each (mode/clock seam, un-short-circuit
+  PM to shared FillSimulator + book-walking, benchmark settlement,
+  run_id/mode + fill-fidelity columns, replay reader + cold smoke,
+  shadow no-op intent).
+- Four resolved forks, each with options/decision/reasoning/flip.
+- Affirmed JSONL append-only persistence, build order, carried gaps
+  (settlement wedge; missing per-case conditionId linkage), out of scope.
