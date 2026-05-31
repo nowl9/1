@@ -371,6 +371,59 @@ async def test_polymarket_clears_same_gates_as_kalshi(monkeypatch, tmp_path: Pat
 
 
 @pytest.mark.asyncio
+async def test_shadow_intent_emitted_pre_fill_and_submits_nothing(
+    monkeypatch, tmp_path: Path,
+):
+    """Build step 6 (plan 3.6; criterion 2): a passing signal emits a shadow
+    no-op order intent capturing the venue submission the LIVE path would have
+    made (venue/side/limit/size/snapshot), submitted=False, alongside -- not
+    in place of -- the order/fill.  Nothing is submitted to any venue."""
+    agent, expiry = _seed_agent(monkeypatch, tmp_path)
+    agent.feed_health.record_tick(DataSource.POLYMARKET)
+    tick = PredictionMarketTick(
+        source=DataSource.POLYMARKET,
+        contract_id="poly-btc-100k",
+        question="BTC above $100k?",
+        strike=100_000.0,
+        expiry=expiry,
+        yes_bid=0.40,
+        yes_ask=0.42,
+        no_bid=0.58,
+        no_ask=0.60,
+        order_book_yes=[(0.42, 500.0)],
+        order_book_no=[(0.60, 500.0)],
+        timestamp=datetime.now(timezone.utc),
+    )
+    agent.ingest_pm_tick(tick)
+    await agent.run_scan_pipeline(agent.flush_pm_ticks())
+
+    intents = list(agent.paper_ledger.replay_intents())
+    orders = list(agent.paper_ledger.replay_orders())
+    assert len(intents) == 1
+    intent = intents[0]
+    order = orders[0]
+
+    # The intent IS the venue submission the live path would have made.
+    assert intent.client_order_id == order.client_order_id
+    assert intent.platform == DataSource.POLYMARKET
+    assert intent.side == order.side == "yes"
+    assert intent.size_usd == pytest.approx(order.size_usd)
+    # Records the INTENDED limit (the order intent), not the simulated fill.
+    assert intent.limit_price == pytest.approx(order.limit_price)
+    assert intent.pm_yes_ask == pytest.approx(0.42)
+    # The no-op marker: the live path would submit; paper mode never does.
+    assert intent.submitted is False
+    # Run-stamped like every other ledger append (build step 4 ride-through).
+    assert intent.mode == agent.clock.mode
+
+    # "Submits nothing": the executor only flipped PENDING -> PLACED; no
+    # platform order id beyond the paper sentinel, and no real submission.
+    live_order = agent.order_mgr.all_orders()[0]
+    assert live_order.state.value == "placed"
+    assert (live_order.platform_order_id or "").startswith("paper-")
+
+
+@pytest.mark.asyncio
 async def test_polymarket_dropped_in_live_mode(monkeypatch, tmp_path: Path):
     """Live-trading guardrail unchanged: with dry_run_paper_mode=False the
     PM drop is still in force -- place() returns None and no paper state is

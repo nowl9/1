@@ -209,6 +209,52 @@ class PaperOrderRecord(BaseModel):
     dry_run: bool = True
 
 
+class PaperIntentRecord(BaseModel):
+    """Shadow no-op order intent (build step 6; plan 3.6; criterion 2).
+
+    The order the LIVE routing path WOULD have submitted to the venue,
+    captured as an audit record BEFORE the :class:`fill_simulator.FillSimulator`
+    evaluates the fill -- and WITHOUT submitting anything.  ``submitted`` is
+    always ``False`` in paper mode: the live path would submit; we never do.
+
+    Distinct from :class:`PaperOrderRecord` (the paper order the simulator
+    then fills): this is the venue-submission payload the live execution path
+    produces (venue / side / limit / size + the top-of-book snapshot it was
+    formed against), recorded so the ledger carries the exact intent live
+    execution would emit, captured without execution.  Shares
+    ``client_order_id`` with the order/fill so the three join.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["intent"] = "intent"
+    schema_version: int = _SCHEMA_VERSION
+
+    # Run identity (build step 4): stamped onto every append.
+    run_id: str = ""
+    mode: str = "live"
+
+    client_order_id: str
+    created_at: datetime
+    platform: DataSource
+    contract_id: str
+    side: Literal["yes", "no"]
+    size_usd: float
+    limit_price: float = Field(ge=0.0, le=1.0)
+
+    # Top-of-book the intent was formed against (the snapshot the live path
+    # would have priced its submission off).
+    pm_yes_bid: float | None = None
+    pm_yes_ask: float | None = None
+    pm_no_bid: float | None = None
+    pm_no_ask: float | None = None
+
+    # Always False in paper mode -- the live path WOULD submit; we record the
+    # intent and submit nothing.  Kept as a field (not a constant) so a future
+    # live-execution round can flip it without a schema change.
+    submitted: bool = False
+
+
 class PaperFillRecord(BaseModel):
     """Fill-evaluation record — written immediately after the simulator runs.
 
@@ -343,6 +389,7 @@ class PaperLedger:
     """
 
     _ORDERS_FILE: str = "orders.jsonl"
+    _INTENTS_FILE: str = "intents.jsonl"
     _FILLS_FILE: str = "fills.jsonl"
     _SETTLEMENTS_FILE: str = "settlements.jsonl"
     _REJECTIONS_FILE: str = "rejections.jsonl"
@@ -362,6 +409,7 @@ class PaperLedger:
         # construction.  Tests use a fresh tmp_path per case.
         self._base_dir.mkdir(parents=True, exist_ok=True)
         self._orders_path = self._base_dir / self._ORDERS_FILE
+        self._intents_path = self._base_dir / self._INTENTS_FILE
         self._fills_path = self._base_dir / self._FILLS_FILE
         self._settlements_path = self._base_dir / self._SETTLEMENTS_FILE
         self._rejections_path = self._base_dir / self._REJECTIONS_FILE
@@ -376,6 +424,10 @@ class PaperLedger:
 
     def append_order(self, record: PaperOrderRecord) -> None:
         self._append(self._orders_path, record)
+
+    def append_intent(self, record: PaperIntentRecord) -> None:
+        """Append a shadow no-op order intent (build step 6).  Submits nothing."""
+        self._append(self._intents_path, record)
 
     def append_fill(self, record: PaperFillRecord) -> None:
         self._append(self._fills_path, record)
@@ -411,6 +463,9 @@ class PaperLedger:
 
     def replay_orders(self) -> Iterator[PaperOrderRecord]:
         yield from self._replay(self._orders_path, PaperOrderRecord)
+
+    def replay_intents(self) -> Iterator[PaperIntentRecord]:
+        yield from self._replay(self._intents_path, PaperIntentRecord)
 
     def replay_fills(self) -> Iterator[PaperFillRecord]:
         yield from self._replay(self._fills_path, PaperFillRecord)

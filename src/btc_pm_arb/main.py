@@ -57,6 +57,7 @@ from btc_pm_arb.execution.fill_simulator import BookSnapshot, FillSimulator
 from btc_pm_arb.execution.orders import OrderManager, Order
 from btc_pm_arb.execution.paper_ledger import (
     BookLevel,
+    PaperIntentRecord,
     PaperLedger,
     PaperOrderRecord,
     PaperRejectionRecord,
@@ -568,6 +569,29 @@ class Agent:
         )
         self.paper_ledger.append_order(order_record)
         self._paper_orders_by_id[order.client_order_id] = order_record
+
+        # Build step 6 (plan 3.6; criterion 2): emit the shadow no-op order
+        # intent the LIVE routing path would have submitted (venue / side /
+        # limit / size + the top-of-book snapshot it was formed against)
+        # BEFORE the FillSimulator evaluates -- submitting nothing.  This is
+        # the audit trail live execution WOULD have produced, captured without
+        # execution; submitted=False marks the no-op.
+        self.paper_ledger.append_intent(
+            PaperIntentRecord(
+                client_order_id=order.client_order_id,
+                created_at=order.created_at,
+                platform=order.platform,
+                contract_id=order.contract_id,
+                side=order.side,  # type: ignore[arg-type]
+                size_usd=order.size_usd,
+                limit_price=order.limit_price,
+                pm_yes_bid=tick.yes_bid,
+                pm_yes_ask=tick.yes_ask,
+                pm_no_bid=tick.no_bid,
+                pm_no_ask=tick.no_ask,
+                submitted=False,
+            )
+        )
 
         snapshot = BookSnapshot.from_order_record(order_record)
         evaluation = self.fill_simulator.evaluate(

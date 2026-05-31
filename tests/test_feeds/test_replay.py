@@ -273,11 +273,13 @@ def _project_ledger(ledger_dir: Path) -> dict:
 
     led = PaperLedger(ledger_dir)
     order_drop = {"client_order_id", "created_at", "run_id"}
+    intent_drop = {"client_order_id", "created_at", "run_id"}
     fill_drop = {"client_order_id", "filled_at", "run_id"}
     settle_drop = {"client_order_id", "settled_at", "run_id"}
     rej_drop = {"timestamp", "run_id"}
     return {
         "orders": [_project(r, order_drop) for r in led.replay_orders()],
+        "intents": [_project(r, intent_drop) for r in led.replay_intents()],
         "fills": [_project(r, fill_drop) for r in led.replay_fills()],
         "settlements": [_project(r, settle_drop) for r in led.replay_settlements()],
         "rejections": [_project(r, rej_drop) for r in led.replay_rejections()],
@@ -302,10 +304,16 @@ async def test_cold_path_replay_reproduces_full_chain(tmp_path, monkeypatch):
     agent = await _replay_real(tmp_path / "run", monkeypatch, jump=True)
 
     orders = list(agent.paper_ledger.replay_orders())
+    intents = list(agent.paper_ledger.replay_intents())
     fills = list(agent.paper_ledger.replay_fills())
     settlements = list(agent.paper_ledger.replay_settlements())
 
     assert len(orders) >= 1, "cold replay produced no order intent"
+    # Build step 6: a shadow no-op intent rides with every order, submitting
+    # nothing (criterion 2 reproduced under replay).
+    assert len(intents) == len(orders)
+    assert all(i.submitted is False for i in intents)
+    assert {i.client_order_id for i in intents} == {o.client_order_id for o in orders}
     assert any(f.fill_outcome in ("full", "partial") for f in fills)
     assert len(settlements) >= 1, "jump-to-expiry produced no settlement"
     # All settled positions are Polymarket benchmark settlements (PM is the
@@ -326,8 +334,9 @@ async def test_two_cold_replays_are_identical(tmp_path, monkeypatch):
     proj_b = _project_ledger(tmp_path / "b")
 
     # Non-trivial: the chain actually fired, so identity is meaningful.
-    assert proj_a["orders"] and proj_a["fills"] and proj_a["settlements"]
-    for stream in ("orders", "fills", "settlements", "rejections"):
+    assert proj_a["orders"] and proj_a["intents"] and proj_a["fills"]
+    assert proj_a["settlements"]
+    for stream in ("orders", "intents", "fills", "settlements", "rejections"):
         assert proj_a[stream] == proj_b[stream], f"{stream} differ across replays"
 
 
