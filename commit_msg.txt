@@ -1,23 +1,34 @@
-fix(replay): position the replay clock from the first frame, not wall-clock
+feat(recorder): widen --record-feeds with 3 capture-only latency streams
 
-run() anchored the replay-mode SimulatedClock at datetime.now() -- build
-step 1's placeholder for the reader-pending era.  With the ReplayReader now
-driving the clock, that wall-clock anchor sits AFTER the recorded frames
-(which predate "now"), so the reader's monotonic guard never advanced the
-clock onto the recorded timeline: it stayed frozen at wall-time and every
-recorded PM tick looked hours-stale.  The full --mode replay CLI path then
-produced zero fills (only rejections) even though the reader-driven smoke
-(which anchors before the frames) reproduced the chain.
+Adds three auxiliary, capture-only feed recorders that run ONLY under
+--record-feeds, writing into the SAME gzipped-JSONL format the existing
+recorder uses ({base}/{tag}/{date}/frames-HH.jsonl.gz) with the SAME outer
+per-frame ts stamp the k-way replay merge keys on:
 
-- main.py: build the replay clock UNANCHORED (SimulatedClock("replay")); the
-  reader positions it from the first frame's ts.
-- replay.py: advance_to the first frame unconditionally when the clock is
-  still unpositioned (clock.now() raises until positioned), then forward-only.
-- test_replay.py: regression -- a reader with an unanchored clock (exactly as
-  run() builds it) tracks the recorded timeline instead of freezing.
+  * spot      -- Deribit deribit_price_index.btc_usd WS push (fast spot ref),
+                 a dedicated connection so the deribit recording is unchanged.
+  * chainlink -- Polygon BTC/USD aggregator latestRoundData via raw JSON-RPC
+                 eth_call (no web3 dep); captures round_id/answer/updated_at
+                 (the latency-critical on-chain push timestamp, not just price).
+  * pm5min    -- Polymarket BTC 5-minute up/down binaries, discovered by the
+                 btc-updown-5m slug prefix and polled at HIGH frequency (1s)
+                 so the slow repricing lag is visible offline.
 
-Verified end-to-end: `--mode replay --replay-date 2026-05-30` now reproduces
-2 orders / 2 intents / 2 fills / 2 settlements (1 win, 1 loss) with no network.
-Full suite: 734 passed.
+Capture-only guardrails: none of these flow into pricing, signals, gates, or
+execution; the 5-minute contracts are recorded but NOT added to the arb's
+tracked/signal universe (the live PolymarketFeed threshold filter still
+rejects them -- no strike). Default live/paper/replay behavior is unchanged;
+the new tasks start only when a recorder is present (--record-feeds, live
+mode) and each self-disables on a blocked stream without touching the live
+feeds. The replay reader ignores the new tags (its k-way merge keys on the
+outer ts and falls to source-order 99 for unknown tags).
+
+Recorder change: FrameRecorder.record now accepts a bare-string source tag in
+addition to a DataSource enum; enum-source output is byte-identical to before.
+
+Tests: +13 (decode incl. signed answer, discovery filter / Up-token
+resolution, network-free discovery+book recording via httpx MockTransport,
+each stream's on-disk format, replay-merge parses widened recordings,
+DataSource byte-identity). Full suite 747 passed.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
