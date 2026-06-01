@@ -21,3 +21,4 @@ paper_ledger/
 # Generated artifacts: raw feed recordings and diagnostic/scratch output
 data/
 outputs/
+analysis_out/
