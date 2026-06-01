@@ -155,7 +155,12 @@ class Agent:
         self.surface = VolSurface()
         self.cache = ProbabilityCache()
         self.pricer = DigitalPricer()
-        self.rv_tracker = RealizedVolTracker()
+        # Sim-clock seam (C1): under replay the rv tracker must classify the
+        # vol regime from sim-time, not wall-clock — an as-fast-as-possible
+        # replay otherwise stamps every index sample ~1 wall-second apart and
+        # annualizes a phantom HIGH regime (live reads LOW on identical
+        # frames).  Live: clock.now() == datetime.now(utc), so unchanged.
+        self.rv_tracker = RealizedVolTracker(clock=self.clock)
         self.feed_health = FeedHealthTracker(clock=self.clock)
         self.odds_tracker = OddsVelocityTracker()
         self.matcher = ContractMatcher()

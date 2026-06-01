@@ -35,7 +35,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Sequence
+from typing import Callable, Sequence
 
 import structlog
 
@@ -105,6 +105,17 @@ class RealizedVolTracker:
 
     windows_h: list[float] = field(default_factory=lambda: [1.0, 4.0, 24.0])
     max_points: int = 100_000
+    # Injectable "now" source (sim-clock seam, Fork 3 — sibling of the
+    # vol_surface.update(now=) fix).  ``maybe_update``'s throttle/timestamp
+    # and ``rv``'s query-time eviction read this instead of calling
+    # ``datetime.now(timezone.utc)`` inline, so an as-fast-as-possible replay
+    # samples + annualizes off SIM time (true recorded spacing) rather than
+    # wall-clock (which collapses every interval to ~milliseconds and reads a
+    # phantom HIGH regime).  None -> wall-clock, so a default tracker and every
+    # existing caller/test are byte-for-byte unchanged; main.py injects
+    # ``Agent.clock`` (live clock.now() == datetime.now(utc), so live is also
+    # unchanged).  Mirrors FeedHealthTracker(clock=...).
+    clock: Callable[[], datetime] | None = None
 
     # (timestamp, log_price) pairs in chronological order — retained for
     # backward compatibility with n_points / oldest_ts / newest_ts properties
@@ -151,7 +162,7 @@ class RealizedVolTracker:
         """
         if price <= 0:
             return
-        now = ts or datetime.now(timezone.utc)
+        now = ts or self._now()
         log_price = math.log(price)
 
         # Reject non-monotonic timestamps; would otherwise produce zero or
@@ -220,7 +231,7 @@ class RealizedVolTracker:
         """
         if price <= 0:
             return False
-        now = datetime.now(timezone.utc)
+        now = self._now()
         last = self.newest_ts
         if last is not None:
             elapsed_s = (now - last).total_seconds()
@@ -261,7 +272,7 @@ class RealizedVolTracker:
         # empty_window feeds prices then asserts rv() at a later instant
         # without further updates).  Each entry is evicted at most once
         # over its lifetime, keeping the per-call amortized cost O(1).
-        self._evict_stale(w, datetime.now(timezone.utc))
+        self._evict_stale(w, self._now())
 
         n = len(w.entries)
         if n < 2:
@@ -314,6 +325,19 @@ class RealizedVolTracker:
         return self._data[-1][0] if self._data else None
 
     # ── Private ───────────────────────────────────────────────────────────────
+
+    def _now(self) -> datetime:
+        """Current UTC time via the injected clock seam, else wall-clock.
+
+        ``clock`` is a ``Callable[[], datetime]`` (typically a
+        :class:`~btc_pm_arb.clock.SimulatedClock`).  None -> wall-clock so a
+        default tracker is unchanged; under replay the injected sim-clock makes
+        the throttle cadence, stored timestamps, and query-time eviction all
+        read the recorded timeline.
+        """
+        if self.clock is not None:
+            return self.clock()
+        return datetime.now(timezone.utc)
 
     def _evict_stale(self, w: _WindowAggregates, now: datetime) -> None:
         """Pop aged-out entries from the front of ``w.entries`` and subtract

@@ -188,3 +188,65 @@ def test_empty_tracker_ts_none():
     t = RealizedVolTracker()
     assert t.oldest_ts is None
     assert t.newest_ts is None
+
+
+# ── C1: sim-clock seam (replay vol-regime faithfulness) ────────────────────────
+
+def test_maybe_update_uses_injected_clock_for_throttle_and_timestamp():
+    """maybe_update must throttle + stamp off the injected clock, not wall-clock.
+
+    Regression for the live-vs-replay vol_regime contradiction: an
+    as-fast-as-possible replay otherwise stamps every sample at wall-clock
+    (~ms apart) and reads a phantom HIGH regime on frames that live reads LOW.
+    """
+    from btc_pm_arb.clock import SimulatedClock
+
+    clock = SimulatedClock("replay")
+    t0 = datetime(2026, 6, 1, 18, 0, 0, tzinfo=timezone.utc)
+    clock.advance_to(t0)
+    tr = RealizedVolTracker(clock=clock)
+
+    # First observation admitted; stamped at SIM time, not wall-clock now.
+    assert tr.maybe_update(62_000.0) is True
+    assert tr.newest_ts == t0
+
+    # Sim advances 0.5s (< 1.0s throttle) -> throttled, regardless of wall time.
+    clock.advance_to(t0 + timedelta(seconds=0.5))
+    assert tr.maybe_update(62_100.0) is False
+    assert tr.newest_ts == t0
+
+    # Sim advances to +1.0s from last sample -> admitted, stamped sim time.
+    t1 = t0 + timedelta(seconds=1.0)
+    clock.advance_to(t1)
+    assert tr.maybe_update(62_100.0) is True
+    assert tr.newest_ts == t1
+
+
+def test_rv_query_eviction_uses_injected_clock():
+    """rv()'s query-time eviction must read the injected clock, not wall-clock."""
+    from btc_pm_arb.clock import SimulatedClock
+
+    clock = SimulatedClock("replay")
+    t0 = datetime(2026, 6, 1, 18, 0, 0, tzinfo=timezone.utc)
+    clock.advance_to(t0)
+    tr = RealizedVolTracker(clock=clock)
+
+    # Five samples 60s apart in SIM time -> two-plus returns inside the 1h window.
+    for i in range(5):
+        tr.update(62_000.0 + 10.0 * i, ts=t0 + timedelta(seconds=60 * i))
+    clock.advance_to(t0 + timedelta(minutes=5))
+    assert tr.rv(1.0) is not None
+
+    # Advance the SIM clock >1h past the last sample -> all entries age out.
+    clock.advance_to(t0 + timedelta(hours=2))
+    assert tr.rv(1.0) is None
+
+
+def test_default_tracker_unchanged_without_clock():
+    """No clock -> wall-clock fallback; default construction stays live-identical."""
+    tr = RealizedVolTracker()
+    assert tr.clock is None
+    assert tr.maybe_update(62_000.0) is True
+    # newest_ts is a wall-clock instant (close to now), proving the fallback.
+    assert tr.newest_ts is not None
+    assert abs((datetime.now(timezone.utc) - tr.newest_ts).total_seconds()) < 5.0
