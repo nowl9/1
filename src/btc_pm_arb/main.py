@@ -1392,9 +1392,9 @@ async def run(
 
     # Build step 5: replay swaps the live feed tasks (and the live scan /
     # settlement-poller / dashboard tasks) for the deterministic ReplayReader,
-    # which ingests recorded frames, runs one scan, and jump-to-expiry settles
-    # -- reaching NO network.  It runs to completion and returns; the live
-    # TaskGroup below is never entered in replay mode.
+    # which ingests recorded frames, scans at the live 5 s sim-clock cadence,
+    # and jump-to-expiry settles -- reaching NO network.  It runs to completion
+    # and returns; the live TaskGroup below is never entered in replay mode.
     if mode == "replay":
         try:
             await _run_replay(agent, record_dir, replay_date)

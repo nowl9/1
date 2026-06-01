@@ -48,7 +48,7 @@ import gzip
 import heapq
 import json
 import zlib
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator
 
@@ -68,6 +68,16 @@ logger: structlog.BoundLogger = structlog.get_logger(__name__)
 # Source replay priority for ties on the outer ``ts`` -- deterministic and
 # arbitrary; only matters when two frames share an identical timestamp.
 _SOURCE_ORDER: dict[str, int] = {"deribit": 0, "kalshi": 1, "polymarket": 2}
+
+# Replay scan cadence.  Mirrors the LIVE scan task interval
+# (``main._SCAN_INTERVAL_SECS == 5.0``): the reader fires a scan at every 5 s
+# boundary of SIM-time as frames advance the clock, instead of one terminal
+# scan at window-end.  The boundary is derived purely from the recorded ``ts``
+# stream (first-frame anchor + fixed 5 s steps), so it is deterministic and
+# reproduces what the live agent would have scanned at the same cadence -- it
+# never scans per-tick (which would be more generous than live) nor on
+# wall-clock.
+_SCAN_INTERVAL: timedelta = timedelta(seconds=5.0)
 
 
 def _parse_ts(raw: str) -> datetime:
@@ -275,24 +285,42 @@ class ReplayReader:
     # ── Run ───────────────────────────────────────────────────────────────────
 
     async def run(self) -> dict[str, int]:
-        """Replay every frame, run one scan, then jump-to-expiry settle.
+        """Replay every frame at the LIVE 5 s scan cadence, then settle.
+
+        Ingests the merged frame stream while firing a scan at every 5 s
+        boundary of sim-time (``_SCAN_INTERVAL``) as the clock advances --
+        reproducing the live agent's ``_scan_task`` cadence instead of a single
+        terminal scan.  A trailing scan drains the last partial window, then
+        the jump-to-expiry settler fires.
 
         Returns the run :attr:`stats`.  Reaches no network: only the
         in-memory pipeline and the deterministic benchmark settler run.
         """
         clock = self._agent.clock
+        # Next sim-time boundary at which a scan fires.  None until the first
+        # frame positions the (possibly UNANCHORED) clock and anchors the
+        # schedule: the live ``_scan_task`` sleeps one interval before its
+        # first scan, so the first replay scan likewise fires one interval
+        # after the first frame.
+        next_scan_at: datetime | None = None
         for ts, _order, source, rec in self._merged_frames():
-            # Advance the sim-clock onto the recorded timeline.  The clock may
-            # be UNANCHORED (run() leaves replay clocks with no start so the
-            # reader positions them from the first frame) -- clock.now() raises
-            # until positioned, so the first frame advances unconditionally.
-            # Thereafter the merged stream is monotonic; the >= guard tolerates
-            # equal timestamps and never moves backwards.
-            try:
-                current = clock.now()
-            except RuntimeError:
-                current = None
-            if current is None or ts > current:
+            if next_scan_at is None:
+                # First frame: position the clock and anchor the scan schedule.
+                clock.advance_to(ts)
+                next_scan_at = ts + _SCAN_INTERVAL
+            # Fire every 5 s boundary that falls strictly before this frame's
+            # arrival, with the clock positioned AT the boundary (not at the
+            # frame's ts), so each scan sees exactly the ticks that had arrived
+            # by that boundary -- the live "drain every 5 s" contract -- and
+            # prices them against the contemporaneous surface/cache.  A frame
+            # exactly at the boundary is ingested first and picked up by the
+            # next scan.  The merged stream is monotonic, so each boundary is
+            # >= the clock and advance_to never moves backwards.
+            while ts > next_scan_at:
+                clock.advance_to(next_scan_at)
+                await self._scan_once()
+                next_scan_at = next_scan_at + _SCAN_INTERVAL
+            if ts > clock.now():
                 clock.advance_to(ts)
             self.stats["frames"] += 1
             if source == "deribit":
@@ -320,6 +348,10 @@ class ReplayReader:
             )
             return self.stats
 
+        # Trailing scan: drain ticks that arrived after the last 5 s boundary
+        # (the clock is at the final frame's ts).  Mirrors the scan the live
+        # task would run for the last partial window before shutdown, and is
+        # what the jump-to-expiry settler needs to see every opened position.
         await self._scan_once()
         if self._jump_to_expiry:
             self._jump_to_expiry_and_settle()

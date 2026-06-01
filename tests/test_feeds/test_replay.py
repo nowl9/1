@@ -274,6 +274,78 @@ async def test_reader_tolerates_truncated_gzip_tail(tmp_path, monkeypatch):
     assert stats["pm_ticks"] == 1
 
 
+async def test_run_fires_scans_at_live_5s_cadence_not_terminal(tmp_path, monkeypatch):
+    """C1: run() fires scans at 5 s sim-boundaries as frames advance -- not a
+    single terminal scan.
+
+    A PM tick arriving early in a window LONGER than the 300 s
+    ``max_data_age_seconds`` cutoff must be SCANNED FRESH (age <= one interval)
+    instead of being staled out as ``pm_data_age`` at window-end.  Exercises the
+    REAL ``run()`` scan path by spying on ``agent.run_scan_pipeline`` (the
+    clock-anchor lesson: assert on what run() actually scans, with the sim-clock
+    it advances -- not the reader in isolation).
+    """
+    from datetime import timedelta as _td
+
+    from btc_pm_arb.feeds.replay import _SCAN_INTERVAL
+
+    t0 = datetime(2026, 5, 30, 20, 0, 0, tzinfo=timezone.utc)
+
+    def iso(sec: int) -> str:
+        return (t0 + _td(seconds=sec)).isoformat()
+
+    rec = tmp_path / "recordings"
+    # Deribit frames spread across a 360 s window (> the 300 s cutoff) drive the
+    # clock across the 5 s boundaries.
+    _write_gz(
+        rec / "deribit" / "2026-05-30" / "frames-20.jsonl.gz",
+        [_deribit_frame(iso(s), "BTC-31MAY26-70000-C", 70000) for s in range(0, 361, 30)],
+    )
+    # PM contract appears at t0 and books at t0+1 s -- early in the window.
+    _write_gz(
+        rec / "polymarket" / "2026-05-30" / "frames-20.jsonl.gz",
+        [
+            _pm_markets_frame(iso(0), "TOKEN_YES"),
+            _pm_book_frame(iso(1), "TOKEN_YES"),
+        ],
+    )
+    agent = _make_replay_agent(tmp_path / "ledger", monkeypatch)
+
+    # Spy on the REAL scan pipeline: record (scan_sim_time, [pm tick ts]).
+    calls: list[tuple[datetime, list[datetime]]] = []
+    orig = agent.run_scan_pipeline
+
+    async def _spy(pm_ticks):
+        calls.append((agent.clock.now(), [t.timestamp for t in pm_ticks]))
+        return await orig(pm_ticks)
+
+    monkeypatch.setattr(agent, "run_scan_pipeline", _spy)
+
+    reader = ReplayReader(
+        record_dir=rec, date="2026-05-30", agent=agent,
+        sources=("deribit", "polymarket"), jump_to_expiry=False,
+    )
+    await reader.run()
+
+    # Cadence, not terminal: many scans fired (one per 5 s boundary + trailing),
+    # never the single scan the old reader ran.
+    assert len(calls) > 50
+    # Every boundary scan fired at a clean 5 s sim-offset off the first frame.
+    for scan_now, _ in calls[:-1]:
+        offset = (scan_now - t0).total_seconds()
+        assert abs(offset % 5.0) < 1e-6, f"scan at non-boundary offset {offset}"
+    # The early PM tick (t0+1 s) is SCANNED FRESH: it first appears in a scan
+    # whose sim-time is within one interval of arrival -> pm_age <= 5 s, far
+    # under the 300 s cutoff that staled it under the terminal scan.
+    pm_ts = t0 + _td(seconds=1)
+    fresh = [(s - pm_ts).total_seconds() for s, tss in calls if pm_ts in tss]
+    assert fresh, "early PM tick was never scanned"
+    assert min(fresh) <= _SCAN_INTERVAL.total_seconds() + 1e-6
+    # Contrast: the window exceeds the 300 s gate, so a single terminal scan
+    # (the OLD behaviour) WOULD have staled this very tick.
+    assert (calls[-1][0] - pm_ts).total_seconds() > 300.0
+
+
 async def test_replay_requires_replay_clock(tmp_path, monkeypatch):
     """The reader refuses a live-mode clock -- it is the only clock driver and
     a live clock would silently ignore advance_to."""
