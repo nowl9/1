@@ -285,6 +285,24 @@ class ReplayReader:
             elif source == "kalshi":
                 self._ingest_kalshi(rec, ts)
 
+        # Empty/zero-frame guard (C2).  When the day dir is absent/empty (or
+        # every frame was unparseable) the merged stream is empty, so the
+        # sim-clock was never positioned by advance_to.  _scan_once tolerates
+        # that (it only reads clock.now() when there are dirty ticks), but
+        # _jump_to_expiry_and_settle reads agent.clock.now() unconditionally
+        # once there are open positions (replay.py:_jump -> clock.py:82
+        # RuntimeError) -- and positions ARE replayed from disk at Agent init,
+        # so the jump is reached even on a no-data date.  Exit cleanly with a
+        # "no recordings for {date}" report instead of crashing.
+        if self.stats["frames"] == 0:
+            logger.warning(
+                "replay.no_recordings_for_date",
+                date=self._date,
+                base_dir=str(self._base),
+                sources=list(self._sources),
+            )
+            return self.stats
+
         await self._scan_once()
         if self._jump_to_expiry:
             self._jump_to_expiry_and_settle()

@@ -388,3 +388,40 @@ async def test_jump_to_expiry_gates_settlement(tmp_path, monkeypatch):
 
     jumped = await _replay_real(tmp_path / "jump", monkeypatch, jump=True)
     assert len(list(jumped.paper_ledger.replay_settlements())) >= 1
+
+
+# ── C2: empty/zero-frame replay guard ─────────────────────────────────────────
+
+async def test_run_no_recordings_for_date_exits_clean_with_open_positions(
+    tmp_path, monkeypatch,
+):
+    """A no-data replay date must NOT crash on the unanchored clock.
+
+    Regression: with open positions present (replayed from disk at Agent
+    init), run() reaches _jump_to_expiry_and_settle, which reads
+    agent.clock.now() unconditionally (replay.py -> clock.py:82).  When the
+    day dir is empty the clock was never positioned, so that read raised
+    RuntimeError.  The frames==0 guard exits cleanly instead.
+    """
+    from types import SimpleNamespace
+
+    monkeypatch.setattr("btc_pm_arb.config.settings.paper_ledger_dir", str(tmp_path))
+    # Unanchored replay clock, exactly as main.run() constructs it.
+    agent = Agent(dry_run=True, clock=SimulatedClock("replay"), run_id="testrun")
+
+    # Force the open-positions path so the (previously crashing) jump-to-expiry
+    # branch would be reached but for the guard.
+    fake_pos = SimpleNamespace(expiry=datetime(2026, 6, 30, tzinfo=timezone.utc))
+    monkeypatch.setattr(
+        agent.paper_positions, "open_positions", lambda: [fake_pos],
+    )
+
+    # tmp_path has no recordings -> zero frames for any date.
+    reader = ReplayReader(record_dir=tmp_path, date="2026-06-01", agent=agent)
+    stats = await reader.run()  # must NOT raise
+
+    assert stats["frames"] == 0
+    assert stats["settlements"] == 0
+    # We exited before touching the clock: it is still unpositioned.
+    with pytest.raises(RuntimeError):
+        agent.clock.now()
