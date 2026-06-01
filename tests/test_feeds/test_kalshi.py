@@ -643,3 +643,118 @@ class TestDiscoverySeriesFanout:
         # are present.
         for required in ("KXBTCMINMON", "KXBTCMAXMON", "KXBTCMAX150"):
             assert required in _BTC_SERIES_TICKERS_TIER1
+
+
+# ── C4: empty-series pruning + read-budget spacing + 429 backoff ───────────────
+
+class _FakeResp:
+    """Minimal stand-in for an httpx.Response used by the C4 tests."""
+
+    def __init__(self, status_code: int, body: dict | None = None) -> None:
+        self.status_code = status_code
+        self.content = b"{}"
+        self._body = body if body is not None else {"markets": []}
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+    def json(self) -> dict:
+        return self._body
+
+
+def _c4_feed() -> KalshiFeed:
+    feed = KalshiFeed(
+        base_url="https://demo-api.kalshi.co/trade-api/v2",
+        key_path="/nonexistent.pem",
+        key_id="dummy",
+    )
+    feed._private_key = None
+    feed._client = AsyncMock()
+    return feed
+
+
+def test_active_series_excludes_empty_tier2() -> None:
+    """The active poll/discovery set is Tier-1 only; the empty Tier-2 series
+    (KXBTCW / KXBTCMAXW / BTC / BTCD) are not polled (C4)."""
+    from btc_pm_arb.feeds.kalshi import (
+        _BTC_SERIES_TICKERS,
+        _BTC_SERIES_TICKERS_TIER1,
+        _BTC_SERIES_TICKERS_TIER2,
+    )
+
+    assert _BTC_SERIES_TICKERS == _BTC_SERIES_TICKERS_TIER1
+    for empty in _BTC_SERIES_TICKERS_TIER2:
+        assert empty not in _BTC_SERIES_TICKERS
+
+
+@pytest.mark.asyncio
+async def test_discover_markets_does_not_poll_empty_tier2_series() -> None:
+    """_discover_markets issues no GET for the empty Tier-2 series (C4)."""
+    from btc_pm_arb.feeds.kalshi import _BTC_SERIES_TICKERS_TIER2
+
+    requested: list[str] = []
+
+    async def fake_get(path: str, headers: dict[str, str]) -> Any:
+        requested.append(path)
+        return _FakeResp(200, {"markets": []})
+
+    feed = _c4_feed()
+    feed._client.get = fake_get
+    await feed._discover_markets()
+
+    for empty in _BTC_SERIES_TICKERS_TIER2:
+        assert not any(f"series_ticker={empty}" in p for p in requested), (
+            f"must not poll empty series {empty}; got {requested!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_http_get_retries_on_429_then_succeeds(monkeypatch) -> None:
+    """A 429 (no Retry-After) is self-clock-backed-off and retried (C4)."""
+    slept: list[float] = []
+
+    async def fake_sleep(s: float) -> None:
+        slept.append(s)
+
+    monkeypatch.setattr("btc_pm_arb.feeds.kalshi.asyncio.sleep", fake_sleep)
+
+    calls = {"n": 0}
+
+    async def fake_get(path: str, headers: dict[str, str]) -> Any:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _FakeResp(429)
+        return _FakeResp(200, {"ok": True})
+
+    feed = _c4_feed()
+    feed._client.get = fake_get
+
+    body = await feed._http_get("/markets/X/orderbook")
+
+    assert body == {"ok": True}
+    assert calls["n"] == 2                      # retried exactly once
+    assert 1.0 in slept                         # first backoff was the 1s base
+
+
+@pytest.mark.asyncio
+async def test_rate_gate_reserves_sequential_slots(monkeypatch) -> None:
+    """Consecutive GETs are spaced by at least the read-budget interval (C4)."""
+    from btc_pm_arb.feeds.kalshi import _READ_SPACING_S
+
+    slept: list[float] = []
+
+    async def fake_sleep(s: float) -> None:
+        slept.append(s)
+
+    monkeypatch.setattr("btc_pm_arb.feeds.kalshi.asyncio.sleep", fake_sleep)
+
+    feed = _c4_feed()
+    await feed._rate_gate()
+    first = feed._next_get_at
+    await feed._rate_gate()
+    second = feed._next_get_at
+
+    assert second - first >= _READ_SPACING_S - 1e-9
+    # The second call had to wait ~one spacing interval before its slot.
+    assert any(s >= _READ_SPACING_S * 0.5 for s in slept)

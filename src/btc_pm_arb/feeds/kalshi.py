@@ -127,14 +127,35 @@ _BTC_SERIES_TICKERS_TIER2: tuple[str, ...] = (
     "BTC",
     "BTCD",
 )
-_BTC_SERIES_TICKERS: tuple[str, ...] = (
-    _BTC_SERIES_TICKERS_TIER1 + _BTC_SERIES_TICKERS_TIER2
-)
+# C4: the active discovery/poll set is Tier-1 ONLY.  The Tier-2 series above
+# return zero open contracts (confirmed empty), so polling them every 60s only
+# spends read tokens against the rate limit for no contracts -- the dominant
+# avoidable source of 429s.  They are retained as a named constant (and the
+# static allow-list guard still checks them) so a future re-probe can promote
+# any that reopen back into the active set; until then they are NOT polled.
+_BTC_SERIES_TICKERS: tuple[str, ...] = _BTC_SERIES_TICKERS_TIER1
 
 # Reconnection backoff parameters.
 _RECONNECT_BASE: float = 5.0
 _RECONNECT_MAX: float = 60.0
 _RECONNECT_FACTOR: float = 2.0
+
+# C4: read-budget spacing.  Kalshi Basic tier grants 200 read tokens/s and a
+# GET costs 10 tokens -> a ~20 GET/s hard ceiling.  We self-throttle to <=15
+# GET/s (one global gate across the concurrently-running discovery + poll
+# loops, since BOTH issue GETs through _http_get) to stay clear of the ceiling.
+_READ_TARGET_HZ: float = 15.0
+_READ_SPACING_S: float = 1.0 / _READ_TARGET_HZ      # ~0.067 s between GETs
+
+# C4: 429 backoff.  Kalshi sends no Retry-After header, so the wait is
+# self-clocked: exponential 1 -> 2 -> 4 -> 8 ... capped at 30 s, retried a
+# bounded number of times before the error propagates to the caller's existing
+# per-request handling (which logs and moves to the next ticker/series).
+_RATE_LIMIT_BACKOFF_BASE: float = 1.0
+_RATE_LIMIT_BACKOFF_FACTOR: float = 2.0
+_RATE_LIMIT_BACKOFF_MAX: float = 30.0
+_RATE_LIMIT_MAX_RETRIES: int = 6
+_HTTP_429_TOO_MANY_REQUESTS: int = 429
 
 
 # ── Feed ──────────────────────────────────────────────────────────────────────
@@ -182,6 +203,10 @@ class KalshiFeed:
         # Ticker → market metadata dict (title, subtitle, close_time, …),
         # populated by _discover_markets and consumed by _poll_loop.
         self._tracked: dict[str, dict] = {}
+        # C4: monotonic timestamp of the earliest moment the next GET may fire.
+        # Shared across the discovery + poll loops (both go through _http_get)
+        # so the combined read rate is gated to <=_READ_TARGET_HZ globally.
+        self._next_get_at: float = 0.0
 
     # ── Public interface ──────────────────────────────────────────────────────
 
@@ -267,15 +292,58 @@ class KalshiFeed:
 
     # ── Internal: HTTP helper ─────────────────────────────────────────────────
 
+    async def _rate_gate(self) -> None:
+        """Self-clocked read-budget gate (C4): space GETs to <=_READ_TARGET_HZ.
+
+        Reserves the next slot SYNCHRONOUSLY (no await between reading the clock
+        and writing ``_next_get_at``), so two concurrently-running callers
+        (discovery + poll loops on the one event loop) each get a distinct,
+        sequential slot — the combined GET rate stays under the limit rather
+        than each loop pacing itself independently.  Then sleeps until its slot.
+        """
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        scheduled = max(now, self._next_get_at)
+        self._next_get_at = scheduled + _READ_SPACING_S
+        delay = scheduled - now
+        if delay > 0:
+            await asyncio.sleep(delay)
+
     async def _http_get(self, path: str) -> dict:
         """Authenticated GET, returning the JSON-decoded body.
 
         Fires ``on_alive`` on every 2xx response — this is what makes the
         feed register liveness even when the BTC market universe is empty.
+
+        C4: every GET passes the read-budget gate first; a 429 (no Retry-After
+        from Kalshi) triggers a self-clocked exponential backoff and retry,
+        bounded by ``_RATE_LIMIT_MAX_RETRIES`` before the error propagates to
+        the caller's existing per-request handling.
         """
         assert self._client is not None
-        headers = signed_headers("GET", path, self._private_key, self._key_id)
-        resp = await self._client.get(path, headers=headers)
+        backoff = _RATE_LIMIT_BACKOFF_BASE
+        attempt = 0
+        while True:
+            await self._rate_gate()
+            headers = signed_headers("GET", path, self._private_key, self._key_id)
+            resp = await self._client.get(path, headers=headers)
+            if resp.status_code == _HTTP_429_TOO_MANY_REQUESTS:
+                attempt += 1
+                if attempt > _RATE_LIMIT_MAX_RETRIES:
+                    # Exhausted: let raise_for_status raise the 429 so the
+                    # caller logs + moves on (and the outer reconnect backoff
+                    # engages if it is systemic).
+                    resp.raise_for_status()
+                logger.warning(
+                    "kalshi_rate_limited",
+                    path=path,
+                    attempt=attempt,
+                    backoff_s=round(backoff, 2),
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * _RATE_LIMIT_BACKOFF_FACTOR, _RATE_LIMIT_BACKOFF_MAX)
+                continue
+            break
         resp.raise_for_status()
         # Round 9c Commit 2: record the raw response body (decompressed
         # by httpx already) before json parsing.  4xx/5xx have already
