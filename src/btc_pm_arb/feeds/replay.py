@@ -47,6 +47,7 @@ from __future__ import annotations
 import gzip
 import heapq
 import json
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterator
@@ -148,17 +149,33 @@ class ReplayReader:
         """
         order = _SOURCE_ORDER.get(source, 99)
         for path in self._files_for(source):
-            with gzip.open(path, "rt", encoding="utf-8") as fh:
-                for line in fh:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                        ts = _parse_ts(rec["ts"])
-                    except (ValueError, KeyError):
-                        continue
-                    yield (ts, order, source, rec)
+            # A recording killed mid-write leaves a truncated / corrupt gzip
+            # member, so the decompressor raises partway through the file
+            # (zlib.error / EOFError / OSError) AFTER yielding every frame
+            # decoded before the break point.  Keep those good frames and stop
+            # reading THIS file gracefully -- the k-way merge continues with the
+            # other sources -- instead of letting the error crash the whole run
+            # at window-end (the corrupt tail sorts last, so it is reached just
+            # before the terminal scan).  Mirrors the existing per-line
+            # json/KeyError skip, one level out.
+            try:
+                with gzip.open(path, "rt", encoding="utf-8") as fh:
+                    for line in fh:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                            ts = _parse_ts(rec["ts"])
+                        except (ValueError, KeyError):
+                            continue
+                        yield (ts, order, source, rec)
+            except (OSError, EOFError, zlib.error) as exc:
+                logger.warning(
+                    "replay.truncated_recording",
+                    path=str(path), source=source, error=str(exc),
+                )
+                continue
 
     def _merged_frames(self) -> Iterator[tuple[datetime, int, str, dict]]:
         """k-way merge the per-source streams by (ts, source_order)."""

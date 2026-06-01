@@ -234,6 +234,46 @@ async def test_reader_positions_an_unanchored_clock_from_first_frame(
     )
 
 
+async def test_reader_tolerates_truncated_gzip_tail(tmp_path, monkeypatch):
+    """A recording killed mid-write leaves a truncated / corrupt gzip member.
+
+    Regression: ``_source_lines`` read the file with no guard around the
+    decompressor, so a corrupt tail raised ``zlib.error`` partway through the
+    k-way merge and crashed the whole run at window-end -- BEFORE the terminal
+    scan -- losing every frame in the window.  The reader must keep the frames
+    decoded before the break point and skip the rest of that file.
+    """
+    rec = tmp_path / "recordings"
+    dpath = rec / "deribit" / "2026-05-30" / "frames-20.jsonl.gz"
+    _write_gz(
+        dpath,
+        [
+            _deribit_frame("2026-05-30T20:00:01+00:00", "BTC-31MAY26-70000-C", 70000),
+            _deribit_frame("2026-05-30T20:00:02+00:00", "BTC-31MAY26-72000-C", 72000),
+        ],
+    )
+    # Append a corrupt trailing member: gzip magic + garbage deflate bytes, so
+    # the decompressor raises only AFTER the two valid frames are yielded.
+    with open(dpath, "ab") as fh:
+        fh.write(b"\x1f\x8b\x08\x00" + b"\xff" * 64)
+    _write_gz(
+        rec / "polymarket" / "2026-05-30" / "frames-20.jsonl.gz",
+        [
+            _pm_markets_frame("2026-05-30T20:00:00+00:00", "TOKEN_YES"),
+            _pm_book_frame("2026-05-30T20:00:03+00:00", "TOKEN_YES"),
+        ],
+    )
+    agent = _make_replay_agent(tmp_path / "ledger", monkeypatch)
+    reader = ReplayReader(
+        record_dir=rec, date="2026-05-30", agent=agent,
+        sources=("deribit", "polymarket"), jump_to_expiry=False,
+    )
+    stats = await reader.run()   # must NOT raise on the corrupt tail
+    # Both pre-corruption Deribit frames survived; the PM file read cleanly.
+    assert stats["deribit_ticks"] == 2
+    assert stats["pm_ticks"] == 1
+
+
 async def test_replay_requires_replay_clock(tmp_path, monkeypatch):
     """The reader refuses a live-mode clock -- it is the only clock driver and
     a live clock would silently ignore advance_to."""
