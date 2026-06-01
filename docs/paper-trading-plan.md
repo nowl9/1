@@ -118,8 +118,17 @@ that jump is deterministic.
 4. At expiry, a DETERMINISTIC benchmark settlement (Fork 2) writes a
    PaperSettlementRecord.
 
-5. tools/analyze_paper_ledger.py emits a joined.parquet row carrying
-   slippage and P&L (fill-fidelity columns).
+5. The analyzer emits a joined.parquet row carrying slippage and P&L
+   (fill-fidelity columns).  Invoke it as a module (it imports the
+   `tools.analysis` package, so a bare-path `python tools/analyze_paper_ledger.py`
+   fails on the package import):
+
+   ```
+   py -3.12 -m tools.analyze_paper_ledger --ledger-dir ./paper_ledger --out-dir ./analysis_out
+   ```
+
+   By default it scopes to the latest run_id; pass `--run-id <id>` to pin a
+   run or `--run-id all` to analyze every run in the ledger dir.
 
 6. `--mode replay --duration N` reproduces all of the above from an EMPTY
    surface against the recordings, DETERMINISTICALLY, in CI.

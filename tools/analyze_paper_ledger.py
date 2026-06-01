@@ -461,6 +461,23 @@ def assess_power_tier(n_settled: int) -> str:
     return "below_single_threshold"
 
 
+# ── Run-id scoping ─────────────────────────────────────────────────────────────
+
+def latest_run_id(orders: list[PaperOrderRecord]) -> str | None:
+    """Return the ``run_id`` of the most-recently-created order, or None.
+
+    "Most recent" = max ``created_at``.  Used as the default analysis scope so
+    a ledger dir accumulating many runs reports on the freshest run rather than
+    silently aggregating month-old phantom rows from earlier runs (the
+    observed failure: 137 stale rows, 0 from today's run_id).  Pre-step-4
+    legacy rows carry ``run_id == ""`` and a pure-legacy ledger therefore still
+    scopes to "" (a no-op), while a fresh uuid-stamped run is auto-isolated.
+    """
+    if not orders:
+        return None
+    return max(orders, key=lambda r: r.created_at).run_id
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main(argv: list[str] | None = None) -> int:
@@ -491,6 +508,16 @@ def main(argv: list[str] | None = None) -> int:
             "(default: no filter).  Naive timestamps are interpreted as UTC."
         ),
     )
+    parser.add_argument(
+        "--run-id",
+        type=str,
+        default=None,
+        help=(
+            "Restrict analysis to one run_id.  Default: the latest run (by "
+            "order created_at), so stale phantom rows from earlier runs in the "
+            "same ledger dir are excluded.  Pass 'all' to analyze every run."
+        ),
+    )
     args = parser.parse_args(argv)
 
     as_of: datetime | None = None
@@ -511,10 +538,37 @@ def main(argv: list[str] | None = None) -> int:
         args.ledger_dir / "settlements.jsonl", PaperSettlementRecord,
     )
 
+    # ── Run-id scoping (C3b) ────────────────────────────────────────────────
+    # Default to the latest run so the analyzer stops aggregating month-old
+    # phantom rows; --run-id pins an explicit run; --run-id all opts out.
+    if args.run_id == "all":
+        target_run_id: str | None = None
+    elif args.run_id is not None:
+        target_run_id = args.run_id
+    else:
+        target_run_id = latest_run_id(orders_result.records)
+
+    if target_run_id is None:
+        orders_records = orders_result.records
+        fills_records = fills_result.records
+        settlements_records = settlements_result.records
+        scope_label = "all runs"
+    else:
+        orders_records = [r for r in orders_result.records if r.run_id == target_run_id]
+        fills_records = [r for r in fills_result.records if r.run_id == target_run_id]
+        settlements_records = [
+            r for r in settlements_result.records if r.run_id == target_run_id
+        ]
+        scope_label = f"run_id={target_run_id!r}"
+    print(
+        f"Scope: {scope_label} "
+        f"({len(orders_records)}/{len(orders_result.records)} orders in scope)."
+    )
+
     df = build_joined_dataframe(
-        orders_result.records,
-        fills_result.records,
-        settlements_result.records,
+        orders_records,
+        fills_records,
+        settlements_records,
     )
     df = filter_as_of(df, as_of)
 

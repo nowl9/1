@@ -523,6 +523,11 @@ def fit_logit(df: pd.DataFrame) -> LogitResult:
         return LogitResult(fitted=False, reason="empty_dataframe", n=0)
 
     settled = df[df["is_settled"].fillna(False).astype(bool)]
+    # No settlements merged -> the join never produced an "outcome" column
+    # (e.g. a fresh run that placed orders but has not settled any).  Treat it
+    # the same as too-few-settled rather than raising KeyError 'outcome'.
+    if "outcome" not in settled.columns:
+        return LogitResult(fitted=False, reason="insufficient_settled_rows", n=0)
     eligible = settled[settled["outcome"].isin(["win", "loss"])].copy()
     n = len(eligible)
     if n < _LOGIT_MIN_N:
