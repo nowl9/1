@@ -22,3 +22,5 @@ paper_ledger/
 data/
 outputs/
 analysis_out/
+.claude/
+ledger_archive/
