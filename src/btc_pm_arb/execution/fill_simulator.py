@@ -102,6 +102,32 @@ class BookSnapshot:
             order_book_no=tuple(record.order_book_no),
         )
 
+    @classmethod
+    def from_tick(cls, tick: "PredictionMarketTickLike") -> "BookSnapshot":
+        """Build a snapshot directly from a :class:`models.PredictionMarketTick`.
+
+        The rejection-path shadow fill (main.py) reuses the SAME book-walk as
+        placed orders, but a rejected contract never becomes a
+        :class:`PaperOrderRecord`.  This adapter converts the originating tick
+        using the IDENTICAL ``(price, size) -> BookLevel`` mapping
+        ``_build_paper_order_record`` applies for placed orders, so the
+        snapshot fed to :meth:`evaluate` is constructed the same way on both
+        the passing-order and rejection paths.  Structural type so callers and
+        tests can pass any object with the tick's field shape.
+        """
+        return cls(
+            yes_bid=tick.yes_bid,
+            yes_ask=tick.yes_ask,
+            no_bid=tick.no_bid,
+            no_ask=tick.no_ask,
+            order_book_yes=tuple(
+                BookLevel(price=p, size_usd=s) for p, s in tick.order_book_yes
+            ),
+            order_book_no=tuple(
+                BookLevel(price=p, size_usd=s) for p, s in tick.order_book_no
+            ),
+        )
+
 
 # Structural protocol for ``BookSnapshot.from_order_record`` — declared as
 # a plain class for typing simplicity (Protocol would require importing
@@ -113,6 +139,19 @@ class PaperOrderRecordLike:
     pm_no_ask: float | None
     order_book_yes: list[BookLevel]
     order_book_no: list[BookLevel]
+
+
+# Structural protocol for ``BookSnapshot.from_tick`` — the tick's order-book
+# fields are raw ``(price, size_usd)`` tuples (converted to ``BookLevel`` in
+# the classmethod), unlike ``PaperOrderRecordLike`` whose levels are already
+# ``BookLevel`` instances.
+class PredictionMarketTickLike:
+    yes_bid: float | None
+    yes_ask: float | None
+    no_bid: float | None
+    no_ask: float | None
+    order_book_yes: list[tuple[float, float]]
+    order_book_no: list[tuple[float, float]]
 
 
 # ── Evaluation result ─────────────────────────────────────────────────────────

@@ -315,6 +315,29 @@ def _pick_best_side(
     return "buy_no", max(adj_no, 0.0)
 
 
+def model_yes_bounds(match: MatchResult) -> tuple[float, float]:
+    """Return the direction-mapped model-YES ``(bid, ask)`` bounds for a match.
+
+    Mirrors the raw (non-basis-adjusted) bounds ``EdgeCalculator.compute``
+    derives at the top of its body (line where ``_model_yes_prob`` maps the
+    options P(above) onto the PM YES event) and feeds to
+    :func:`_compute_fill_adjusted_edge` as the YES fair-value lower bound /
+    ask upper bound.
+
+    Exposed so the rejection-path shadow fill (main.py) computes its
+    fill-adjusted edge against the IDENTICAL fair value the passing-order
+    fill-adjusted edge uses — ``fair_value - book_walked_fill_price`` — without
+    reimplementing the polarity mapping.  ``fair = my_bid`` for a buy_yes,
+    ``fair = 1 - my_ask`` for a buy_no, exactly as
+    :func:`_compute_fill_adjusted_edge` does.
+    """
+    entry = match.options_entry
+    my_bid, _, my_ask = _model_yes_prob(
+        match.pm_quote.direction, entry.bid_prob, entry.mid_prob, entry.ask_prob
+    )
+    return my_bid, my_ask
+
+
 def fill_adjusted_price(
     order_book: list[tuple[float, float]],
     size_usd: float,

@@ -366,6 +366,29 @@ class PaperRejectionRecord(BaseModel):
     # source-side is rv_tracker.current_regime().value.
     vol_regime: str
 
+    # ── Shadow fill-adjusted edge (rejection-path measurement infra) ──────────
+    # Computed ONLY for near-floor edge-economics rejections (reason_key in the
+    # edge/threshold set, a positive best_side, and best_conservative_edge above
+    # the noise floor) by invoking the SAME book-walking
+    # ``fill_simulator.FillSimulator`` placed orders use — NOT a second, more
+    # optimistic fill model.  ``fill_adjusted_edge`` is the model fair value
+    # minus the depth-walked fill price, so the near-floor band carries an
+    # honest fill estimate (e.g. +3% theoretical collapsing negative against the
+    # 0.99 wall) instead of only the 1-2 contracts that clear the floor.
+    #
+    # None for rejections outside that band (no meaningful fill) AND for
+    # no_fill walks (empty / limit-below book) — never a manufactured positive
+    # edge.  ``fill_simulator_reason`` / ``fill_outcome`` / ``fill_size_usd``
+    # mirror the PaperFillRecord fields so a partial walk is diagnosable.
+    #
+    # All optional/defaulted -> records round-trip at schema_version 1; this is
+    # the same additive precedent as run_id / mode / strike / direction (no
+    # wire-format bump, future migration tools dispatch on schema_version).
+    fill_adjusted_edge: float | None = None
+    fill_simulator_reason: str | None = None
+    fill_outcome: Literal["full", "partial", "no_fill"] | None = None
+    fill_size_usd: float | None = None
+
 
 # ── PaperLedger ───────────────────────────────────────────────────────────────
 

@@ -444,3 +444,152 @@ class TestRunScanPipelineEndToEnd:
         # Placement still counted — the increment occurs before the
         # defensive lookup, mirroring the real code path.
         assert agent._funnel["paper_orders_placed"] == 1
+
+
+# ── Rejection-path shadow fill (measurement infra) ────────────────────────────
+
+
+class TestShadowFillForRejection:
+    """``Agent._shadow_fill_for_rejection`` reuses the placed-order book-walk to
+    give near-floor rejections a fill-adjusted edge — NOT a second, more
+    optimistic fill model.  The contract stays rejected; this only records what
+    its fill WOULD have been."""
+
+    def _agent(self, monkeypatch, tmp_path) -> Agent:
+        monkeypatch.setattr(
+            "btc_pm_arb.config.settings.paper_ledger_dir", str(tmp_path),
+        )
+        return Agent(dry_run=True)
+
+    def test_near_floor_conservative_edge_rejection_gets_book_walked_edge(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        agent = self._agent(monkeypatch, tmp_path)
+        # Deep book at the ask → full fill at the ask price.
+        tick = _make_pm_tick(yes_ask=0.543, order_book_yes=[(0.543, 500.0)])
+        edge = _make_edge_result(pm_tick=tick, best_side="buy_yes", edge=0.007)
+
+        fae, ev = agent._shadow_fill_for_rejection(edge, "conservative_edge")
+
+        assert ev is not None
+        assert ev.outcome == "full"
+        assert ev.reason == "book_walk_full"
+        # fair value (model-YES bid 0.55) minus the depth VWAP at the ask 0.543.
+        assert fae == pytest.approx(0.55 - 0.543)
+
+    def test_thin_book_yields_honest_partial_not_manufactured_full(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        """The honest book-walk fills only what is available at-or-below the
+        limit and STOPS at the 0.99 wall — it never crosses the limit to
+        manufacture a full fill (the phantom-alpha guardrail)."""
+        agent = self._agent(monkeypatch, tmp_path)
+        tick = _make_pm_tick(
+            yes_ask=0.543,
+            order_book_yes=[(0.543, 120.0), (0.99, 1000.0)],
+        )
+        edge = _make_edge_result(pm_tick=tick, best_side="buy_yes", edge=0.007)
+
+        fae, ev = agent._shadow_fill_for_rejection(edge, "conservative_edge")
+
+        assert ev is not None
+        assert ev.outcome == "partial"
+        assert ev.reason == "book_walk_partial"
+        # Only $120 of the $200 was lift-able at-or-below the limit; the wall
+        # at 0.99 was NOT crossed.
+        assert ev.fill_size_usd == pytest.approx(120.0)
+        assert fae == pytest.approx(0.55 - 0.543)
+
+    def test_empty_book_records_no_fill_reason_with_none_edge(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        """An empty crossed book is an honest no-fill — record the simulator
+        reason but NEVER invent a fill-adjusted edge."""
+        agent = self._agent(monkeypatch, tmp_path)
+        tick = _make_pm_tick(yes_ask=0.543, order_book_yes=[])
+        edge = _make_edge_result(pm_tick=tick, best_side="buy_yes", edge=0.007)
+
+        fae, ev = agent._shadow_fill_for_rejection(edge, "conservative_edge")
+
+        assert fae is None
+        assert ev is not None
+        assert ev.reason == "empty_book"
+
+    def test_buy_no_walks_the_no_book(self, monkeypatch, tmp_path) -> None:
+        agent = self._agent(monkeypatch, tmp_path)
+        # buy_no: limit = 1 - yes_bid = 0.60; walk the NO book at 0.60.
+        tick = _make_pm_tick(yes_bid=0.40, order_book_no=[(0.60, 500.0)])
+        edge = _make_edge_result(pm_tick=tick, best_side="buy_no", edge=0.02)
+
+        fae, ev = agent._shadow_fill_for_rejection(edge, "conservative_edge")
+
+        assert ev is not None
+        assert ev.outcome == "full"
+        # fair = 1 - model-YES ask (0.55) = 0.45; NO fill at 0.60 → negative.
+        assert fae == pytest.approx(0.45 - 0.60)
+
+    @pytest.mark.parametrize(
+        "reason_key",
+        ["no_positive_edge", "days_to_expiry", "empty_book", "range_product",
+         "pm_spread", "match_quality"],
+    )
+    def test_structural_rejections_are_not_walked(
+        self, monkeypatch, tmp_path, reason_key,
+    ) -> None:
+        agent = self._agent(monkeypatch, tmp_path)
+        edge = _make_edge_result(best_side="buy_yes", edge=0.02)
+        assert agent._shadow_fill_for_rejection(edge, reason_key) == (None, None)
+
+    def test_no_best_side_is_not_walked(self, monkeypatch, tmp_path) -> None:
+        agent = self._agent(monkeypatch, tmp_path)
+        edge = _make_edge_result(best_side=None, edge=0.0)
+        assert agent._shadow_fill_for_rejection(edge, "conservative_edge") == (
+            None, None,
+        )
+
+    def test_sub_noise_edge_is_not_walked(self, monkeypatch, tmp_path) -> None:
+        agent = self._agent(monkeypatch, tmp_path)
+        edge = _make_edge_result(best_side="buy_yes", edge=0.004)  # < 0.005 floor
+        assert agent._shadow_fill_for_rejection(edge, "conservative_edge") == (
+            None, None,
+        )
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_near_floor_rejection_persists_fill_adjusted_edge(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        """Re-creates the goal's observed gap: a sub-floor contract that hits
+        rejections.jsonl now carries a fill-adjusted edge via the SAME
+        book-walk, not just the passers that clear the floor."""
+        monkeypatch.setattr(
+            "btc_pm_arb.config.settings.paper_ledger_dir", str(tmp_path),
+        )
+        agent = Agent(dry_run=True)
+        agent.feed_health.record_tick(DataSource.DERIBIT)
+        agent.feed_health.record_tick(DataSource.KALSHI)
+
+        expiry = datetime.now(timezone.utc) + timedelta(days=7)
+        agent.cache.update(
+            strike=100_000.0, expiry=expiry,
+            bid_prob=0.55, ask_prob=0.55, mid_prob=0.55,
+            source=DataSource.DERIBIT,
+        )
+        # options mid 0.55, yes_ask 0.543 → conservative edge 0.007: above the
+        # 0.005 walk floor but below the 0.01 min_conservative_edge → rejected
+        # at the conservative_edge gate with a walkable book.
+        tick = _make_pm_tick(
+            expiry=expiry, yes_bid=0.538, yes_ask=0.543,
+            order_book_yes=[(0.543, 500.0)],
+        )
+        agent.ingest_pm_tick(tick)
+
+        await agent.run_scan_pipeline(agent.flush_pm_ticks())
+
+        rejections = list(agent.paper_ledger.replay_rejections())
+        assert len(rejections) == 1
+        rec = rejections[0]
+        assert rec.reason_key == "conservative_edge"
+        assert rec.fill_adjusted_edge == pytest.approx(0.55 - 0.543)
+        assert rec.fill_outcome == "full"
+        assert rec.fill_simulator_reason == "book_walk_full"
+        assert agent._funnel["shadow_fill_walked"] == 1

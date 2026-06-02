@@ -53,7 +53,11 @@ import uvicorn
 from btc_pm_arb.clock import SimulatedClock
 from btc_pm_arb.config import settings
 from btc_pm_arb.execution.benchmark_settlement import PaperBenchmarkSettler
-from btc_pm_arb.execution.fill_simulator import BookSnapshot, FillSimulator
+from btc_pm_arb.execution.fill_simulator import (
+    BookSnapshot,
+    FillEvaluation,
+    FillSimulator,
+)
 from btc_pm_arb.execution.orders import OrderManager, Order
 from btc_pm_arb.execution.paper_ledger import (
     BookLevel,
@@ -86,7 +90,7 @@ from btc_pm_arb.pricing.vol_surface import VolSurface
 from btc_pm_arb.server.app import create_app
 from btc_pm_arb.server.state import SharedState
 from btc_pm_arb.signals.confidence import ConfidenceScorer
-from btc_pm_arb.signals.edge import EdgeCalculator, EdgeResult
+from btc_pm_arb.signals.edge import EdgeCalculator, EdgeResult, model_yes_bounds
 from btc_pm_arb.signals.filters import FilterConfig, SignalFilter, _extract_reason_key
 from btc_pm_arb.signals.matcher import ContractMatcher
 from btc_pm_arb.signals.velocity import OddsVelocityTracker
@@ -97,6 +101,19 @@ _SCAN_INTERVAL_SECS: float = 5.0
 _ORDER_REFRESH_SECS: float = 30.0
 _BASE_SIZE_USD: float = 200.0
 _DASHBOARD_PORT: int = 8000
+
+# Rejection-path shadow fill (measurement infra): the reason_key buckets whose
+# rejections carry a meaningful would-be fill -- edge-economics gates where the
+# contract had a positive best_side and a book to walk but the edge fell below
+# (or near) the floor.  Structural rejections (no_positive_edge, range /
+# one_touch product, empty_book, stale, expiry, spread, match_quality, feed
+# staleness, ...) have no meaningful fill and are skipped.
+_SHADOW_FILL_REASON_KEYS: frozenset[str] = frozenset(
+    {"conservative_edge", "mid_edge", "regime_adjusted_edge"}
+)
+# Conservative-edge floor below which a rejection is pipeline noise not worth
+# book-walking (mirrors the goal's reason_key-in-set AND edge >= ~0.005 filter).
+_SHADOW_FILL_MIN_EDGE: float = 0.005
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -250,6 +267,13 @@ class Agent:
             # passing-signal contract_id that wasn't in the
             # edges_by_id / tick_by_contract lookups (a bug worth seeing).
             "paper_ledger_missing_originating_data": 0,
+            # Rejection-path shadow fill (measurement infra): how many
+            # near-floor rejections got a book-walked fill-adjusted edge, and
+            # how many were skipped because a malformed recorded book made the
+            # walk raise (additive path -- never disturbs the rejection
+            # decision; a non-zero error count is worth seeing).
+            "shadow_fill_walked": 0,
+            "shadow_fill_errors": 0,
         }
         # Replay paper-trading state from disk so positions and the orders
         # registry persist across restarts (the load-bearing
@@ -499,15 +523,36 @@ class Agent:
         # tracker at write time — consistent with _to_arbitrage_signal's
         # source-side for the passing-signal path.
         for _edge, _reason in rejected:
+            _reason_key = _extract_reason_key(_reason)
+            # Measurement infra (additive): near-floor edge-economics
+            # rejections get a fill-adjusted edge via the SAME book-walk placed
+            # orders use, so the [1-3%) band carries an honest depth-aware fill
+            # estimate instead of only the 1-2 contracts that clear the floor.
+            # The contract STAYS rejected -- nothing here changes the gate
+            # outcome.  None for rejections outside the band (no meaningful
+            # fill).
+            _fae, _evaluation = self._shadow_fill_for_rejection(_edge, _reason_key)
+            if _evaluation is not None:
+                self._funnel["shadow_fill_walked"] += 1
             self.paper_ledger.append_rejection(
                 PaperRejectionRecord(
                     timestamp=_edge.timestamp,
                     contract_id=_edge.match.pm_tick.contract_id,
                     platform=_edge.match.pm_tick.source,
-                    reason_key=_extract_reason_key(_reason),
+                    reason_key=_reason_key,
                     full_reason=_reason,
                     best_conservative_edge=_edge.best_conservative_edge,
                     vol_regime=self.rv_tracker.current_regime().value,
+                    fill_adjusted_edge=_fae,
+                    fill_simulator_reason=(
+                        _evaluation.reason if _evaluation is not None else None
+                    ),
+                    fill_outcome=(
+                        _evaluation.outcome if _evaluation is not None else None
+                    ),
+                    fill_size_usd=(
+                        _evaluation.fill_size_usd if _evaluation is not None else None
+                    ),
                 )
             )
 
@@ -566,6 +611,71 @@ class Agent:
                             edge_result=originating_edge,
                             tick=originating_tick,
                         )
+
+    def _shadow_fill_for_rejection(
+        self, edge: EdgeResult, reason_key: str,
+    ) -> tuple[float | None, FillEvaluation | None]:
+        """Compute the would-be fill-adjusted edge for a near-floor rejection.
+
+        Measurement infra (additive): the contract STAYS rejected — this only
+        records what its fill WOULD have been, so the near-floor band carries a
+        depth-aware fill estimate instead of only the 1-2 contracts that clear
+        the floor.  Reuses the SAME ``self.fill_simulator`` book-walk and the
+        SAME side / limit_price / size derivation as the placed-order path
+        (``OrderManager.place`` orders.py:446-449 + ``_record_paper_order``);
+        it is NOT a second, more optimistic fill model.
+
+        Returns ``(None, None)`` for rejections outside the edge-economics band
+        (reason_key not in the set, no positive ``best_side``, or sub-noise
+        edge) — no meaningful fill.  For a walked rejection returns
+        ``(fill_adjusted_edge, evaluation)`` where ``fill_adjusted_edge`` is the
+        model fair value minus the book-walked fill price, or ``None`` when the
+        walk did not fill (empty / limit-below book) — never a manufactured
+        positive edge.
+        """
+        if (
+            reason_key not in _SHADOW_FILL_REASON_KEYS
+            or edge.best_side is None
+            or edge.best_conservative_edge < _SHADOW_FILL_MIN_EDGE
+        ):
+            return None, None
+        try:
+            side = "yes" if edge.best_side == "buy_yes" else "no"
+            pm = edge.match.pm_quote
+            # IDENTICAL limit-price derivation to OrderManager.place
+            # (orders.py:446-449): a buy_yes lifts the YES ask; a buy_no lifts
+            # the implied NO ask (1 - YES bid).
+            limit_price = pm.ask_prob if side == "yes" else (1.0 - pm.bid_prob)
+            snapshot = BookSnapshot.from_tick(edge.match.pm_tick)
+            evaluation = self.fill_simulator.evaluate(
+                side=side,  # type: ignore[arg-type]
+                limit_price=limit_price,
+                size_usd=_BASE_SIZE_USD,
+                snapshot=snapshot,
+            )
+        except Exception:
+            # Additive measurement path must never disturb the scan pipeline or
+            # the (unchanged) rejection decision.  A malformed recorded book
+            # yields no shadow fill; deterministic given the recorded inputs.
+            self._funnel["shadow_fill_errors"] += 1
+            log.warning(
+                "shadow_fill.error",
+                contract_id=edge.match.pm_tick.contract_id,
+                reason_key=reason_key,
+            )
+            return None, None
+        if evaluation.fill_price is None:
+            # Honest no-fill (empty book / limit below the whole book): record
+            # the simulator reason, but no fill-adjusted edge — do NOT invent
+            # one against an empty near-mid book.
+            return None, evaluation
+        # Fair value mirrors edge._compute_fill_adjusted_edge: raw model-YES
+        # lower bound for a buy_yes, (1 - upper bound) for a buy_no.  Only the
+        # fill PRICE differs from the passing-order path — and that price comes
+        # from the same honest book-walk.
+        my_bid, my_ask = model_yes_bounds(edge.match)
+        fair = my_bid if side == "yes" else (1.0 - my_ask)
+        return fair - evaluation.fill_price, evaluation
 
     def _record_paper_order(
         self,

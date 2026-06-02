@@ -217,6 +217,64 @@ def test_book_snapshot_from_order_record_round_trip():
     assert snap.order_book_no == (BookLevel(price=0.55, size_usd=300.0),)
 
 
+# ── BookSnapshot.from_tick ────────────────────────────────────────────────────
+
+
+def test_book_snapshot_from_tick_converts_tuple_levels_to_book_levels():
+    """``from_tick`` converts the tick's raw ``(price, size)`` tuples into
+    ``BookLevel`` instances — the IDENTICAL conversion the placed-order path
+    applies — so the rejection-path shadow fill walks the same snapshot shape.
+
+    Structural type: a duck-typed stand-in with the tick's field names is
+    accepted (mirrors ``from_order_record``'s structural protocol)."""
+    from types import SimpleNamespace
+
+    tick = SimpleNamespace(
+        yes_bid=0.40,
+        yes_ask=0.42,
+        no_bid=0.58,
+        no_ask=0.60,
+        order_book_yes=[(0.42, 500.0), (0.45, 300.0)],
+        order_book_no=[(0.60, 250.0)],
+    )
+    snap = BookSnapshot.from_tick(tick)
+    assert snap.yes_bid == 0.40
+    assert snap.yes_ask == 0.42
+    assert snap.no_bid == 0.58
+    assert snap.no_ask == 0.60
+    assert snap.order_book_yes == (
+        BookLevel(price=0.42, size_usd=500.0),
+        BookLevel(price=0.45, size_usd=300.0),
+    )
+    assert snap.order_book_no == (BookLevel(price=0.60, size_usd=250.0),)
+
+
+def test_book_snapshot_from_tick_feeds_the_same_book_walk_as_orders():
+    """A snapshot built via ``from_tick`` walks identically to one built from
+    an order record — the rejection path reuses the placed-order book-walk."""
+    from types import SimpleNamespace
+
+    tick = SimpleNamespace(
+        yes_bid=0.40,
+        yes_ask=0.42,
+        no_bid=0.58,
+        no_ask=0.60,
+        order_book_yes=[(0.42, 120.0), (0.50, 1000.0)],
+        order_book_no=[],
+    )
+    sim = FillSimulator(book_walk=True)
+    # limit at the ask: only the $120 at 0.42 is lift-able; the 0.50 level is
+    # above the limit and must NOT be crossed (no manufactured full fill).
+    ev = sim.evaluate(
+        side="yes", limit_price=0.42, size_usd=200.0,
+        snapshot=BookSnapshot.from_tick(tick),
+    )
+    assert ev.outcome == "partial"
+    assert ev.reason == "book_walk_partial"
+    assert ev.fill_size_usd == pytest.approx(120.0)
+    assert ev.fill_price == pytest.approx(0.42)
+
+
 # ── build_fill_record materialisation ─────────────────────────────────────────
 
 
