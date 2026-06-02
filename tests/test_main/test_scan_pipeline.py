@@ -593,3 +593,159 @@ class TestShadowFillForRejection:
         assert rec.fill_outcome == "full"
         assert rec.fill_simulator_reason == "book_walk_full"
         assert agent._funnel["shadow_fill_walked"] == 1
+
+
+# ── Rejection-path chase fill (#1 UNCAPPED completion cost) ───────────────────
+
+
+class TestChaseFillForRejection:
+    """``Agent._chase_adjusted_edge_for_rejection`` computes the UNCAPPED #1
+    'chase-into-the-wall' edge via the SAME ``edge.fill_adjusted_price``
+    book-walk orders.jsonl uses for placed orders.  It rides ALONGSIDE the
+    capped #2 shadow fill (``_shadow_fill_for_rejection``, unchanged); unlike #2
+    it CAN go negative.  A negative result is a CORRECTLY-REJECTED LOSER
+    (completing the contract loses money), NOT a missed signal."""
+
+    def _agent(self, monkeypatch, tmp_path) -> Agent:
+        monkeypatch.setattr(
+            "btc_pm_arb.config.settings.paper_ledger_dir", str(tmp_path),
+        )
+        return Agent(dry_run=True)
+
+    def test_chase_walks_through_the_wall_to_a_negative_edge(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        """Hand-worked walk-into-the-wall: $120 lifts at the ask 0.543, the
+        remaining $80 of the $200 size completes against the 0.99 wall -> the
+        completion VWAP (0.7218) is dragged far above the 0.55 fair value, so
+        the chase-adjusted edge is NEGATIVE.  This is the +theoretical ->
+        -completion collapse the capped #2 model structurally cannot show."""
+        agent = self._agent(monkeypatch, tmp_path)
+        tick = _make_pm_tick(
+            yes_bid=0.538, yes_ask=0.543,
+            order_book_yes=[(0.543, 120.0), (0.99, 1000.0)],
+        )
+        edge = _make_edge_result(pm_tick=tick, best_side="buy_yes", edge=0.007)
+
+        chase = agent._chase_adjusted_edge_for_rejection(edge)
+
+        # VWAP = (120*0.543 + 80*0.99) / 200 = 0.7218; fair = model-YES bid 0.55.
+        expected_vwap = (120 * 0.543 + 80 * 0.99) / 200.0
+        assert chase == pytest.approx(0.55 - expected_vwap)
+        assert chase < 0  # correctly-rejected loser: completing it loses money
+
+    def test_chase_and_capped_coexist_and_disagree_capped_stays_positive(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        """On the SAME near-floor rejection #1 (uncapped) goes negative while
+        #2 (capped) stays positive -- both models coexist, and #2 is unchanged
+        from 4df1bcf (still a non-negative partial fill at the limit)."""
+        agent = self._agent(monkeypatch, tmp_path)
+        tick = _make_pm_tick(
+            yes_bid=0.538, yes_ask=0.543,
+            order_book_yes=[(0.543, 120.0), (0.99, 1000.0)],
+        )
+        edge = _make_edge_result(pm_tick=tick, best_side="buy_yes", edge=0.007)
+
+        fae, ev = agent._shadow_fill_for_rejection(edge, "conservative_edge")
+        chase = agent._chase_adjusted_edge_for_rejection(edge)
+
+        # #2 CAPPED: stops at the limit (0.543), partial fill, never negative.
+        assert ev is not None
+        assert ev.outcome == "partial"
+        assert fae == pytest.approx(0.55 - 0.543)
+        assert fae > 0
+        # #1 UNCAPPED: completes through the wall -> strictly worse, negative.
+        assert chase < 0
+        assert chase < fae
+
+    def test_chase_walks_the_no_book_for_buy_no(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        agent = self._agent(monkeypatch, tmp_path)
+        # buy_no completes against the NO book; a wall at 0.99 drags it negative.
+        tick = _make_pm_tick(
+            yes_bid=0.40,
+            order_book_no=[(0.60, 120.0), (0.99, 1000.0)],
+        )
+        edge = _make_edge_result(pm_tick=tick, best_side="buy_no", edge=0.02)
+
+        chase = agent._chase_adjusted_edge_for_rejection(edge)
+
+        # fair = 1 - model-YES ask (0.55) = 0.45; VWAP completes through 0.99.
+        expected_vwap = (120 * 0.60 + 80 * 0.99) / 200.0
+        assert chase == pytest.approx(0.45 - expected_vwap)
+        assert chase < 0
+
+    def test_deep_book_with_no_wall_stays_positive_not_clipped(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        """Anti-phantom symmetry: a deep book at the ask completes the full
+        size at the ask price, so #1 equals #2 here and is honestly positive --
+        the model is not biased negative, it just chases when the wall exists."""
+        agent = self._agent(monkeypatch, tmp_path)
+        tick = _make_pm_tick(yes_ask=0.543, order_book_yes=[(0.543, 500.0)])
+        edge = _make_edge_result(pm_tick=tick, best_side="buy_yes", edge=0.007)
+
+        chase = agent._chase_adjusted_edge_for_rejection(edge)
+
+        assert chase == pytest.approx(0.55 - 0.543)
+        assert chase > 0
+
+    def test_thin_whole_book_is_an_honest_no_fill(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        """When the WHOLE book cannot complete the size, the uncapped walk
+        honestly returns None -- never an invented edge."""
+        agent = self._agent(monkeypatch, tmp_path)
+        # Only $50 of depth total; the $200 size cannot complete.
+        tick = _make_pm_tick(yes_ask=0.543, order_book_yes=[(0.543, 50.0)])
+        edge = _make_edge_result(pm_tick=tick, best_side="buy_yes", edge=0.007)
+
+        assert agent._chase_adjusted_edge_for_rejection(edge) is None
+
+    @pytest.mark.asyncio
+    async def test_end_to_end_rejection_persists_both_chase_and_capped(
+        self, monkeypatch, tmp_path,
+    ) -> None:
+        """A near-floor rejection now carries BOTH #1 (chase_adjusted_edge, can
+        go negative) and #2 (fill_adjusted_edge, capped) on the same record.
+        The #2 fields are unchanged from 4df1bcf; #1 is the new column."""
+        monkeypatch.setattr(
+            "btc_pm_arb.config.settings.paper_ledger_dir", str(tmp_path),
+        )
+        agent = Agent(dry_run=True)
+        agent.feed_health.record_tick(DataSource.DERIBIT)
+        agent.feed_health.record_tick(DataSource.KALSHI)
+
+        expiry = datetime.now(timezone.utc) + timedelta(days=7)
+        agent.cache.update(
+            strike=100_000.0, expiry=expiry,
+            bid_prob=0.55, ask_prob=0.55, mid_prob=0.55,
+            source=DataSource.DERIBIT,
+        )
+        # conservative edge 0.007 (rejected at the 0.01 gate; walked above the
+        # 0.005 floor).  YES book lifts $120 at the ask 0.543 then hits the
+        # 0.99 wall: #2 partial+positive, #1 completes-through-wall negative.
+        tick = _make_pm_tick(
+            expiry=expiry, yes_bid=0.538, yes_ask=0.543,
+            order_book_yes=[(0.543, 120.0), (0.99, 1000.0)],
+        )
+        agent.ingest_pm_tick(tick)
+
+        await agent.run_scan_pipeline(agent.flush_pm_ticks())
+
+        rejections = list(agent.paper_ledger.replay_rejections())
+        assert len(rejections) == 1
+        rec = rejections[0]
+        assert rec.reason_key == "conservative_edge"
+        # #2 CAPPED unchanged: partial fill at the limit, positive.
+        assert rec.fill_adjusted_edge == pytest.approx(0.55 - 0.543)
+        assert rec.fill_outcome == "partial"
+        assert rec.fill_simulator_reason == "book_walk_partial"
+        # #1 UNCAPPED: completes through the wall -> negative loser.
+        expected_vwap = (120 * 0.543 + 80 * 0.99) / 200.0
+        assert rec.chase_adjusted_edge == pytest.approx(0.55 - expected_vwap)
+        assert rec.chase_adjusted_edge < 0
+        assert agent._funnel["shadow_fill_walked"] == 1
+        assert agent._funnel["chase_fill_walked"] == 1

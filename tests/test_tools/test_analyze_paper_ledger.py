@@ -32,6 +32,7 @@ from tools.analyze_paper_ledger import (
     assign_conservative_edge_bucket,
     assign_fill_adjusted_edge_bucket,
     build_joined_dataframe,
+    chase_adjusted_band_distribution,
     fill_adjusted_band_distribution,
     filter_as_of,
     load_jsonl,
@@ -153,6 +154,7 @@ def _make_rejection(
     fill_outcome: str | None = None,
     fill_simulator_reason: str | None = None,
     fill_size_usd: float | None = None,
+    chase_adjusted_edge: float | None = None,
     run_id: str = "",
     contract_id: str = "KX-REJ-1",
 ) -> PaperRejectionRecord:
@@ -168,6 +170,7 @@ def _make_rejection(
         fill_outcome=fill_outcome,  # type: ignore[arg-type]
         fill_simulator_reason=fill_simulator_reason,
         fill_size_usd=fill_size_usd,
+        chase_adjusted_edge=chase_adjusted_edge,
         run_id=run_id,
     )
 
@@ -1078,3 +1081,159 @@ class TestMainEmitsFillAdjustedBand:
         by_bucket = {row["bucket"]: row for row in band["buckets"]}
         assert by_bucket["<-5%"]["n"] == 1
         assert by_bucket["1-3%"]["n"] == 1
+
+
+# ── Chase-adjusted band distribution (#1 UNCAPPED completion cost) ────────────
+
+
+class TestChaseAdjustedBandDistribution:
+    """``chase_adjusted_band_distribution`` buckets the UNCAPPED #1 edge across
+    the full signed axis -- INCLUDING the negative buckets the capped #2 band
+    never reaches -- and carries #2's partial-fill rate per bucket side by side.
+    A negative bucket is a CORRECTLY-REJECTED LOSER, not a missed signal."""
+
+    def test_negatives_land_in_negative_buckets_with_capped_rate_side_by_side(
+        self,
+    ) -> None:
+        rejections = [
+            # #1 chase collapsed deep negative; #2 capped stayed a positive
+            # partial fill -- the two coexist and disagree by design.
+            _make_rejection(
+                chase_adjusted_edge=-0.17, fill_adjusted_edge=0.007,
+                fill_outcome="partial", best_conservative_edge=0.007,
+            ),
+            # Another negative; #2 was a full fill here.
+            _make_rejection(
+                chase_adjusted_edge=-0.06, fill_adjusted_edge=0.02,
+                fill_outcome="full", best_conservative_edge=0.025,
+            ),
+            # #1 stayed positive (deep book, no wall) -> non-negative bucket.
+            _make_rejection(
+                chase_adjusted_edge=0.012, fill_adjusted_edge=0.012,
+                fill_outcome="full", best_conservative_edge=0.012,
+            ),
+            # #1 no_fill (whole book too thin to complete the size).
+            _make_rejection(
+                chase_adjusted_edge=None, fill_adjusted_edge=None,
+                fill_outcome="no_fill", fill_simulator_reason="empty_book",
+                best_conservative_edge=0.02,
+            ),
+            # NOT walked (structural rejection) -> excluded from the band.
+            _make_rejection(
+                reason_key="no_positive_edge", best_conservative_edge=0.0,
+            ),
+        ]
+        chase = chase_adjusted_band_distribution(rejections)
+
+        assert chase["n_walked"] == 4
+        assert chase["n_chase_negative"] == 2
+        assert chase["n_chase_nonneg"] == 1
+        assert chase["n_chase_no_fill"] == 1
+        # The labeling guardrail is stamped into the JSON so a future reader
+        # cannot misread the negative buckets as missed signals.
+        assert "CORRECTLY-REJECTED LOSER" in chase["legend"]
+
+        by_bucket = {row["bucket"]: row for row in chase["buckets"]}
+        # Both -0.17 and -0.06 fall in the "<-5%" bucket.
+        assert by_bucket["<-5%"]["n"] == 2
+        assert by_bucket["<-5%"]["mean_chase_adjusted_edge"] == pytest.approx(
+            (-0.17 + -0.06) / 2
+        )
+        # #2's partial-fill rate per bucket, side by side: one of the two
+        # negative-#1 rejections was a #2 partial fill.
+        assert by_bucket["<-5%"]["n_partial"] == 1
+        assert by_bucket["<-5%"]["partial_fill_rate"] == pytest.approx(0.5)
+        assert by_bucket["<-5%"]["mean_fill_adjusted_edge"] == pytest.approx(
+            (0.007 + 0.02) / 2
+        )
+        # The positive #1 lands in the 1-3% bucket (never clipped/merged).
+        assert by_bucket["1-3%"]["n"] == 1
+        assert by_bucket["1-3%"]["mean_chase_adjusted_edge"] == pytest.approx(0.012)
+        # no_fill #1 -> the "no_fill" bucket, no edge to place.
+        assert by_bucket["no_fill"]["n"] == 1
+        assert by_bucket["no_fill"]["mean_chase_adjusted_edge"] is None
+
+    def test_negative_is_reported_as_is_never_clipped_to_zero(self) -> None:
+        """Anti-phantom: a negative #1 edge is reported verbatim -- the band
+        must never floor it to look better."""
+        chase = chase_adjusted_band_distribution([
+            _make_rejection(
+                chase_adjusted_edge=-0.2003, fill_adjusted_edge=0.006,
+                fill_outcome="partial", best_conservative_edge=0.006,
+            ),
+        ])
+        by_bucket = {row["bucket"]: row for row in chase["buckets"]}
+        assert by_bucket["<-5%"]["mean_chase_adjusted_edge"] == pytest.approx(-0.2003)
+        assert chase["n_chase_negative"] == 1
+
+    def test_empty_input(self) -> None:
+        chase = chase_adjusted_band_distribution([])
+        assert chase["n_walked"] == 0
+        assert chase["n_chase_negative"] == 0
+        # Every bucket present with zero count (stable schema for the campaign).
+        assert all(row["n"] == 0 for row in chase["buckets"])
+
+
+class TestMainEmitsChaseBand:
+    def test_main_nests_chase_band_alongside_capped_band(
+        self, tmp_path: Path,
+    ) -> None:
+        """End-to-end: main() nests the #1 chase band under the same
+        fill_adjusted_band.json sidecar as the #2 band (summary_stats.json
+        untouched), with the negatives in the negative buckets."""
+        from tests.test_tools.test_analyze_paper_ledger_9b2 import (
+            _synthesize_settled_ledger,
+        )
+
+        ledger_dir = tmp_path / "ledger"
+        out_dir = tmp_path / "out"
+        ledger_dir.mkdir()
+
+        orders, fills, settlements = _synthesize_settled_ledger(n=10)
+        _write_records(ledger_dir / "orders.jsonl", orders)
+        _write_records(ledger_dir / "fills.jsonl", fills)
+        _write_records(ledger_dir / "settlements.jsonl", settlements)
+        _write_records(ledger_dir / "rejections.jsonl", [
+            # #1 negative (loser) while #2 capped stayed a positive partial.
+            _make_rejection(
+                chase_adjusted_edge=-0.17, fill_adjusted_edge=0.007,
+                fill_outcome="partial", fill_simulator_reason="book_walk_partial",
+                best_conservative_edge=0.007,
+            ),
+            # #1 positive near-floor.
+            _make_rejection(
+                chase_adjusted_edge=0.012, fill_adjusted_edge=0.012,
+                fill_outcome="full", fill_simulator_reason="book_walk_full",
+                best_conservative_edge=0.012,
+            ),
+            _make_rejection(
+                reason_key="no_positive_edge", best_conservative_edge=0.0,
+            ),
+        ])
+
+        rc = main([
+            "--ledger-dir", str(ledger_dir), "--out-dir", str(out_dir),
+            "--run-id", "all",
+        ])
+        assert rc == 0
+
+        band = json.loads(
+            (out_dir / "fill_adjusted_band.json").read_text(encoding="utf-8")
+        )
+        # The #2 band is still present and unchanged alongside the new chase.
+        assert band["n_walked"] == 2
+        assert "chase" in band
+        chase = band["chase"]
+        assert chase["n_walked"] == 2
+        assert chase["n_chase_negative"] == 1
+        assert "CORRECTLY-REJECTED LOSER" in chase["legend"]
+        by_bucket = {row["bucket"]: row for row in chase["buckets"]}
+        assert by_bucket["<-5%"]["n"] == 1
+        assert by_bucket["<-5%"]["partial_fill_rate"] == pytest.approx(1.0)
+        assert by_bucket["1-3%"]["n"] == 1
+
+        # summary_stats.json schema is untouched (no chase keys leaked in).
+        summary = json.loads(
+            (out_dir / "summary_stats.json").read_text(encoding="utf-8")
+        )
+        assert "chase" not in summary

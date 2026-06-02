@@ -90,7 +90,12 @@ from btc_pm_arb.pricing.vol_surface import VolSurface
 from btc_pm_arb.server.app import create_app
 from btc_pm_arb.server.state import SharedState
 from btc_pm_arb.signals.confidence import ConfidenceScorer
-from btc_pm_arb.signals.edge import EdgeCalculator, EdgeResult, model_yes_bounds
+from btc_pm_arb.signals.edge import (
+    EdgeCalculator,
+    EdgeResult,
+    fill_adjusted_price,
+    model_yes_bounds,
+)
 from btc_pm_arb.signals.filters import FilterConfig, SignalFilter, _extract_reason_key
 from btc_pm_arb.signals.matcher import ContractMatcher
 from btc_pm_arb.signals.velocity import OddsVelocityTracker
@@ -274,6 +279,13 @@ class Agent:
             # decision; a non-zero error count is worth seeing).
             "shadow_fill_walked": 0,
             "shadow_fill_errors": 0,
+            # Rejection-path chase fill (#1, UNCAPPED completion cost): how many
+            # of the SAME in-band near-floor rejections also carry a
+            # chase-adjusted edge (book walked to completion through the wall),
+            # and how many were skipped because the uncapped walk raised.
+            # Additive measurement path -- never disturbs the rejection decision.
+            "chase_fill_walked": 0,
+            "chase_fill_errors": 0,
         }
         # Replay paper-trading state from disk so positions and the orders
         # registry persist across restarts (the load-bearing
@@ -532,8 +544,20 @@ class Agent:
             # outcome.  None for rejections outside the band (no meaningful
             # fill).
             _fae, _evaluation = self._shadow_fill_for_rejection(_edge, _reason_key)
+            # #1 (UNCAPPED chase) rides ALONGSIDE #2 (capped passive fill) on
+            # the IDENTICAL in-band set: ``_evaluation is not None`` is exactly
+            # "the rejection passed the #2 filter and the book-walk did not
+            # raise", so #1 is computed for the same near-floor rejections #2 is
+            # -- never independently re-filtered, so the two can never drift
+            # apart.  #1 is the primary fill-adjusted edge for the Jun 5 capture
+            # (it CAN go negative, exposing correctly-rejected losers); #2 is
+            # untouched.
+            _chase: float | None = None
             if _evaluation is not None:
                 self._funnel["shadow_fill_walked"] += 1
+                _chase = self._chase_adjusted_edge_for_rejection(_edge)
+                if _chase is not None:
+                    self._funnel["chase_fill_walked"] += 1
             self.paper_ledger.append_rejection(
                 PaperRejectionRecord(
                     timestamp=_edge.timestamp,
@@ -553,6 +577,7 @@ class Agent:
                     fill_size_usd=(
                         _evaluation.fill_size_usd if _evaluation is not None else None
                     ),
+                    chase_adjusted_edge=_chase,
                 )
             )
 
@@ -676,6 +701,66 @@ class Agent:
         my_bid, my_ask = model_yes_bounds(edge.match)
         fair = my_bid if side == "yes" else (1.0 - my_ask)
         return fair - evaluation.fill_price, evaluation
+
+    def _chase_adjusted_edge_for_rejection(
+        self, edge: EdgeResult,
+    ) -> float | None:
+        """Compute the UNCAPPED 'chase-into-the-wall' fill-adjusted edge (#1).
+
+        Companion to ``_shadow_fill_for_rejection`` (#2), NOT a replacement.
+        Called ONLY for the in-band near-floor set #2 already accepted (the
+        caller gates on ``_shadow_fill_for_rejection`` returning an evaluation),
+        so #1 and #2 measure the IDENTICAL rejections.
+
+        Where #2 caps the book-walk at the limit (passive fill: never crosses
+        the price, never negative, a thin book shows up as a partial-fill rate),
+        #1 reuses the SAME uncapped book-walker placed orders use --
+        ``signals.edge.fill_adjusted_price`` -- which walks the WHOLE book to
+        COMPLETE the full size, crossing the 0.99 wall.  The side / size
+        derivation is identical to #2 (``buy_yes`` -> the YES book, ``buy_no``
+        -> the NO book; ``_BASE_SIZE_USD``); only the cap differs.  The fair
+        value is the same ``model_yes_bounds`` value #2 uses, so #1 and #2 share
+        a fair value and differ ONLY in fill price -- exactly the relationship
+        between ``orders.jsonl``'s fill_adjusted_edge and a placed order.
+
+        Returns the chase-adjusted edge ``fair - completion_vwap``.  Because the
+        walk chases through the wall to fill, this CAN BE NEGATIVE; the negative
+        is returned AS-IS and never clipped at zero -- a negative result is a
+        CORRECTLY-REJECTED LOSER (completing the contract loses money), not a
+        missed signal.  Returns ``None`` for an honest no-fill (whole book too
+        thin to complete the size) -- never a manufactured edge.
+        """
+        try:
+            side = "yes" if edge.best_side == "buy_yes" else "no"
+            # IDENTICAL side->book mapping as edge._compute_fill_adjusted_edge:
+            # a buy_yes walks the YES book, a buy_no walks the NO book.
+            book = (
+                edge.match.pm_tick.order_book_yes
+                if side == "yes"
+                else edge.match.pm_tick.order_book_no
+            )
+            # UNCAPPED: fill_adjusted_price walks every level to fill the full
+            # size (returns None only if the whole book cannot) -- it does NOT
+            # stop at the limit, so the 0.99 wall drags the completion VWAP up.
+            chase_fill_price = fill_adjusted_price(book, size_usd=_BASE_SIZE_USD)
+        except Exception:
+            # Additive measurement path: a malformed recorded book must never
+            # disturb the (unchanged) rejection decision -- yields no chase edge.
+            self._funnel["chase_fill_errors"] += 1
+            log.warning(
+                "chase_fill.error",
+                contract_id=edge.match.pm_tick.contract_id,
+            )
+            return None
+        if chase_fill_price is None:
+            # Honest no-fill: the whole book is too thin to complete the size.
+            # Do NOT invent an edge.
+            return None
+        my_bid, my_ask = model_yes_bounds(edge.match)
+        fair = my_bid if side == "yes" else (1.0 - my_ask)
+        # Returned as-is: a negative completion cost is the POINT (a
+        # correctly-rejected loser), never clipped to look better.
+        return fair - chase_fill_price
 
     def _record_paper_order(
         self,
