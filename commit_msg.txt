@@ -1,28 +1,36 @@
-feat(dashboard): one-click Windows launcher (dashboard.bat)
+docs(diag): Signal-seam diagnosis -- hard gate fired, passthrough not implemented
 
-P2 of the dashboard-launcher goal. The dashboard runs in-process with the
-agent, so the whole startup is a single command. dashboard.bat wraps it for
-double-click use from Explorer:
+Phase 1 findings for the "Signal seam as single-signal passthrough"
+goal. The diagnosis located the options-implied probability producer
+and traced every handoff to the contract-matching/edge step, then hit
+both stop conditions of the phase's hard gate, so Phases 2 and 3 were
+not started and no source code was changed.
 
-- cd to the repo root (%~dp0), default mode paper.
-- Background-poll /api/health, then open the default browser at the SPA once
-  it answers 200 (falls back to opening after ~30s).
-- Foreground-run `py -3.12 -m btc_pm_arb.main`; closing the window (or Ctrl+C)
-  tears the agent + dashboard down together. goto end guards stop the paper
-  path from falling through into the replay block.
-- `dashboard.bat replay` runs the headless deterministic replay (no dashboard,
-  by design). "live" is intentionally NOT a launch option -- real-money is a
-  guarded runtime toggle, not a CLI flag.
-- HOST/PORT/token hoisted to the top so a later server deploy is a config
-  change (plus the 127.0.0.1 bind in main.py), not a rewrite. Localhost only.
+Producer: DigitalPricer.price_from_surface (pricing/digital_pricer.py:101)
+already returns DigitalPrice, a frozen dataclass carrying the
+(bid, mid, ask) probability triple plus method. The single handoff
+point is main.py:412-423 (update_cache_from_surface -> cache.update),
+and every downstream hop is already typed: CacheEntry ->
+MatchResult.options_entry -> EdgeResult -> ArbitrageSignal/
+ProbabilityQuote. A new frozen Signal dataclass would duplicate an
+existing typed carrier, not introduce a missing seam.
 
-Tests: test_launcher.py -- static contract checks of the .bat (runs the right
-module, polls health, opens the browser, binds localhost only, ASCII). Kept
-network-free so they are deterministic under pytest-randomly. The runtime
-"dashboard responds on localhost" invariant is covered by test_dashboard.py
-(test_health / test_spa_served_at_root).
+Confidence is not produced at that boundary at all: it is computed
+post-filter (main.py:502) by ConfidenceScorer.score from edge-step
+outputs (edge_persistence, match_quality, book depth, options spread,
+SVI fit RMSE) and backfilled onto passing ArbitrageSignals only.
+Probability (per strike/expiry grid point, pre-match) and confidence
+(per passing signal, post-filter) never co-exist at a producer
+boundary, so a Signal{estimated_prob, confidence} passthrough cannot
+be wired without moving confidence upstream (semantic change),
+stamping a placeholder (already modelled by ArbitrageSignal's 0.5
+default), or collapsing the bid/mid/ask triple into one scalar (lossy
+for the conservative-edge math). All three are refactors, which the
+gate forbids.
 
-No trading behavior changed; the launcher only starts/stops the existing
-entry point and reads state.
+The replay path was verified to reuse the identical seams
+(feeds/replay.py:372-374); no parallel pipeline recomputes either
+value. Full field inventory at the boundary and the typed-carrier
+chain are recorded in docs/diag_signalseam.md.
 
-Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
