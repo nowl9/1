@@ -1,36 +1,60 @@
-docs(diag): Signal-seam diagnosis -- hard gate fired, passthrough not implemented
+test(risk): Phase 3 verification -- 21 tests pin every cap, scope, and run_id boundary
 
-Phase 1 findings for the "Signal seam as single-signal passthrough"
-goal. The diagnosis located the options-implied probability producer
-and traced every handoff to the contract-matching/edge step, then hit
-both stop conditions of the phase's hard gate, so Phases 2 and 3 were
-not started and no source code was changed.
+Phase 3 of the risk-limit goal (Phase 1 diagnosis: 808019e; Phase 2
+implementation: 6a838bf).  Adds tests/test_execution/test_risk_limits.py
+(21 tests) plus review-driven hardening of the Phase 2 code, all confined
+to lines this goal itself introduced -- vs the cb2c05e base, git numstat
+shows zero deletions on every touched file.
 
-Producer: DigitalPricer.price_from_surface (pricing/digital_pricer.py:101)
-already returns DigitalPrice, a frozen dataclass carrying the
-(bid, mid, ask) probability triple plus method. The single handoff
-point is main.py:412-423 (update_cache_from_surface -> cache.update),
-and every downstream hop is already typed: CacheEntry ->
-MatchResult.options_entry -> EdgeResult -> ArbitrageSignal/
-ProbabilityQuote. A new frozen Signal dataclass would duplicate an
-existing typed carrier, not introduce a missing seam.
+Coverage maps 1:1 onto the success criteria.  check_risk units: each cap
+breach returns the correct first-breach reason, within-cap returns
+(True, ""), exactly-at-cap is allowed for the exposure caps (strict >)
+while exactly-at-loss trips the daily brake (<=).  build_portfolio_state
+units: run-scoped fill accumulation across sides and markets, the
+tracker's exact skip rules (no_fill / None-price / non-positive-size,
+now with POSITIVE sizes on the must-skip records so deleting a rule
+breaks the test -- the first draft was near-tautological per adversarial
+review), settlements closing a triple out of exposure, the today-only
+realized-P&L window, and exclusion of both other-run and None-tagged
+(run_id="") records.  Integration through run_scan_pipeline: each of the
+three caps blocks an otherwise-passing intent with exactly one
+run_id-stamped risk_block record and no order/fill/position; within-cap
+intents place exactly as the pre-risk-layer pipeline did; cross-run
+records seeded at breach levels for ALL THREE caps simultaneously do not
+block anything (the prior 137 None-tagged-record misread, pinned
+end-to-end); a persistent breach blocks once per re-arriving intent.
 
-Confidence is not produced at that boundary at all: it is computed
-post-filter (main.py:502) by ConfidenceScorer.score from edge-step
-outputs (edge_persistence, match_quality, book depth, options spread,
-SVI fit RMSE) and backfilled onto passing ArbitrageSignals only.
-Probability (per strike/expiry grid point, pre-match) and confidence
-(per passing signal, post-filter) never co-exist at a producer
-boundary, so a Signal{estimated_prob, confidence} passthrough cannot
-be wired without moving confidence upstream (semantic change),
-stamping a placeholder (already modelled by ArbitrageSignal's 0.5
-default), or collapsing the bid/mid/ask triple into one scalar (lossy
-for the conservative-edge math). All three are refactors, which the
-gate forbids.
+Three review-found test gaps are now pinned with discriminating tests:
+(1) the is_duplicate gate -- an already-placed signal re-arriving after
+caps tighten produces NO risk_block (place() dedupes it; removing the
+gate fails the test); (2) ordering -- an edge-rejected signal never
+reaches the risk layer even when seeded state breaches every cap
+(hoisting the check above the gates fails the test); (3) duplicate ticks
+for one contract within one scan block exactly once.
 
-The replay path was verified to reuse the identical seams
-(feeds/replay.py:372-374); no parallel pipeline recomputes either
-value. Full field inventory at the boundary and the typed-carrier
-chain are recorded in docs/diag_signalseam.md.
+Hardening folded in from the adversarial review (5 reviewers, 29
+findings, 0 blockers): a per-scan blocked-intent set in
+run_scan_pipeline so duplicate same-fingerprint passing signals cannot
+write duplicate risk_block records (batch_match does not dedupe; the
+allow path already collapses via place()'s fingerprint); the funnel
+increment moved after the record append so the counter can never claim a
+block whose record failed to persist; the daily-loss integration test
+anchored on a mid-day SimulatedClock so a UTC-midnight rollover cannot
+flake it; module docstrings now state the run-scoping consequence
+explicitly (caps measure THIS RUN -- a restart mints a fresh run_id and
+a fresh cap window; that is the goal-mandated price of making cross-run
+accumulation unable to contaminate a cap) and the O(lifetime-history)
+read cost honestly; the three RISK_ env knobs documented in
+.env.example (commented defaults -- the live .env is untouched).
+
+Out-of-scope notes surfaced by review, deliberately NOT addressed here:
+the dashboard still displays the dormant RiskManager's 10000 global cap
+while the enforcing cap is RiskLimits' 5000 (display wiring, separate
+change); a persistent daily-loss breach appends one fsynced risk_block
+per ~5s scan for the rest of the UTC day (documented by-design
+telemetry); an offset cache for the per-intent ledger read if the dir
+ever accumulates months of records.
+
+py -3.12 -m pytest -q: 822 passed (801 base + 21 new), zero regressions.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
