@@ -416,6 +416,46 @@ class PaperRejectionRecord(BaseModel):
     chase_adjusted_edge: float | None = None
 
 
+class PaperRiskBlockRecord(BaseModel):
+    """Risk-limit block record -- written when the risk layer vetoes an intent.
+
+    One record per blocked order intent (risk-limit goal, Phase 2).  The
+    intent passed every edge/confidence gate but breached a declarative
+    cap (``execution/risk_limits.py``), so NO order was placed; this
+    record is the only artifact.  Persisted to ``risk_blocks.jsonl``.
+
+    Carries the portfolio numbers the decision was made against
+    (run_id-scoped, event-sourced -- see risk_limits module docstring)
+    so a block is auditable without re-deriving state.  A persistent
+    breach re-blocks on every ~5 s scan while the signal keeps passing
+    the edge gates -- one record per blocked intent, by design (the
+    dedupe fingerprint is only registered on successful place()).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["risk_block"] = "risk_block"
+    schema_version: int = _SCHEMA_VERSION
+
+    # Run identity (build step 4 precedent): stamped onto every append.
+    run_id: str = ""
+    mode: str = "live"
+
+    timestamp: datetime
+    platform: DataSource
+    contract_id: str
+    side: Literal["yes", "no"]
+    size_usd: float
+
+    # The first-breached cap's reason string from check_risk.
+    reason: str
+
+    # Portfolio state the caps were evaluated against (run_id-scoped).
+    market_position_usd: float
+    global_exposure_usd: float
+    daily_realized_pnl_usd: float
+
+
 # ── PaperLedger ───────────────────────────────────────────────────────────────
 
 T = TypeVar("T", bound=BaseModel)
@@ -442,6 +482,7 @@ class PaperLedger:
     _FILLS_FILE: str = "fills.jsonl"
     _SETTLEMENTS_FILE: str = "settlements.jsonl"
     _REJECTIONS_FILE: str = "rejections.jsonl"
+    _RISK_BLOCKS_FILE: str = "risk_blocks.jsonl"
 
     def __init__(
         self, base_dir: str | Path, *, run_id: str = "", mode: str = "live",
@@ -462,6 +503,7 @@ class PaperLedger:
         self._fills_path = self._base_dir / self._FILLS_FILE
         self._settlements_path = self._base_dir / self._SETTLEMENTS_FILE
         self._rejections_path = self._base_dir / self._REJECTIONS_FILE
+        self._risk_blocks_path = self._base_dir / self._RISK_BLOCKS_FILE
 
         # Counters for skip-and-warn-with-counter reader policy.  Surfaced
         # via .health(); operators compare against raw line count to verify
@@ -486,6 +528,10 @@ class PaperLedger:
 
     def append_rejection(self, record: PaperRejectionRecord) -> None:
         self._append(self._rejections_path, record)
+
+    def append_risk_block(self, record: PaperRiskBlockRecord) -> None:
+        """Append a risk-limit block record (risk-limit goal).  No order exists."""
+        self._append(self._risk_blocks_path, record)
 
     def _append(self, path: Path, record: BaseModel) -> None:
         """Append one record as a JSON line, flush, and fsync.
@@ -524,6 +570,9 @@ class PaperLedger:
 
     def replay_rejections(self) -> Iterator[PaperRejectionRecord]:
         yield from self._replay(self._rejections_path, PaperRejectionRecord)
+
+    def replay_risk_blocks(self) -> Iterator[PaperRiskBlockRecord]:
+        yield from self._replay(self._risk_blocks_path, PaperRiskBlockRecord)
 
     def _replay(self, path: Path, model_cls: type[T]) -> Iterator[T]:
         """Yield records from ``path``; skip-and-warn on malformed lines.

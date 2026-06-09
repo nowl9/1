@@ -65,11 +65,18 @@ from btc_pm_arb.execution.paper_ledger import (
     PaperLedger,
     PaperOrderRecord,
     PaperRejectionRecord,
+    PaperRiskBlockRecord,
 )
 from btc_pm_arb.execution.paper_positions import PaperPosition, PaperPositionTracker
 from btc_pm_arb.execution.paper_settlement import KalshiSettlementPoller
 from btc_pm_arb.execution.positions import PositionTracker
 from btc_pm_arb.execution.risk import RiskConfig, RiskManager
+from btc_pm_arb.execution.risk_limits import (
+    RiskIntent,
+    RiskLimits,
+    build_portfolio_state,
+    check_risk,
+)
 from btc_pm_arb.execution.settlement import SettlementMonitor
 from btc_pm_arb.feeds.aux_capture import (
     ChainlinkRoundCapture,
@@ -246,6 +253,17 @@ class Agent:
         # this one instance.
         self.fill_simulator = FillSimulator(book_walk=True)
         self.paper_positions = PaperPositionTracker()
+        # Risk-limit layer (risk-limit goal): declarative caps evaluated in
+        # run_scan_pipeline AFTER all edge/confidence gates and BEFORE
+        # OrderManager.place builds an order.  Caps are checked against
+        # run_id-scoped event-sourced state read back from the ledger files
+        # (NOT self.paper_positions, which is rehydrated below from ALL runs'
+        # records and is therefore cross-run contaminated -- see
+        # docs/diag_risklimits.md).  The reader is a dedicated instance so
+        # per-intent replays don't inflate self.paper_ledger's
+        # load-verification counters (health() semantics unchanged).
+        self.risk_limits = RiskLimits()
+        self._risk_ledger_reader = PaperLedger(settings.paper_ledger_dir)
         # Order registry keyed by client_order_id — populated as the agent
         # places paper orders, and re-populated from disk on startup so the
         # settlement poller can still look up theoretical_edge for positions
@@ -259,6 +277,10 @@ class Agent:
             "signals_passed_filter": 0,
             "signals_rejected_filter": 0,
             "paper_orders_placed": 0,
+            # Risk-limit layer: intents that passed every edge/confidence
+            # gate but breached a declarative cap (risk_limits.check_risk)
+            # -- no order placed, one risk_block record appended each.
+            "paper_orders_risk_blocked": 0,
             "paper_orders_filled": 0,
             # Build step 2: book-walking can fill only part of size_usd when
             # the crossed book is thin -- counted separately from full fills
@@ -608,6 +630,65 @@ class Agent:
             # this branch is skipped — live execution wiring is a future
             # round.
             if self.dry_run:
+                # ── Risk-limit layer (risk-limit goal) ───────────────────────
+                # Declarative caps, evaluated strictly AFTER every edge/
+                # confidence gate above and strictly BEFORE place() builds an
+                # order.  Pre-place blocking is load-bearing: place()
+                # registers the dedupe fingerprint, so blocking after it
+                # would suppress the signal forever even once headroom
+                # returns; blocking before it leaves the intent free to
+                # re-evaluate next scan.  Gated on is_duplicate so a signal
+                # place() would dedupe anyway never reaches the cap check
+                # (no spurious risk_block records for already-placed
+                # signals).  On block: NO order, exactly one run_id-stamped
+                # risk_block record with the reason -- a block is a return
+                # value, never an exception.
+                if not self.order_mgr.is_duplicate(sig):
+                    _risk_intent = RiskIntent(
+                        platform=sig.pm_quote.source,
+                        contract_id=sig.pm_quote.contract_id,
+                        # IDENTICAL side derivation to OrderManager.place
+                        # (orders.py): a buy_yes is a YES order.
+                        side="yes" if sig.trade_side == "buy_yes" else "no",
+                        size_usd=_BASE_SIZE_USD,
+                    )
+                    _risk_now = self.clock.now()
+                    _pstate = build_portfolio_state(
+                        self._risk_ledger_reader,
+                        run_id=self.run_id,
+                        platform=_risk_intent.platform,
+                        contract_id=_risk_intent.contract_id,
+                        today=_risk_now.date(),
+                    )
+                    _allowed, _block_reason = check_risk(
+                        _risk_intent, _pstate, self.risk_limits,
+                    )
+                    if not _allowed:
+                        self._funnel["paper_orders_risk_blocked"] += 1
+                        self.paper_ledger.append_risk_block(
+                            PaperRiskBlockRecord(
+                                timestamp=_risk_now,
+                                platform=_risk_intent.platform,
+                                contract_id=_risk_intent.contract_id,
+                                side=_risk_intent.side,
+                                size_usd=_risk_intent.size_usd,
+                                reason=_block_reason,
+                                market_position_usd=_pstate.market_position_usd,
+                                global_exposure_usd=_pstate.global_exposure_usd,
+                                daily_realized_pnl_usd=(
+                                    _pstate.daily_realized_pnl_usd
+                                ),
+                            )
+                        )
+                        log.info(
+                            "risk.blocked",
+                            contract=_risk_intent.contract_id,
+                            platform=_risk_intent.platform.value,
+                            side=_risk_intent.side,
+                            size_usd=_risk_intent.size_usd,
+                            reason=_block_reason,
+                        )
+                        continue
                 order = await self.order_mgr.place(
                     sig, size_usd=_BASE_SIZE_USD,
                 )

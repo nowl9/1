@@ -409,6 +409,17 @@ class OrderManager:
             f"{signal.pm_quote.expiry.isoformat()}"
         )
 
+    def is_duplicate(self, signal: ArbitrageSignal) -> bool:
+        """Read-only: would :meth:`place` dedupe this signal right now?
+
+        Mutates nothing -- the fingerprint is only registered inside
+        place().  Lets the risk-limit layer (risk-limit goal) skip cap
+        evaluation for signals place() would drop anyway, so an
+        already-placed signal re-arriving on a later scan cannot emit
+        spurious risk_block records.
+        """
+        return self._signal_fingerprint(signal) in self._seen_signals
+
     async def place(self, signal: ArbitrageSignal, size_usd: float) -> Order | None:
         """Create and submit an order for a signal.
 
