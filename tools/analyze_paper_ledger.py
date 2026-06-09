@@ -76,6 +76,7 @@ from pydantic import BaseModel
 from btc_pm_arb.execution.paper_ledger import (
     PaperFillRecord,
     PaperOrderRecord,
+    PaperRejectionRecord,
     PaperSettlementRecord,
 )
 from tools.analysis.report import render_all
@@ -102,6 +103,21 @@ CONSERVATIVE_EDGE_BUCKETS: list[tuple[float, float, str]] = [
     (0.030, 0.050, "3-5%"),
     (0.050, 0.100, "5-10%"),
     (0.100, float("inf"), "10%+"),
+]
+
+# Fill-adjusted-edge bucket boundaries — left-inclusive, right-exclusive.
+# Unlike the conservative-edge bins (which start at the +1% floor) these span
+# the negative axis: the whole point of book-walking the near-floor band is to
+# expose theoretical edge collapsing through zero against thin near-mid depth,
+# so the distribution must have somewhere for the negatives to land.
+FILL_ADJUSTED_EDGE_BUCKETS: list[tuple[float, float, str]] = [
+    (float("-inf"), -0.05, "<-5%"),
+    (-0.05, -0.02, "-5to-2%"),
+    (-0.02, 0.0, "-2to0%"),
+    (0.0, 0.01, "0-1%"),
+    (0.01, 0.03, "1-3%"),
+    (0.03, 0.05, "3-5%"),
+    (0.05, float("inf"), "5%+"),
 ]
 
 # Power-tier gates (defined here, used by 9b2 — kept visible from the
@@ -260,6 +276,185 @@ def assign_conservative_edge_bucket(value: float | None) -> str:
             return label
     # Unreachable: the final bucket has high=inf.
     return "unknown"
+
+
+def assign_fill_adjusted_edge_bucket(value: float | None) -> str:
+    """Assign a fill-adjusted edge to a signed fixed-bin label.
+
+    Buckets are left-inclusive, right-exclusive and span the negative axis (see
+    ``FILL_ADJUSTED_EDGE_BUCKETS``).  ``None`` returns ``"no_fill"`` — a walk
+    that produced no fill price (empty / limit-below book) has no edge to
+    bucket, distinct from a fill that landed at exactly 0%.
+    """
+    if value is None:
+        return "no_fill"
+    for low, high, label in FILL_ADJUSTED_EDGE_BUCKETS:
+        if low <= value < high:
+            return label
+    # Unreachable: the final bucket has high=inf.
+    return "no_fill"
+
+
+def fill_adjusted_band_distribution(
+    rejections: list[PaperRejectionRecord],
+) -> dict[str, Any]:
+    """Summarise the book-walked fill-adjusted edge across the near-floor band.
+
+    This is the rejection-side counterpart to the passer calibration report:
+    the near-floor [1-3%) band previously existed only as un-book-walked
+    rejections, so a fill-adjusted distribution that spans the band (not just
+    the 1-2 contracts that cleared the floor) had nowhere to come from.
+
+    Only rejections that were actually book-walked (``fill_outcome is not
+    None``) contribute.  full / partial walks carry a ``fill_adjusted_edge`` and
+    land in a signed band bucket; no_fill walks (empty / limit-below book) are
+    counted in the ``"no_fill"`` bucket (no edge to place).  Each bucket also
+    reports the mean theoretical edge (``best_conservative_edge``) so the
+    collapse from theoretical to fill-adjusted is visible side by side.
+    """
+    order = [label for _, _, label in FILL_ADJUSTED_EDGE_BUCKETS] + ["no_fill"]
+    grouped: dict[str, list[PaperRejectionRecord]] = {label: [] for label in order}
+
+    walked = [r for r in rejections if r.fill_outcome is not None]
+    for r in walked:
+        grouped[assign_fill_adjusted_edge_bucket(r.fill_adjusted_edge)].append(r)
+
+    def _mean(values: list[float]) -> float | None:
+        return sum(values) / len(values) if values else None
+
+    buckets: list[dict[str, Any]] = []
+    for label in order:
+        members = grouped[label]
+        faes = [m.fill_adjusted_edge for m in members if m.fill_adjusted_edge is not None]
+        buckets.append({
+            "bucket": label,
+            "n": len(members),
+            "n_full": sum(1 for m in members if m.fill_outcome == "full"),
+            "n_partial": sum(1 for m in members if m.fill_outcome == "partial"),
+            "mean_fill_adjusted_edge": _mean(faes),
+            "mean_best_conservative_edge": _mean([m.best_conservative_edge for m in members]),
+        })
+
+    return {
+        "boundaries": [
+            [("-inf" if low == float("-inf") else low),
+             ("inf" if high == float("inf") else high), label]
+            for low, high, label in FILL_ADJUSTED_EDGE_BUCKETS
+        ],
+        "n_rejections_total": len(rejections),
+        "n_walked": len(walked),
+        "n_full": sum(1 for r in walked if r.fill_outcome == "full"),
+        "n_partial": sum(1 for r in walked if r.fill_outcome == "partial"),
+        "n_no_fill": sum(1 for r in walked if r.fill_outcome == "no_fill"),
+        "n_skipped": len(rejections) - len(walked),
+        "buckets": buckets,
+    }
+
+
+# Legend stamped into the chase band JSON + stdout so a future reader can never
+# misread a negative bucket.  The #1 (UNCAPPED) walk completes the full size by
+# chasing through the 0.99 wall, so its edge CAN go negative -- and a negative
+# chase-adjusted edge means completing that contract LOSES money.  That contract
+# was a CORRECTLY-REJECTED LOSER; the floor that rejected it was right.  It is
+# NOT a missed signal and NOT edge left on the table -- do not "fix" the floor
+# to capture the negative buckets.
+_CHASE_BAND_LEGEND: str = (
+    "chase_adjusted_edge (#1) is the UNCAPPED completion cost: the book is "
+    "walked to COMPLETE the full size, crossing the 0.99 wall, so it CAN be "
+    "negative. A NEGATIVE chase bucket is a CORRECTLY-REJECTED LOSER (completing "
+    "the contract loses money), NOT a missed signal or edge left on the table. "
+    "partial_fill_rate is the CAPPED #2 model's passive-fill rate for the same "
+    "rejections, shown side by side: #2 collapses to partial fills near the "
+    "floor exactly where #1 goes negative."
+)
+
+
+def chase_adjusted_band_distribution(
+    rejections: list[PaperRejectionRecord],
+) -> dict[str, Any]:
+    """Summarise the UNCAPPED chase-adjusted edge (#1) across the signed band.
+
+    Companion to :func:`fill_adjusted_band_distribution` (#2), NOT a
+    replacement.  #2 buckets the CAPPED passive fill, which the near-floor
+    filter pins non-negative -- so it never populates the negative buckets.
+    #1 (``chase_adjusted_edge``) is the UNCAPPED completion cost: it walks the
+    whole book through the 0.99 wall to complete the size, so it spans the FULL
+    SIGNED AXIS including the negative buckets where a +theoretical edge has
+    collapsed past zero once the contract is actually completed.
+
+    Buckets the SAME in-band walked set #2 reports (``fill_outcome is not
+    None``) by ``chase_adjusted_edge`` (reusing the signed
+    :func:`assign_fill_adjusted_edge_bucket` bins; ``None`` -> ``"no_fill"`` for
+    a whole-book-too-thin walk).  Each bucket also carries the CAPPED #2 model's
+    ``partial_fill_rate`` (and mean #2 fill-adjusted edge) side by side, so the
+    reader sees #1 going negative exactly where #2 collapses to partial fills.
+
+    A negative bucket is a CORRECTLY-REJECTED LOSER -- see
+    ``_CHASE_BAND_LEGEND``.  Negatives are reported as-is, never clipped.
+    """
+    order = [label for _, _, label in FILL_ADJUSTED_EDGE_BUCKETS] + ["no_fill"]
+    grouped: dict[str, list[PaperRejectionRecord]] = {label: [] for label in order}
+
+    walked = [r for r in rejections if r.fill_outcome is not None]
+    for r in walked:
+        grouped[assign_fill_adjusted_edge_bucket(r.chase_adjusted_edge)].append(r)
+
+    def _mean(values: list[float]) -> float | None:
+        return sum(values) / len(values) if values else None
+
+    def _rate(num: int, den: int) -> float | None:
+        return num / den if den else None
+
+    buckets: list[dict[str, Any]] = []
+    for label in order:
+        members = grouped[label]
+        chase_vals = [
+            m.chase_adjusted_edge for m in members if m.chase_adjusted_edge is not None
+        ]
+        cap_vals = [
+            m.fill_adjusted_edge for m in members if m.fill_adjusted_edge is not None
+        ]
+        n = len(members)
+        buckets.append({
+            "bucket": label,
+            "n": n,
+            "mean_chase_adjusted_edge": _mean(chase_vals),
+            # CAPPED #2 model, same rejections, side by side: partial-fill rate
+            # plus the capped fill-adjusted edge for the collapse comparison.
+            "n_partial": sum(1 for m in members if m.fill_outcome == "partial"),
+            "n_full": sum(1 for m in members if m.fill_outcome == "full"),
+            "partial_fill_rate": _rate(
+                sum(1 for m in members if m.fill_outcome == "partial"), n
+            ),
+            "mean_fill_adjusted_edge": _mean(cap_vals),
+            "mean_best_conservative_edge": _mean(
+                [m.best_conservative_edge for m in members]
+            ),
+        })
+
+    n_negative = sum(
+        1 for r in walked
+        if r.chase_adjusted_edge is not None and r.chase_adjusted_edge < 0
+    )
+    n_nonneg = sum(
+        1 for r in walked
+        if r.chase_adjusted_edge is not None and r.chase_adjusted_edge >= 0
+    )
+    return {
+        "legend": _CHASE_BAND_LEGEND,
+        "boundaries": [
+            [("-inf" if low == float("-inf") else low),
+             ("inf" if high == float("inf") else high), label]
+            for low, high, label in FILL_ADJUSTED_EDGE_BUCKETS
+        ],
+        "n_walked": len(walked),
+        "n_chase_negative": n_negative,
+        "n_chase_nonneg": n_nonneg,
+        "n_chase_no_fill": sum(
+            1 for r in walked if r.chase_adjusted_edge is None
+        ),
+        "buckets": buckets,
+    }
 
 
 # ── DataFrame join ───────────────────────────────────────────────────────────
@@ -537,6 +732,9 @@ def main(argv: list[str] | None = None) -> int:
     settlements_result = load_jsonl(
         args.ledger_dir / "settlements.jsonl", PaperSettlementRecord,
     )
+    rejections_result = load_jsonl(
+        args.ledger_dir / "rejections.jsonl", PaperRejectionRecord,
+    )
 
     # ── Run-id scoping (C3b) ────────────────────────────────────────────────
     # Default to the latest run so the analyzer stops aggregating month-old
@@ -552,12 +750,16 @@ def main(argv: list[str] | None = None) -> int:
         orders_records = orders_result.records
         fills_records = fills_result.records
         settlements_records = settlements_result.records
+        rejections_records = rejections_result.records
         scope_label = "all runs"
     else:
         orders_records = [r for r in orders_result.records if r.run_id == target_run_id]
         fills_records = [r for r in fills_result.records if r.run_id == target_run_id]
         settlements_records = [
             r for r in settlements_result.records if r.run_id == target_run_id
+        ]
+        rejections_records = [
+            r for r in rejections_result.records if r.run_id == target_run_id
         ]
         scope_label = f"run_id={target_run_id!r}"
     print(
@@ -628,6 +830,69 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Wrote {args.out_dir / 'report.md'}.")
     print(f"Wrote {args.out_dir / 'summary_stats.json'}.")
     print(f"Wrote {args.out_dir / 'charts'}/ (21 PNGs).")
+
+    # ── Fill-adjusted band distribution (rejection-side measurement infra) ───
+    # The passer calibration report above sees only orders that cleared the
+    # floor.  This sidecar emits the book-walked fill-adjusted edge across the
+    # near-floor band from rejections.jsonl — the [1-3%) band that previously
+    # existed only as un-book-walked rejections — so the distribution spans the
+    # band, not just passers.  Written as a separate JSON (not folded into
+    # summary_stats.json) so the passer-calibration schema stays untouched.
+    band = fill_adjusted_band_distribution(rejections_records)
+    # #1 (UNCAPPED chase) band rides ALONGSIDE the #2 band in the same sidecar:
+    # nested under "chase" so the existing #2 keys are untouched and
+    # summary_stats.json is never involved.  #1 is the primary fill-adjusted
+    # edge for the Jun 5 capture -- it spans the negative buckets the capped #2
+    # never reaches.
+    band["chase"] = chase_adjusted_band_distribution(rejections_records)
+    band_path = args.out_dir / "fill_adjusted_band.json"
+    band_path.write_text(json.dumps(band, indent=2), encoding="utf-8")
+    print(
+        f"Rejections: {band['n_rejections_total']} total "
+        f"({len(rejections_records)}/{len(rejections_result.records)} in scope), "
+        f"{band['n_walked']} book-walked "
+        f"({band['n_full']} full, {band['n_partial']} partial, "
+        f"{band['n_no_fill']} no_fill, {band['n_skipped']} skipped)."
+    )
+    if band["n_walked"]:
+        print("Fill-adjusted edge band [#2 CAPPED passive fill; never negative]:")
+        print("  bucket        n   mean_fill_adj  mean_theoretical")
+        for row in band["buckets"]:
+            if row["n"] == 0:
+                continue
+            mfae = row["mean_fill_adjusted_edge"]
+            mbce = row["mean_best_conservative_edge"]
+            mfae_s = f"{mfae:+.4f}" if mfae is not None else "     n/a"
+            mbce_s = f"{mbce:+.4f}" if mbce is not None else "     n/a"
+            print(f"  {row['bucket']:<10} {row['n']:>4}   {mfae_s:>10}   {mbce_s:>10}")
+    chase = band["chase"]
+    if chase["n_walked"]:
+        # NEGATIVE buckets here are CORRECTLY-REJECTED LOSERS (completing the
+        # contract loses money), NOT missed signals -- see the legend.
+        print(
+            "Chase-adjusted edge band [#1 UNCAPPED completion cost; "
+            "NEGATIVE = CORRECTLY-REJECTED LOSER, not a missed signal]:"
+        )
+        print(
+            f"  {chase['n_chase_negative']} negative (losers), "
+            f"{chase['n_chase_nonneg']} non-negative, "
+            f"{chase['n_chase_no_fill']} no_fill."
+        )
+        print("  bucket        n   mean_chase   #2_partial_rate  mean_#2_fill_adj")
+        for row in chase["buckets"]:
+            if row["n"] == 0:
+                continue
+            mce = row["mean_chase_adjusted_edge"]
+            pfr = row["partial_fill_rate"]
+            mfa = row["mean_fill_adjusted_edge"]
+            mce_s = f"{mce:+.4f}" if mce is not None else "     n/a"
+            pfr_s = f"{pfr:6.2f}" if pfr is not None else "   n/a"
+            mfa_s = f"{mfa:+.4f}" if mfa is not None else "     n/a"
+            print(
+                f"  {row['bucket']:<10} {row['n']:>4}   {mce_s:>10}   "
+                f"{pfr_s:>13}   {mfa_s:>14}"
+            )
+    print(f"Wrote {band_path}.")
     return 0
 
 

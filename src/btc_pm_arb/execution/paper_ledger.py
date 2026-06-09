@@ -366,6 +366,55 @@ class PaperRejectionRecord(BaseModel):
     # source-side is rv_tracker.current_regime().value.
     vol_regime: str
 
+    # ── Shadow fill-adjusted edge (rejection-path measurement infra) ──────────
+    # Computed ONLY for near-floor edge-economics rejections (reason_key in the
+    # edge/threshold set, a positive best_side, and best_conservative_edge above
+    # the noise floor) by invoking the SAME book-walking
+    # ``fill_simulator.FillSimulator`` placed orders use — NOT a second, more
+    # optimistic fill model.  ``fill_adjusted_edge`` is the model fair value
+    # minus the depth-walked fill price, so the near-floor band carries an
+    # honest fill estimate (e.g. +3% theoretical collapsing negative against the
+    # 0.99 wall) instead of only the 1-2 contracts that clear the floor.
+    #
+    # None for rejections outside that band (no meaningful fill) AND for
+    # no_fill walks (empty / limit-below book) — never a manufactured positive
+    # edge.  ``fill_simulator_reason`` / ``fill_outcome`` / ``fill_size_usd``
+    # mirror the PaperFillRecord fields so a partial walk is diagnosable.
+    #
+    # All optional/defaulted -> records round-trip at schema_version 1; this is
+    # the same additive precedent as run_id / mode / strike / direction (no
+    # wire-format bump, future migration tools dispatch on schema_version).
+    fill_adjusted_edge: float | None = None
+    fill_simulator_reason: str | None = None
+    fill_outcome: Literal["full", "partial", "no_fill"] | None = None
+    fill_size_usd: float | None = None
+
+    # ── Chase-adjusted edge (#1: UNCAPPED completion cost) ────────────────────
+    # The COMPANION to ``fill_adjusted_edge`` above, NOT a replacement.  Where
+    # ``fill_adjusted_edge`` (#2) is the CAPPED passive fill -- the FillSimulator
+    # stops at the limit, so it can only fill what is at-or-below the price and
+    # is never negative (a thin near-floor book collapses to a partial-fill
+    # rate, not a loss) -- ``chase_adjusted_edge`` (#1) is the UNCAPPED
+    # completion cost: ``model fair value - edge.fill_adjusted_price(book, size)``
+    # walks the WHOLE book to COMPLETE the full size, crossing the 0.99 wall.
+    # It is the SAME book-walk (``signals.edge.fill_adjusted_price``) that
+    # populates ``orders.jsonl``'s fill_adjusted_edge for placed orders.
+    #
+    # Because the walk chases through the wall to fill, this value CAN GO
+    # NEGATIVE (a +3% theoretical edge collapsing to e.g. -15% once the size is
+    # completed against thin near-mid depth).  A NEGATIVE chase_adjusted_edge is
+    # a CORRECTLY-REJECTED LOSER: completing that contract would LOSE money, so
+    # the floor that rejected it was right.  It is NOT a missed signal and NOT
+    # edge left on the table -- do not read it as a trade we could have captured.
+    # The value is recorded as-is and never clipped at zero (clipping would
+    # manufacture phantom positive edge; the negative IS the measurement).
+    #
+    # None for rejections outside the near-floor band AND for no_fill walks
+    # (whole book too thin to complete the size) -- never an invented edge.
+    # Optional/defaulted -> round-trips at schema_version 1, the same additive
+    # precedent as the #2 fields above (no wire-format bump).
+    chase_adjusted_edge: float | None = None
+
 
 # ── PaperLedger ───────────────────────────────────────────────────────────────
 
