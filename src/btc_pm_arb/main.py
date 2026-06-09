@@ -607,6 +607,15 @@ class Agent:
             passing, rejected, edges_by_id,
         )
 
+        # Risk-limit layer: intents already risk-blocked THIS scan.  The
+        # drained 5 s tick buffer can hold several ticks for one contract,
+        # and batch_match does not dedupe, so ``passing`` can carry the
+        # same (contract, side) intent more than once per scan.  On the
+        # allow path place()'s fingerprint collapses the duplicates; this
+        # set is the block-path counterpart, keeping "exactly one
+        # risk_block record per blocked intent" true at scan granularity.
+        _risk_blocked_this_scan: set[tuple[str, str]] = set()
+
         for sig in passing:
             log.info(
                 "signal.observed",
@@ -630,7 +639,7 @@ class Agent:
             # this branch is skipped — live execution wiring is a future
             # round.
             if self.dry_run:
-                # ── Risk-limit layer (risk-limit goal) ───────────────────────
+                # -- Risk-limit layer (risk-limit goal) ----------------------
                 # Declarative caps, evaluated strictly AFTER every edge/
                 # confidence gate above and strictly BEFORE place() builds an
                 # order.  Pre-place blocking is load-bearing: place()
@@ -643,6 +652,12 @@ class Agent:
                 # signals).  On block: NO order, exactly one run_id-stamped
                 # risk_block record with the reason -- a block is a return
                 # value, never an exception.
+                _risk_key = (sig.pm_quote.contract_id, sig.trade_side)
+                if _risk_key in _risk_blocked_this_scan:
+                    # Duplicate of an intent already blocked this scan
+                    # (duplicate ticks for one contract in the buffer):
+                    # same decision, no second record, and no order.
+                    continue
                 if not self.order_mgr.is_duplicate(sig):
                     _risk_intent = RiskIntent(
                         platform=sig.pm_quote.source,
@@ -664,7 +679,9 @@ class Agent:
                         _risk_intent, _pstate, self.risk_limits,
                     )
                     if not _allowed:
-                        self._funnel["paper_orders_risk_blocked"] += 1
+                        _risk_blocked_this_scan.add(_risk_key)
+                        # Append before counting so the funnel can never
+                        # claim a block whose record failed to persist.
                         self.paper_ledger.append_risk_block(
                             PaperRiskBlockRecord(
                                 timestamp=_risk_now,
@@ -680,6 +697,7 @@ class Agent:
                                 ),
                             )
                         )
+                        self._funnel["paper_orders_risk_blocked"] += 1
                         log.info(
                             "risk.blocked",
                             contract=_risk_intent.contract_id,

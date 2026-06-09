@@ -43,11 +43,25 @@ therefore reads the JSONL streams directly and filters every record by
     (the stamp lands on the serialized copy; callers' in-memory records
     keep ``run_id=""``, so they must never be filtered by that field).
 
-Per-intent reads are cheap: the builder runs only for intents the
-OrderManager would not dedupe (at most one per unique signal fingerprint
-per breach-tick), and orders/fills/settlements are low-volume streams --
-the project already accepts inline per-append fsync on this same code
-path as not latency-critical (paper_ledger.py module docstring).
+EXPLICIT CONSEQUENCE of run_id scoping (mandated by the goal, not an
+accident): caps measure THIS RUN's activity.  A process restart mints a
+fresh run_id, so the cap window restarts with it -- prior-run open
+positions (which the in-memory tracker still carries and the settlers
+still manage) do not count toward the exposure caps, and a daily-loss
+amount realized earlier the same day under a previous run_id does not
+count toward the brake.  That is the price of making cross-run ledger
+accumulation unable to contaminate a cap; a cross-run cap (e.g. filter
+``run_id != ""``) is a deliberate future policy change, not a bug fix.
+
+Per-intent read cost: the builder runs only for intents the OrderManager
+would not dedupe (at most one per unique signal fingerprint per
+breach-tick), but each run parses the FULL orders/fills/settlements
+files before the run_id filter applies, and the shared ledger dir
+accumulates across runs -- O(lifetime history), not O(current run).
+Acceptable at paper cadence (the project already accepts inline
+per-append fsync on this same code path as not latency-critical,
+paper_ledger.py module docstring); revisit with an offset cache if the
+ledger dir ever accumulates months of multi-run records.
 
 Configuration -- pydantic-settings, OS env wins over .env
 ---------------------------------------------------------
@@ -213,8 +227,11 @@ def build_portfolio_state(
 
     A current-run settlement for a triple opened in a PRIOR run finds no
     current-run fills to close (harmless no-op for exposure) but DOES
-    count toward today's realized P&L -- the daily-loss brake cares about
-    money lost today, regardless of when the position was opened.
+    count toward today's realized P&L: within the run-scoped window the
+    brake cares about money THIS RUN realized today, regardless of which
+    run opened the position.  The converse does not hold -- settlements
+    written by an earlier process today carry that run's id and are
+    excluded (see the module docstring's run-scoping consequence note).
     """
     orders_by_id: dict[str, tuple[DataSource, str, str]] = {}
     for order in ledger.replay_orders():
