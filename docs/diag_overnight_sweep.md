@@ -110,7 +110,38 @@ writing to throwaway ledger dirs under analysis_out/. Read-only on
 recordings, zero source changes, runs AFTER the banked sweep so Phase 2
 artifacts are untouched.
 
-## 5. Guardrails honored
+## 5. Phase 2 execution log (2026-06-10)
+
+Pre-sweep: live ledger (a prior session's 0601 run) moved to
+`ledger_archive/paper_ledger_pre_sweep_20260610-001244`. Each window then
+ran replay -> analyzer -> archive strictly sequentially; `./paper_ledger`
+verified ABSENT before each replay and after each archive move.
+
+| window | run_id (ledger) | frames | orders | rejections | noarb_shadow |
+|--------|-----------------|--------|--------|------------|--------------|
+| 2026-05-30 | ac18e918de21... | 42109 | 0 | 292 | 0 (file absent) |
+| 2026-06-01 | bb1c6d87587c... | 702528 | 1 | 2345 | 151 |
+| 2026-06-09 | 24c9428485dd... | 244805 | 0 | 509 | 0 (file absent) |
+
+Isolation evidence per window:
+- every record in each archived ledger carries exactly ONE run_id
+  (sweep_captures.json `ledger_run_id_counts`);
+- 0601 analyzer scope line: `Scope: run_id='bb1c6d87...' (1/1 orders in
+  scope)`; 0530/0609 have zero orders so `latest_run_id` returns None and
+  the scope label is "all runs" -- harmless here because the ledger dir
+  itself is single-run by construction (fresh dir per window);
+- 0601 cross-validates the banked figures exactly: 702528 frames, 284
+  rejections book-walked (89 full / 195 partial), mean #2 fill-adjusted
+  edge +2.01% == mean theoretical, 151 noarb_shadow records, the single
+  order's persisted fill_adjusted_edge -0.1496 (#1 walker semantics).
+
+Artifacts: `ledger_archive/overnight_sweep_2026-06-09/<window>/`
+{paper_ledger/, analysis_out/, replay.log, analyzer.log} plus
+`sweep_captures.json` at the sweep root (emitted by the gitignored
+scratch `analysis_out/_sweep_capture.py`). data/recordings untouched
+(replay is structurally read-only on it, sec. 1).
+
+## 6. Guardrails honored
 
 - No source change to main.py / analyzer / pricing / filters; no new CLI
   flags; no new persistence. The sweep uses only: the existing replay CLI,
