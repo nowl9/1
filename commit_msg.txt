@@ -1,54 +1,47 @@
-test(noarb): Phase 3 verification -- byte-identical replay, 19 tests, 151-record cross-validation
+docs(sweep): overnight characterization Phase 3 -- consolidated 3-window report, 25.7% calendar rate cross-checked
 
-Phase 3 of the no-arb shadow goal: prove the shadow layer changes
-nothing and pins its contract with tests.
+Phase 3 of the overnight characterization sweep: the consolidated
+per-window comparison report
+(docs/overnight_characterization_2026-06-09.md) covering both fill
+bands and the no-arb shadow stream on 2026-05-30 / 2026-06-01 /
+2026-06-09, each read from an isolated single-run ledger.
 
-Determinism regression (the goal's core promise): the banked
-2026-06-01 window (hours 18-20, min_edge=0.03) was replayed once on
-the pre-change tree (master @ 0a68e71) and once with the shadow layer
-(7e2b894), projecting each ledger through the established semantic
-projection (volatile stamp/identity columns dropped, floats rounded to
-6 dp -- the same projection tests/test_feeds/test_replay.py uses).
-The two projection files are BYTE-IDENTICAL (sha256
-b971a49131a672cf...bdad4ef on both): the emitted signal set (1 order,
-side=no, fill_adjusted_edge -0.149572), all 2345 rejections with their
-fill-adjusted and chase-adjusted edges, 1 intent, 1 fill, 1 settlement
--- all exactly equal.  SHADOW MODE CHANGES NOTHING.
+Headline cross-window findings:
+- The ~25.7% fit-level calendar no-arb rate on 0601 (previously solo
+  verification) HOLDS as the middle of the cross-window range: 19.9%
+  (75/377 fits, 0530), 25.7% (1319/5138, 0601 -- reproducing
+  docs/diag_noarb.md section 4 exactly, including 20935/192911
+  strike-points), 36.9% (362/981, 0609). Calendar-only everywhere;
+  zero butterfly violations in any window.
+- Fit-level violations are pervasive but edge-level association is
+  window-dependent: 0530/0609 produced ZERO noarb_shadow records
+  despite 19.9%/36.9% fit rates; only 0601 had edges consume flagged
+  fits (151 records, 100% positive would-be edge, 100% caught by
+  existing gates).
+- The #1 UNCAPPED chase band is 100% negative on all walked
+  rejections in all three windows (45/45, 284/284, 126/126): zero
+  would-be winners rejected at the 3% floor. The #2 CAPPED band's
+  mean fill-adjusted edge equals mean theoretical everywhere;
+  thinness shows as partial-fill rate (58%/69%/40%).
 
-Cross-validation: the after-replay wrote exactly 151 noarb_shadow
-records -- the precise count the Phase 1 probe measured for edges
-computed on violating fits -- all calendar_vs_prev, all with a
-positive would-be edge (max +0.961 on the deep-ITM 63000 digital), and
-all signal_emitted=false: on this window the existing gates caught
-every artifact edge anyway, and the one signal that DID emit rode a
-clean fit.  That separation ("artifact edge that fired" vs "artifact
-edge the gates caught") is exactly what the quiet-vs-CPI comparison
-needs.
+Numbers verified by a 6-agent adversarial recount against the raw
+archived artifacts (95-check transcription audit; every band,
+rejection-reason, noarb, and fit-rate figure reproduced). Fixes from
+that pass: 0601 ledger record count corrected to 2,500 (intents.jsonl
+was omitted by the capture script -- same single run_id, isolation
+conclusion unchanged), the Kalshi prose corrected (0530 DID form
+Kalshi matches: 53 one_touch_barrier rejections, a post-match filter;
+0601/0609 rejections are 100% Polymarket), and regime rv_1h bounds
+replaced with exact logged maxima.
 
-New tests (19; suite 822 -> 841 passed, 3m46s):
-- tests/test_pricing/test_noarb.py (14): pure-function matrix.  Clean
-  surface ok on both slices; Axel Vogt's butterfly-arbitrageable SVI
-  params flag butterfly:g<0 at k=0.9 while checking CLEAN at ATM
-  (strike-local, as it must be); a crossed calendar pair flags
-  calendar_vs_prev on the longer slice and calendar_vs_next on the
-  shorter (same crossing, both views); reason strings carry both w
-  values for the later suppression goal's thresholding; sub-CAL_TOL
-  jitter is NOT flagged; unfitted slice / missing expiry / bad forward
-  / empty strikes / degenerate neighbour all return ok without
-  crashing; the check mutates nothing.
-- tests/test_main/test_noarb_shadow.py (5): pipeline contract through
-  the REAL wiring (update_cache_from_surface -> run_scan_pipeline).  A
-  clean surface logs NO record and the signal emits; a
-  butterfly-violating smile and a calendar-violating pair each log
-  EXACTLY ONE record with the right reason, strike, expiry, side, and
-  positive would-be edge -- and the signal STILL emits
-  (signal_emitted=True, signals_passed_filter=1); a clean refit clears
-  the flag so later scans log nothing new (latest-fit semantics); the
-  record round-trips JSONL with the run_id/mode stamp.
+Fit-level numbers come from the gitignored observe-only probe
+analysis_out/_sweep_noarb_fitrate.py (wraps noarb_check_by_strike,
+returns results unchanged, throwaway ledgers under analysis_out/).
+Archives under ledger_archive/overnight_sweep_2026-06-09/ (gitignored).
 
-Scope proof: this commit is two new test files only (numstat
-additive); the implementation commit (7e2b894) was +293/-0 across
-pricing/noarb.py (new), paper_ledger.py, main.py.  No floor, gate,
-fill model, DigitalPricer, or SVI-fit change anywhere in the goal.
+Zero source changes (numstat 4c862d8..HEAD: docs only); recordings
+read-only (newest mtime 2026-06-09 15:12); recorder path untouched;
+no floor/fill-model/shadow-behavior change; #1 negatives unclipped.
+Suite: 841 passed at every phase gate (three full runs).
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
