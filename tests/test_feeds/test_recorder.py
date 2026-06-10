@@ -11,8 +11,11 @@ Scope (Round 9c Commit 2):
 * Daily rotation: frames across a day boundary land in distinct day
   directories.
 * No files until the first record() — construction is side-effect-free.
-* Failure policy (Q4): on the first OSError, recorder logs + disables
-  itself; subsequent calls no-op and do not raise.
+* Failure policy (revised 2026-06-10, graceful-stop-loud): on the first
+  OSError the recorder closes EVERY handle with valid gzip trailers
+  (banking buffered frames), logs CRITICAL, appends the RECORDER_FAILED
+  sentinel, and fires on_fatal exactly once; subsequent calls no-op and
+  do not raise.  Close failures are logged, never silently swallowed.
 * _to_text encoding helper: str passthrough, bytes utf-8, bytes non-utf-8
   falls back to base64, dict JSON-encoded.
 """
@@ -161,40 +164,98 @@ def test_no_files_created_until_first_record(tmp_path: Path) -> None:
 # ── Failure policy ───────────────────────────────────────────────────────────
 
 
-def test_io_error_disables_recorder(tmp_path: Path) -> None:
-    """On first OSError, recorder disables itself + no-ops subsequent calls."""
-    rec = FrameRecorder(tmp_path)
-    # First call succeeds.
-    rec.record(DataSource.DERIBIT, "ok", _T0)
+def test_io_error_fails_loud_and_banks_all_streams(tmp_path: Path) -> None:
+    """First OSError -> ALL open handles closed with valid trailers,
+    RECORDER_FAILED sentinel written, on_fatal fired once, subsequent
+    record() calls no-op without raising (2026-06-10 policy)."""
+    fatal_calls: list[str] = []
+    rec = FrameRecorder(tmp_path, on_fatal=fatal_calls.append)
+    rec.record(DataSource.DERIBIT, "d-ok", _T0)
+    rec.record(DataSource.KALSHI, "k-ok", _T0, endpoint="/markets")
     assert rec._disabled is False
 
-    # Force the next write to raise OSError by patching _handle_for.
-    # Simulates a disk-full or permission error mid-run.
+    # Simulate ENOSPC on the next write (the 2026-06-10 trigger).
+    with patch.object(
+        FrameRecorder, "_handle_for",
+        side_effect=OSError(28, "No space left on device"),
+    ):
+        # Must not raise into the feed callback.
+        rec.record(DataSource.POLYMARKET, "dropped", _T0)
+
+    assert rec._disabled is True
+    assert fatal_calls == ["io_error"]
+
+    # Subsequent call is a no-op and must NOT re-fire on_fatal.
+    rec.record(DataSource.DERIBIT, "still-stopped", _T0 + timedelta(hours=2))
+    assert fatal_calls == ["io_error"]
+
+    # Both already-open streams banked their buffered frames WITH valid
+    # gzip trailers (gzip.open raises EOFError on a trailerless file).
+    p_d = tmp_path / "deribit" / "2026-05-25" / "frames-14.jsonl.gz"
+    p_k = tmp_path / "kalshi" / "2026-05-25" / "frames-14.jsonl.gz"
+    with gzip.open(p_d, "rt", encoding="utf-8") as f:
+        assert [json.loads(ln)["frame"] for ln in f] == ["d-ok"]
+    with gzip.open(p_k, "rt", encoding="utf-8") as f:
+        assert [json.loads(ln)["frame"] for ln in f] == ["k-ok"]
+
+    # Sentinel exists and names the failure.
+    sentinel = (tmp_path / "RECORDER_FAILED").read_text(encoding="ascii")
+    assert "reason=io_error" in sentinel
+    assert "error_type=OSError" in sentinel
+    assert "close_failures=none" in sentinel
+
+
+def test_fatal_close_failure_is_recorded_not_swallowed(
+    tmp_path: Path, capsys,
+) -> None:
+    """A handle whose close() raises during the fatal stop is named in
+    the sentinel and logged CRITICAL -- never silently swallowed."""
+
+    class _BrokenClose:
+        def write(self, data: bytes) -> None:  # pragma: no cover
+            raise OSError(28, "No space left on device")
+
+        def close(self) -> None:
+            raise OSError(28, "No space left on device (at close)")
+
+    rec = FrameRecorder(tmp_path)
+    rec.record(DataSource.DERIBIT, "d-ok", _T0)
+    # Inject a broken handle for a second stream, then trip the failure.
+    path = tmp_path / "kalshi" / "2026-05-25" / "frames-14.jsonl.gz"
+    rec._handles["kalshi"] = (path, _BrokenClose())  # type: ignore[assignment]
+    with patch.object(
+        FrameRecorder, "_handle_for",
+        side_effect=OSError(28, "No space left on device"),
+    ):
+        rec.record(DataSource.POLYMARKET, "dropped", _T0)
+
+    sentinel = (tmp_path / "RECORDER_FAILED").read_text(encoding="ascii")
+    assert "close_failures=kalshi" in sentinel
+    out = capsys.readouterr().out
+    assert "frame_recorder.fatal_close_failed" in out
+    # The healthy stream still banked its frames with a trailer.
+    p_d = tmp_path / "deribit" / "2026-05-25" / "frames-14.jsonl.gz"
+    with gzip.open(p_d, "rt", encoding="utf-8") as f:
+        assert [json.loads(ln)["frame"] for ln in f] == ["d-ok"]
+
+
+def test_on_fatal_callback_exception_is_contained(tmp_path: Path) -> None:
+    """record() must never raise into feed callbacks -- even when the
+    on_fatal callback itself blows up."""
+
+    def _bad_callback(reason: str) -> None:
+        raise RuntimeError("callback exploded")
+
+    rec = FrameRecorder(tmp_path, on_fatal=_bad_callback)
     with patch.object(
         FrameRecorder, "_handle_for", side_effect=OSError("simulated"),
     ):
-        # Must not raise.
-        rec.record(
-            DataSource.DERIBIT, "should-be-dropped",
-            _T0 + timedelta(hours=1),
-        )
-
+        rec.record(DataSource.DERIBIT, "x", _T0)  # must not raise
     assert rec._disabled is True
 
-    # Subsequent call (without the patch) is also a no-op.
-    rec.record(
-        DataSource.DERIBIT, "still-disabled", _T0 + timedelta(hours=2),
-    )
 
-    # Read what landed on disk — the first "ok" frame, nothing else.
-    p = tmp_path / "deribit" / "2026-05-25" / "frames-14.jsonl.gz"
-    with gzip.open(p, "rt", encoding="utf-8") as f:
-        lines = [json.loads(ln) for ln in f]
-    assert [ln["frame"] for ln in lines] == ["ok"]
-
-
-def test_close_after_disable_does_not_raise(tmp_path: Path) -> None:
-    """close() must be safe after the recorder has self-disabled."""
+def test_close_after_fatal_does_not_raise(tmp_path: Path) -> None:
+    """close() must be safe after the recorder has fatal-stopped."""
     rec = FrameRecorder(tmp_path)
     with patch.object(
         FrameRecorder, "_handle_for", side_effect=OSError("simulated"),

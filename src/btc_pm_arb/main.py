@@ -40,7 +40,9 @@ import asyncio
 import logging
 import os
 import secrets
+import shutil
 import signal
+import sys
 import uuid
 from collections import deque
 from datetime import datetime, timezone
@@ -1686,6 +1688,42 @@ async def _run_replay(
     log.info("replay.finished", **stats)
 
 
+# ── Recorder preflight (2026-06-10 ENOSPC incident) ───────────────────────────
+
+
+def _record_feeds_preflight(record_dir: Path) -> bool:
+    """Refuse to start --record-feeds on a too-full volume.
+
+    Free space is measured via ``shutil.disk_usage`` on the nearest
+    existing ancestor of ``record_dir`` (the directory itself may not
+    exist before the first frame) -- NEVER by summing file sizes.
+    Floor: ``settings.recorder_min_free_gb`` (default 20 GiB).
+    """
+    probe = record_dir.resolve()
+    while not probe.exists():
+        parent = probe.parent
+        if parent == probe:
+            break
+        probe = parent
+    free = shutil.disk_usage(probe).free
+    floor = int(settings.recorder_min_free_gb * 2**30)
+    if free < floor:
+        log.critical(
+            "recorder.preflight_insufficient_disk",
+            free_gb=round(free / 2**30, 2),
+            floor_gb=settings.recorder_min_free_gb,
+            record_dir=str(record_dir),
+            hint="free disk space or lower recorder_min_free_gb",
+        )
+        return False
+    log.info(
+        "recorder.preflight_ok",
+        free_gb=round(free / 2**30, 2),
+        floor_gb=settings.recorder_min_free_gb,
+    )
+    return True
+
+
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 async def run(
@@ -1695,7 +1733,14 @@ async def run(
     mode: str = "live",
     duration_s: float | None = None,
     replay_date: str | None = None,
-) -> None:
+) -> int:
+    """Run the agent.  Returns a process exit code:
+
+    0 = clean run / clean stop; 1 = recorder fatal I/O failure stopped
+    the run; 2 = --record-feeds preflight refused to start (disk too
+    full).  Pre-existing callers that ignore the return value are
+    unaffected.
+    """
     _configure_logging()
 
     # Round 9c Commit 2: optional raw-feed recorder.  When ``record_dir``
@@ -1706,8 +1751,19 @@ async def run(
     # Replay mode READS recordings; it never records.  Building a recorder
     # in replay would risk appending to the very files we read.
     recorder: FrameRecorder | None = None
+    # Set when the recorder fails fatally (ENOSPC etc.); drives the
+    # nonzero exit code.  The on_fatal callback also sets stop_event
+    # (late-bound closure; the event exists before any feed task runs).
+    recorder_fatal: list[str] = []
+
+    def _on_recorder_fatal(reason: str) -> None:
+        recorder_fatal.append(reason)
+        stop_event.set()
+
     if record_dir is not None and mode != "replay":
-        recorder = FrameRecorder(record_dir)
+        if not _record_feeds_preflight(record_dir):
+            return 2
+        recorder = FrameRecorder(record_dir, on_fatal=_on_recorder_fatal)
         log.info("frame_recorder.enabled", base_dir=str(record_dir))
 
     # Build step 1 (Fork 3): construct the simulated-clock seam from the
@@ -1760,7 +1816,7 @@ async def run(
             await agent.order_mgr.aclose()
             summary = agent.paper_positions.performance_summary()
             log.info("agent.shutdown", **summary)
-        return
+        return 0
 
     try:
         async with asyncio.TaskGroup() as tg:
@@ -1804,6 +1860,10 @@ async def run(
             recorder.close()
         summary = agent.tracker.performance_summary()
         log.info("agent.shutdown", **summary)
+    if recorder_fatal:
+        log.critical("run.recorder_fatal_exit", reasons=recorder_fatal)
+        return 1
+    return 0
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -1871,7 +1931,7 @@ def main() -> None:
         record_dir = args.record_dir
     else:
         record_dir = None
-    asyncio.run(
+    exit_code = asyncio.run(
         run(
             dry_run=True,
             record_dir=record_dir,
@@ -1880,6 +1940,8 @@ def main() -> None:
             replay_date=args.replay_date,
         )
     )
+    if exit_code:
+        sys.exit(exit_code)
 
 
 if __name__ == "__main__":

@@ -74,6 +74,14 @@ class Settings(BaseSettings):
     # Strike increment δ for digital pricer finite-difference approximation (USD)
     strike_delta: float = Field(default=500.0, gt=0)
 
+    # ── Recorder capture-path trust (2026-06-10 ENOSPC incident) ─────────────
+    # Preflight floor: --record-feeds refuses to START when the recording
+    # volume has less free space than this (GiB).  Measured exclusively via
+    # shutil.disk_usage -- never by summing file sizes (sparse files lie).
+    # Rationale: on 2026-06-10 a full disk (ENOSPC) silently killed all six
+    # capture streams 2.7 h into an overnight run.
+    recorder_min_free_gb: float = Field(default=20.0, ge=0.0)
+
     # ── Paper-trading ledger (Round 8) ────────────────────────────────────────
     # Append-only JSONL files persist would-be-trade records across restarts.
     # See execution/paper_ledger.py module docstring for storage rationale.

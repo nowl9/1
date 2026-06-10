@@ -27,13 +27,32 @@ Design
   ``/markets`` vs CLOB ``/book``).  None for Deribit (no per-frame
   endpoint).
 
-Failure policy (Round 9c Commit 2 / Q4)
----------------------------------------
-On the first ``OSError`` / ``IOError`` (disk full, permission denied,
-etc.) the recorder is **disabled for the rest of the process
-lifetime** — it logs a WARNING and all subsequent ``record()`` calls
-no-op.  Recording is non-essential to live operation; crashing the
-agent because we can't write a recording would be the wrong tradeoff.
+Failure policy (revised 2026-06-10: graceful-stop-LOUD)
+-------------------------------------------------------
+History: the original Round 9c policy ("on the first OSError, log one
+WARNING and silently no-op forever") converted a transient disk-full
+(ENOSPC) on 2026-06-10 into an 11-hour silent capture outage -- all
+six streams stopped at once, the close failures were swallowed, and
+``close()`` at shutdown was a no-op because ``_handles`` had been
+cleared.  See outputs/diag_repro_disable.py for the confirmed repro.
+
+Current policy: on the first unrecoverable ``OSError`` / ``IOError``
+the recorder *fails loud*:
+
+* every open gzip handle is closed (banking all buffered frames and
+  writing valid trailers) -- per-handle close failures are logged
+  CRITICAL, never swallowed;
+* one CRITICAL ``frame_recorder.fatal`` log line is emitted;
+* a ``RECORDER_FAILED`` sentinel (reason + timestamp + close results)
+  is appended under ``base_dir`` so the failure leaves on-disk
+  evidence even if the console scrolls away;
+* the optional ``on_fatal`` callback fires exactly once so the
+  orchestrator can stop the run and exit nonzero.
+
+There is no silent continuation and no retry loop: a capture run that
+cannot write is worthless, so it stops, loudly.  ``record()`` itself
+still never raises into feed callbacks -- subsequent calls no-op while
+the orchestrator winds the run down.
 
 Disk-usage guard
 ----------------
@@ -58,9 +77,9 @@ import base64
 import gzip
 import json
 import threading
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import IO
+from typing import IO, Callable
 
 import structlog
 
@@ -72,6 +91,10 @@ logger: structlog.BoundLogger = structlog.get_logger(__name__)
 # matches the Round 9c plan.  No auto-stop on exceeding — see module
 # docstring.
 _DEFAULT_MAX_DAILY_BYTES: int = 5 * 2**30
+
+# Sentinel filename appended under ``base_dir`` when the recorder fails
+# fatally.  Operators (and the next diagnostic session) look here first.
+SENTINEL_RECORDER_FAILED: str = "RECORDER_FAILED"
 
 
 class FrameRecorder:
@@ -88,9 +111,16 @@ class FrameRecorder:
         base_dir: Path | str,
         *,
         max_daily_bytes: int = _DEFAULT_MAX_DAILY_BYTES,
+        on_fatal: Callable[[str], None] | None = None,
     ) -> None:
         self._base_dir = Path(base_dir)
         self._max_daily_bytes = max_daily_bytes
+        # Fired exactly once on fatal I/O failure (after handles are
+        # closed and the sentinel is written) so the orchestrator can
+        # stop the run and exit nonzero.  Exceptions it raises are
+        # contained -- record() must never raise into feed callbacks.
+        self._on_fatal = on_fatal
+        self._fatal_reason: str | None = None
         # source.value -> (current_path, open gzip handle).  One handle
         # per source; rotated on hour boundary.
         self._handles: dict[str, tuple[Path, IO[bytes]]] = {}
@@ -132,8 +162,10 @@ class FrameRecorder:
           is purely defensive.
         * ``dict``: JSON-encoded via ``json.dumps(default=str)``.
 
-        On the first ``OSError`` / ``IOError`` the recorder disables
-        itself; subsequent calls no-op.  See module docstring.
+        On the first ``OSError`` / ``IOError`` the recorder fails LOUD
+        (closes every handle with trailers, logs CRITICAL, writes the
+        ``RECORDER_FAILED`` sentinel, fires ``on_fatal``); subsequent
+        calls no-op while the run winds down.  See module docstring.
         """
         if self._disabled:
             return
@@ -152,16 +184,29 @@ class FrameRecorder:
                 handle.write(data)
                 self._track_daily(source_value, ts, len(data))
         except (OSError, IOError) as exc:
-            self._disable(reason="io_error", exc=exc)
+            self._fail(reason="io_error", exc=exc)
 
     def close(self) -> None:
-        """Close all open file handles.  Safe to call after ``_disable``."""
+        """Close all open file handles, banking buffered frames + trailers.
+
+        Safe to call after :meth:`_fail` (no-op: handles already
+        cleared).  Per-handle close failures are logged CRITICAL --
+        never silently swallowed -- but do not raise: ``close()`` runs
+        in shutdown ``finally`` blocks where raising would mask the
+        original error.
+        """
         with self._lock:
-            for _path, h in self._handles.values():
+            for source_value, (path, h) in self._handles.items():
                 try:
                     h.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    logger.critical(
+                        "frame_recorder.close_failed",
+                        source=source_value,
+                        path=str(path),
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                    )
             self._handles.clear()
 
     # ── Internal ──────────────────────────────────────────────────────────────
@@ -185,8 +230,16 @@ class FrameRecorder:
         if current is not None:
             try:
                 current[1].close()
-            except Exception:
-                pass
+            except Exception as exc:
+                # A failed rotation close loses the old hour's buffered
+                # tail -- that must never be silent.
+                logger.critical(
+                    "frame_recorder.rotation_close_failed",
+                    source=source_value,
+                    path=str(current[0]),
+                    error_type=type(exc).__name__,
+                    error=str(exc),
+                )
         target.parent.mkdir(parents=True, exist_ok=True)
         new_handle = gzip.open(target, mode="ab")
         self._handles[source_value] = (target, new_handle)
@@ -209,29 +262,86 @@ class FrameRecorder:
                 max_daily_bytes=self._max_daily_bytes,
             )
 
-    def _disable(self, *, reason: str, exc: Exception) -> None:
-        """Permanently disable the recorder for the rest of the process.
+    def _fail(self, *, reason: str, exc: Exception) -> None:
+        """Fatal-stop the recorder LOUDLY (2026-06-10 policy revision).
 
-        Called from inside the write lock.  Closes cached handles
-        directly (rather than via :meth:`close`, which re-acquires the
-        non-reentrant lock) so any buffered gzip data for previously
-        successful frames is flushed to disk before the references are
-        dropped.  Without the flush, the last few frames written before
-        the failure would be lost in the unclosed gzip block.
+        Called from :meth:`record`'s except handler, i.e. *outside* the
+        write lock (the ``with`` block has already released it on the
+        way out).  Re-acquires the lock, closes every cached handle so
+        all buffered gzip data is banked with valid trailers, logs
+        CRITICAL, appends a ``RECORDER_FAILED`` sentinel under
+        ``base_dir``, and fires ``on_fatal`` exactly once so the
+        orchestrator stops the run and exits nonzero.  Never raises.
         """
-        self._disabled = True
-        logger.warning(
-            "frame_recorder.disabled",
-            reason=reason,
-            error_type=type(exc).__name__,
-            error=str(exc),
+        with self._lock:
+            if self._fatal_reason is not None:
+                return  # already failed; never double-fire
+            self._fatal_reason = reason
+            self._disabled = True
+            logger.critical(
+                "frame_recorder.fatal",
+                reason=reason,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            close_failures: list[str] = []
+            for source_value, (path, h) in self._handles.items():
+                try:
+                    h.close()
+                except Exception as close_exc:
+                    close_failures.append(source_value)
+                    logger.critical(
+                        "frame_recorder.fatal_close_failed",
+                        source=source_value,
+                        path=str(path),
+                        error_type=type(close_exc).__name__,
+                        error=str(close_exc),
+                    )
+            self._handles.clear()
+        self._write_failed_sentinel(
+            reason=reason, exc=exc, close_failures=close_failures,
         )
-        for _path, h in self._handles.values():
+        if self._on_fatal is not None:
             try:
-                h.close()
-            except Exception:
-                pass
-        self._handles.clear()
+                self._on_fatal(reason)
+            except Exception as cb_exc:
+                logger.critical(
+                    "frame_recorder.on_fatal_callback_error",
+                    error_type=type(cb_exc).__name__,
+                    error=str(cb_exc),
+                )
+
+    def _write_failed_sentinel(
+        self, *, reason: str, exc: Exception, close_failures: list[str],
+    ) -> None:
+        """Append one ASCII line to ``base_dir/RECORDER_FAILED``.
+
+        Best-effort: the disk may be the very thing that failed.  A
+        sentinel-write failure is itself logged CRITICAL (the console /
+        file log are the remaining channels).
+        """
+        line = (
+            "ts=%s reason=%s error_type=%s error=%s close_failures=%s\n"
+            % (
+                datetime.now(timezone.utc).isoformat(),
+                reason,
+                type(exc).__name__,
+                str(exc).replace("\n", " "),
+                ",".join(close_failures) if close_failures else "none",
+            )
+        )
+        sentinel = self._base_dir / SENTINEL_RECORDER_FAILED
+        try:
+            self._base_dir.mkdir(parents=True, exist_ok=True)
+            with open(sentinel, "a", encoding="ascii", errors="replace") as f:
+                f.write(line)
+        except Exception as sentinel_exc:
+            logger.critical(
+                "frame_recorder.sentinel_write_failed",
+                path=str(sentinel),
+                error_type=type(sentinel_exc).__name__,
+                error=str(sentinel_exc),
+            )
 
 
 # ── Encoding helper ───────────────────────────────────────────────────────────

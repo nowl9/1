@@ -1,47 +1,36 @@
-docs(sweep): overnight characterization Phase 3 -- consolidated 3-window report, 25.7% calendar rate cross-checked
+fix(recorder): C1 ENOSPC graceful-stop-loud + --record-feeds disk preflight
 
-Phase 3 of the overnight characterization sweep: the consolidated
-per-window comparison report
-(docs/overnight_characterization_2026-06-09.md) covering both fill
-bands and the no-arb shadow stream on 2026-05-30 / 2026-06-01 /
-2026-06-09, each read from an isolated single-run ledger.
+Root-cause fix for the 2026-06-10 silent capture stop (ENOSPC during a
+polymarket write tripped the old disable-forever policy, silently
+killing all six streams for 11 hours).
 
-Headline cross-window findings:
-- The ~25.7% fit-level calendar no-arb rate on 0601 (previously solo
-  verification) HOLDS as the middle of the cross-window range: 19.9%
-  (75/377 fits, 0530), 25.7% (1319/5138, 0601 -- reproducing
-  docs/diag_noarb.md section 4 exactly, including 20935/192911
-  strike-points), 36.9% (362/981, 0609). Calendar-only everywhere;
-  zero butterfly violations in any window.
-- Fit-level violations are pervasive but edge-level association is
-  window-dependent: 0530/0609 produced ZERO noarb_shadow records
-  despite 19.9%/36.9% fit rates; only 0601 had edges consume flagged
-  fits (151 records, 100% positive would-be edge, 100% caught by
-  existing gates).
-- The #1 UNCAPPED chase band is 100% negative on all walked
-  rejections in all three windows (45/45, 284/284, 126/126): zero
-  would-be winners rejected at the 3% floor. The #2 CAPPED band's
-  mean fill-adjusted edge equals mean theoretical everywhere;
-  thinness shows as partial-fill rate (58%/69%/40%).
+recorder.py -- failure policy revised from silent-disable to
+graceful-stop-LOUD:
+* _disable() replaced by _fail(): closes EVERY open gzip handle
+  (banking buffered frames with valid trailers), logs CRITICAL
+  frame_recorder.fatal, appends a RECORDER_FAILED sentinel
+  (reason+ts+close results) under base_dir, and fires a new on_fatal
+  callback exactly once so the orchestrator stops the run.
+* close() / rotation-close failures now log CRITICAL with stream+path
+  instead of bare `except: pass` (no more swallowed close errors).
+* record() still never raises into feed callbacks.
 
-Numbers verified by a 6-agent adversarial recount against the raw
-archived artifacts (95-check transcription audit; every band,
-rejection-reason, noarb, and fit-rate figure reproduced). Fixes from
-that pass: 0601 ledger record count corrected to 2,500 (intents.jsonl
-was omitted by the capture script -- same single run_id, isolation
-conclusion unchanged), the Kalshi prose corrected (0530 DID form
-Kalshi matches: 53 one_touch_barrier rejections, a post-match filter;
-0601/0609 rejections are 100% Polymarket), and regime rv_1h bounds
-replaced with exact logged maxima.
+main.py:
+* _record_feeds_preflight(): --record-feeds refuses to START when the
+  recording volume has < recorder_min_free_gb (default 20 GiB) free,
+  measured via shutil.disk_usage on the nearest existing ancestor
+  (never file-size sums).
+* run() now returns an exit code (0 ok / 1 recorder fatal / 2
+  preflight refused); on_fatal wires recorder failure -> stop_event +
+  nonzero exit; main() sys.exit()s nonzero codes.
 
-Fit-level numbers come from the gitignored observe-only probe
-analysis_out/_sweep_noarb_fitrate.py (wraps noarb_check_by_strike,
-returns results unchanged, throwaway ledgers under analysis_out/).
-Archives under ledger_archive/overnight_sweep_2026-06-09/ (gitignored).
+config.py: new recorder_min_free_gb knob (default 20.0).
 
-Zero source changes (numstat 4c862d8..HEAD: docs only); recordings
-read-only (newest mtime 2026-06-09 15:12); recorder path untouched;
-no floor/fill-model/shadow-behavior change; #1 negatives unclipped.
-Suite: 841 passed at every phase gate (three full runs).
+Tests: failure-policy tests rewritten for the new policy (trailers
+banked on all streams, sentinel content, on_fatal once, callback
+exception contained, close-failure loudness); new preflight guard
+tests. Full suite: 847 passed; the single red is the pre-existing
+test_fresh_data_passes flake (signal path, out of scope; passes in
+isolation).
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
