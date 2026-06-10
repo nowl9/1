@@ -456,6 +456,64 @@ class PaperRiskBlockRecord(BaseModel):
     daily_realized_pnl_usd: float
 
 
+class PaperNoarbShadowRecord(BaseModel):
+    """No-arb shadow record -- an edge computed on a static-arb-violating fit.
+
+    One record per edge whose consumed cache entry's latest fit violated
+    static no-arb (butterfly / calendar) at the digital's strike when the
+    pricing site checked it (no-arb goal Phase 2; see docs/diag_noarb.md).
+    Persisted to ``noarb_shadow.jsonl``.
+
+    SHADOW/OBSERVE ONLY: the signal pipeline is untouched -- the edge
+    still flows through the identical filter / place path, and every
+    signal that fires today still fires identically.  ``would_reject``
+    is what a FUTURE suppression layer (separate goal, gated on the
+    quiet-vs-CPI shadow comparison) WOULD have done; today it only ever
+    logs.  ``signal_emitted`` records whether the edge ALSO passed the
+    filter this scan, so the shadow data separates "artifact edge that
+    fired" from "artifact edge the existing gates caught anyway".
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    kind: Literal["noarb_shadow"] = "noarb_shadow"
+    schema_version: int = _SCHEMA_VERSION
+
+    # Run identity (build step 4 precedent): stamped onto every append.
+    run_id: str = ""
+    mode: str = "live"
+
+    # Sim-time under replay (clock.now()), wall-clock live -- deterministic
+    # run-to-run on banked data, unlike EdgeResult.timestamp (wall-clock).
+    timestamp: datetime
+    contract_id: str
+    platform: DataSource
+
+    # The shadow verdict: always True today (records exist only for
+    # violations); explicit so the later suppression goal can extend the
+    # stream without a schema bump.
+    would_reject: bool = True
+    # Strike-tagged reason strings from pricing.noarb, e.g.
+    # ``"calendar_vs_prev:w=0.244693->0.143401"`` -- bucket key before the
+    # first ``:``, numeric detail after (the rejection-record convention).
+    reasons: list[str]
+
+    # The exact cache grid point the violating fit was flagged at --
+    # MatchResult.matched_strike / matched_expiry, which is always a grid
+    # (strike, expiry) the pricing site priced (matcher.py:135/174).
+    strike: float
+    expiry: datetime
+
+    # The would-be edge that sat on the violating fit (EdgeResult fields).
+    best_side: Literal["buy_yes", "buy_no"] | None
+    best_conservative_edge: float
+    fill_adjusted_edge: float | None = None
+
+    # True when the same edge passed the SignalFilter this scan (i.e. the
+    # would_reject artifact actually fired as a signal today).
+    signal_emitted: bool = False
+
+
 # ── PaperLedger ───────────────────────────────────────────────────────────────
 
 T = TypeVar("T", bound=BaseModel)
@@ -483,6 +541,7 @@ class PaperLedger:
     _SETTLEMENTS_FILE: str = "settlements.jsonl"
     _REJECTIONS_FILE: str = "rejections.jsonl"
     _RISK_BLOCKS_FILE: str = "risk_blocks.jsonl"
+    _NOARB_SHADOW_FILE: str = "noarb_shadow.jsonl"
 
     def __init__(
         self, base_dir: str | Path, *, run_id: str = "", mode: str = "live",
@@ -504,6 +563,7 @@ class PaperLedger:
         self._settlements_path = self._base_dir / self._SETTLEMENTS_FILE
         self._rejections_path = self._base_dir / self._REJECTIONS_FILE
         self._risk_blocks_path = self._base_dir / self._RISK_BLOCKS_FILE
+        self._noarb_shadow_path = self._base_dir / self._NOARB_SHADOW_FILE
 
         # Counters for skip-and-warn-with-counter reader policy.  Surfaced
         # via .health(); operators compare against raw line count to verify
@@ -532,6 +592,10 @@ class PaperLedger:
     def append_risk_block(self, record: PaperRiskBlockRecord) -> None:
         """Append a risk-limit block record (risk-limit goal).  No order exists."""
         self._append(self._risk_blocks_path, record)
+
+    def append_noarb_shadow(self, record: PaperNoarbShadowRecord) -> None:
+        """Append a no-arb shadow record (no-arb goal).  Observe-only."""
+        self._append(self._noarb_shadow_path, record)
 
     def _append(self, path: Path, record: BaseModel) -> None:
         """Append one record as a JSON line, flush, and fsync.
@@ -573,6 +637,9 @@ class PaperLedger:
 
     def replay_risk_blocks(self) -> Iterator[PaperRiskBlockRecord]:
         yield from self._replay(self._risk_blocks_path, PaperRiskBlockRecord)
+
+    def replay_noarb_shadow(self) -> Iterator[PaperNoarbShadowRecord]:
+        yield from self._replay(self._noarb_shadow_path, PaperNoarbShadowRecord)
 
     def _replay(self, path: Path, model_cls: type[T]) -> Iterator[T]:
         """Yield records from ``path``; skip-and-warn on malformed lines.

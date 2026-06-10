@@ -63,6 +63,7 @@ from btc_pm_arb.execution.paper_ledger import (
     BookLevel,
     PaperIntentRecord,
     PaperLedger,
+    PaperNoarbShadowRecord,
     PaperOrderRecord,
     PaperRejectionRecord,
     PaperRiskBlockRecord,
@@ -92,6 +93,7 @@ from btc_pm_arb.feeds.recorder import FrameRecorder
 from btc_pm_arb.models import ArbitrageSignal, DataSource, OptionTick, PredictionMarketTick
 from btc_pm_arb.pricing.cache import ProbabilityCache
 from btc_pm_arb.pricing.digital_pricer import DigitalPricer
+from btc_pm_arb.pricing.noarb import noarb_check_by_strike
 from btc_pm_arb.pricing.realized_vol import RealizedVolTracker
 from btc_pm_arb.pricing.vol_surface import VolSurface
 from btc_pm_arb.server.app import create_app
@@ -269,6 +271,14 @@ class Agent:
         # settlement poller can still look up theoretical_edge for positions
         # opened in a previous process lifetime.
         self._paper_orders_by_id: dict[str, PaperOrderRecord] = {}
+        # No-arb shadow layer (no-arb goal Phase 2): latest static no-arb
+        # reasons per (strike, expiry) grid point, written/cleared at the
+        # digital pricing site in lockstep with each cache write (the flag
+        # and the entry the matcher later consumes come from the SAME fit;
+        # see docs/diag_noarb.md section 5).  Read-only downstream: the
+        # edge step appends a noarb_shadow record per flagged edge and
+        # NOTHING else reads this -- the filter/place path is untouched.
+        self._noarb_flags: dict[tuple[float, datetime], list[str]] = {}
         # Signal-funnel counters surfaced via SharedState.signal_fired_skipped.
         # All increments happen from the scan task (via run_scan_pipeline);
         # serialized by the single event loop, no locking required.
@@ -308,6 +318,11 @@ class Agent:
             # Additive measurement path -- never disturbs the rejection decision.
             "chase_fill_walked": 0,
             "chase_fill_errors": 0,
+            # No-arb shadow layer: edges computed on a fit that violated
+            # static no-arb at the digital pricing site -- one noarb_shadow
+            # record appended each.  Observe-only; never disturbs the
+            # filter/place path.
+            "noarb_shadow_flagged": 0,
         }
         # Replay paper-trading state from disk so positions and the orders
         # registry persist across restarts (the load-bearing
@@ -427,10 +442,25 @@ class Agent:
                 for t in self.surface._ticks.values()
                 if t.expiry == expiry and t.mark_iv is not None
             }
+            # No-arb shadow layer (observe-only): static no-arb state of THIS
+            # fit at every strike about to be priced.  Flags are set/cleared
+            # below in lockstep with each cache write, so the flag for a
+            # (strike, expiry) always describes the fit that produced the
+            # cache entry the matcher later consumes.  Nothing on the pricing
+            # or signal path reads the result -- price/cache writes are
+            # byte-identical with or without it.
+            noarb_by_strike = noarb_check_by_strike(
+                self.surface, sorted(strikes), expiry,
+            )
             for strike in strikes:
                 price = self.pricer.price_from_surface(strike, expiry, self.surface)
                 if price is None:
                     continue
+                reasons = noarb_by_strike.get(strike)
+                if reasons:
+                    self._noarb_flags[(strike, expiry)] = reasons
+                else:
+                    self._noarb_flags.pop((strike, expiry), None)
                 self.cache.update(
                     strike=strike,
                     expiry=expiry,
@@ -600,6 +630,40 @@ class Agent:
                         _evaluation.fill_size_usd if _evaluation is not None else None
                     ),
                     chase_adjusted_edge=_chase,
+                )
+            )
+
+        # ── No-arb shadow layer (no-arb goal Phase 2; observe-only) ──────────
+        # One noarb_shadow record per edge computed THIS scan whose consumed
+        # (matched_strike, matched_expiry) grid point was flagged at the
+        # digital pricing site -- the would_reject a future suppression layer
+        # WOULD have made, with the would-be edge it was carrying.  STRICTLY
+        # additive: nothing here reads back into the filter/place path;
+        # ``passing`` and every emitted signal are untouched (Phase 3 pins
+        # this with a before/after banked-replay identity check).  Timestamp
+        # is clock.now() (sim-time under replay) so the stream is
+        # deterministic on banked data.
+        for _edge in edges:
+            _noarb_reasons = self._noarb_flags.get(
+                (_edge.match.matched_strike, _edge.match.matched_expiry)
+            )
+            if not _noarb_reasons:
+                continue
+            self._funnel["noarb_shadow_flagged"] += 1
+            self.paper_ledger.append_noarb_shadow(
+                PaperNoarbShadowRecord(
+                    timestamp=self.clock.now(),
+                    contract_id=_edge.match.pm_tick.contract_id,
+                    platform=_edge.match.pm_tick.source,
+                    reasons=list(_noarb_reasons),
+                    strike=_edge.match.matched_strike,
+                    expiry=_edge.match.matched_expiry,
+                    best_side=_edge.best_side,
+                    best_conservative_edge=_edge.best_conservative_edge,
+                    fill_adjusted_edge=_edge.fill_adjusted_edge,
+                    signal_emitted=(
+                        _edge.match.pm_tick.contract_id in passing_ids
+                    ),
                 )
             )
 
