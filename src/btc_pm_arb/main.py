@@ -1683,7 +1683,16 @@ async def _duration_task(
 
 
 async def _dashboard_task(agent: Agent, stop_event: asyncio.Event) -> None:
-    """Run the FastAPI dashboard server as a uvicorn task."""
+    """Run the FastAPI dashboard server as a uvicorn task.
+
+    Honors ``stop_event`` (2026-06-10 fix): the original implementation
+    awaited ``server.serve()`` unconditionally, so the TaskGroup never
+    exited -- ``--duration`` runs never completed and NO run path ever
+    reached ``recorder.close()`` (the cause of the final-hour gzip
+    truncation).  Now ``serve()`` races ``stop_event.wait()``; on stop,
+    uvicorn is asked to exit via ``server.should_exit`` and given a
+    bounded grace before a hard cancel.
+    """
     fastapi_app = create_app(shared_state=agent.shared_state)
     config = uvicorn.Config(
         fastapi_app,
@@ -1695,10 +1704,39 @@ async def _dashboard_task(agent: Agent, stop_event: asyncio.Event) -> None:
     server = uvicorn.Server(config)
     server.install_signal_handlers = lambda: None  # don't hijack our signals
     log.info("dashboard.starting", port=_DASHBOARD_PORT)
+    serve_task = asyncio.create_task(server.serve(), name="dashboard-serve")
+    stop_task = asyncio.create_task(stop_event.wait(), name="dashboard-stop")
     try:
-        await server.serve()
-    except Exception as exc:
-        log.error("dashboard.error", error=str(exc))
+        done, _pending = await asyncio.wait(
+            {serve_task, stop_task}, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if serve_task in done:
+            exc = serve_task.exception()
+            if exc is not None:
+                log.error("dashboard.error", error=str(exc))
+        else:
+            # stop_event fired: ask uvicorn to exit, bounded grace.
+            server.should_exit = True
+            try:
+                await asyncio.wait_for(serve_task, timeout=10.0)
+            except asyncio.TimeoutError:
+                log.warning("dashboard.stop_timeout_forcing_cancel")
+                serve_task.cancel()
+                try:
+                    await serve_task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            except Exception as exc:
+                log.error("dashboard.error", error=str(exc))
+            log.info("dashboard.stopped")
+    finally:
+        for t in (serve_task, stop_task):
+            if not t.done():
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
 
 
 # ── Replay (build step 5) ──────────────────────────────────────────────────────

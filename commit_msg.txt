@@ -1,45 +1,22 @@
-feat(recorder): C2 watchdog -- stream-silence + disk alarms, file log, supervised restart
+fix(main): C3 dashboard task honors stop_event -- --duration runs complete
 
-Makes the next capture-path failure loud within seconds instead of
-silent for 11 hours (2026-06-10 incident follow-up).
+Second defect from the 2026-06-10 incident review: _dashboard_task
+awaited uvicorn server.serve() unconditionally (with uvicorn's own
+signal handling disabled), so serve() never returned, the TaskGroup
+never exited, --duration runs never completed, and NO run path ever
+reached recorder.close() -- the mechanism behind the final-hour gzip
+truncation on every long capture run and the --duration dead-end.
 
-feeds/watchdog.py (new): RecorderWatchdog
-* per-stream last-write age check (config recorder_watchdog_silence_s,
-  default 120 s): one CRITICAL alarm per silence episode, re-armed on
-  recovery; never-written streams alarm from watchdog start.
-* disk free-space soft alarm (config recorder_disk_soft_free_gb,
-  default 5 GiB) via shutil.disk_usage, with 5% hysteresis -- fires
-  while writes still work, before hard ENOSPC.
-* layered alarm channels, none depending on the failing resource:
-  (1) stdout CRITICAL, (2) persistent file log, (3) WATCHDOG_ALARM
-  sentinel (reason+ts) under the recording dir, (4) ctypes MessageBeep.
-* supervised restart: calls the registered restart hook for a silent
-  stream, capped at recorder_watchdog_max_restarts per stream per run;
-  hook/beeper/sentinel failures are contained -- the watchdog can never
-  take down the run it guards.
-* echoes exactly one alarm when the recorder has already fatal-stopped.
+_dashboard_task now races serve() against stop_event.wait():
+* stop_event fires -> server.should_exit = True, 10 s bounded grace,
+  then hard cancel as a last resort; task returns and the TaskGroup
+  can exit into run()'s finally, where recorder.close() banks every
+  stream with valid gzip trailers.
+* serve() crashing (e.g. port taken) is logged and returns, as before
+  -- a dead dashboard neither wedges the group nor kills the run.
 
-recorder.py:
-* per-stream last-write monotonic stamps + last_write_monotonic() /
-  fatal_reason accessors for the watchdog.
-* persistent file-log channel (configure_recorder_file_log / file_log /
-  reset_recorder_file_log) writing outputs/recorder.log (gitignored);
-  the fatal path now logs there too, so the next failure leaves
-  evidence even if the console scrolls away.
-
-main.py:
-* feed + aux tasks registered through _supervised_task(), which hands
-  the watchdog a restart hook that only re-creates a task that has
-  actually finished (a live task is never duplicated).
-* RecorderWatchdog task started under --record-feeds; file log
-  configured when the recorder is enabled.
-
-config.py: recorder_watchdog_silence_s / _interval_s / _max_restarts,
-recorder_disk_soft_free_gb, recorder_file_log_path knobs.
-
-Tests: 14 new (silence episodes, re-arm/re-alarm, never-written stream,
-restart cap, contained hook/beeper failures, disk hysteresis, fatal
-echo, real-recorder async loop, file-log lifecycle).
-Full suite: 862 passed, 0 failed.
+Tests: 3 new with a stubbed uvicorn.Server (no socket): stop honored +
+should_exit set, crash path returns, duration->stop->dashboard-exit
+chain completes. Full suite: 865 passed, 0 failed.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
