@@ -81,6 +81,17 @@ class Settings(BaseSettings):
     # Rationale: on 2026-06-10 a full disk (ENOSPC) silently killed all six
     # capture streams 2.7 h into an overnight run.
     recorder_min_free_gb: float = Field(default=20.0, ge=0.0)
+    # Watchdog: a stream silent longer than this raises a CRITICAL alarm,
+    # appends the WATCHDOG_ALARM sentinel, and attempts a supervised
+    # restart of the dead component (capped per stream per run).
+    recorder_watchdog_silence_s: float = Field(default=120.0, gt=0.0)
+    recorder_watchdog_interval_s: float = Field(default=10.0, gt=0.0)
+    recorder_watchdog_max_restarts: int = Field(default=3, ge=0)
+    # Soft free-space alarm floor (GiB): CRITICAL while writes still work,
+    # giving the operator a window to free space before hard ENOSPC.
+    recorder_disk_soft_free_gb: float = Field(default=5.0, ge=0.0)
+    # Persistent recorder/watchdog evidence log (gitignored outputs/).
+    recorder_file_log_path: str = "./outputs/recorder.log"
 
     # ── Paper-trading ledger (Round 8) ────────────────────────────────────────
     # Append-only JSONL files persist would-be-trade records across restarts.

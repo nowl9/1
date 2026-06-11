@@ -1,36 +1,45 @@
-fix(recorder): C1 ENOSPC graceful-stop-loud + --record-feeds disk preflight
+feat(recorder): C2 watchdog -- stream-silence + disk alarms, file log, supervised restart
 
-Root-cause fix for the 2026-06-10 silent capture stop (ENOSPC during a
-polymarket write tripped the old disable-forever policy, silently
-killing all six streams for 11 hours).
+Makes the next capture-path failure loud within seconds instead of
+silent for 11 hours (2026-06-10 incident follow-up).
 
-recorder.py -- failure policy revised from silent-disable to
-graceful-stop-LOUD:
-* _disable() replaced by _fail(): closes EVERY open gzip handle
-  (banking buffered frames with valid trailers), logs CRITICAL
-  frame_recorder.fatal, appends a RECORDER_FAILED sentinel
-  (reason+ts+close results) under base_dir, and fires a new on_fatal
-  callback exactly once so the orchestrator stops the run.
-* close() / rotation-close failures now log CRITICAL with stream+path
-  instead of bare `except: pass` (no more swallowed close errors).
-* record() still never raises into feed callbacks.
+feeds/watchdog.py (new): RecorderWatchdog
+* per-stream last-write age check (config recorder_watchdog_silence_s,
+  default 120 s): one CRITICAL alarm per silence episode, re-armed on
+  recovery; never-written streams alarm from watchdog start.
+* disk free-space soft alarm (config recorder_disk_soft_free_gb,
+  default 5 GiB) via shutil.disk_usage, with 5% hysteresis -- fires
+  while writes still work, before hard ENOSPC.
+* layered alarm channels, none depending on the failing resource:
+  (1) stdout CRITICAL, (2) persistent file log, (3) WATCHDOG_ALARM
+  sentinel (reason+ts) under the recording dir, (4) ctypes MessageBeep.
+* supervised restart: calls the registered restart hook for a silent
+  stream, capped at recorder_watchdog_max_restarts per stream per run;
+  hook/beeper/sentinel failures are contained -- the watchdog can never
+  take down the run it guards.
+* echoes exactly one alarm when the recorder has already fatal-stopped.
+
+recorder.py:
+* per-stream last-write monotonic stamps + last_write_monotonic() /
+  fatal_reason accessors for the watchdog.
+* persistent file-log channel (configure_recorder_file_log / file_log /
+  reset_recorder_file_log) writing outputs/recorder.log (gitignored);
+  the fatal path now logs there too, so the next failure leaves
+  evidence even if the console scrolls away.
 
 main.py:
-* _record_feeds_preflight(): --record-feeds refuses to START when the
-  recording volume has < recorder_min_free_gb (default 20 GiB) free,
-  measured via shutil.disk_usage on the nearest existing ancestor
-  (never file-size sums).
-* run() now returns an exit code (0 ok / 1 recorder fatal / 2
-  preflight refused); on_fatal wires recorder failure -> stop_event +
-  nonzero exit; main() sys.exit()s nonzero codes.
+* feed + aux tasks registered through _supervised_task(), which hands
+  the watchdog a restart hook that only re-creates a task that has
+  actually finished (a live task is never duplicated).
+* RecorderWatchdog task started under --record-feeds; file log
+  configured when the recorder is enabled.
 
-config.py: new recorder_min_free_gb knob (default 20.0).
+config.py: recorder_watchdog_silence_s / _interval_s / _max_restarts,
+recorder_disk_soft_free_gb, recorder_file_log_path knobs.
 
-Tests: failure-policy tests rewritten for the new policy (trailers
-banked on all streams, sentinel content, on_fatal once, callback
-exception contained, close-failure loudness); new preflight guard
-tests. Full suite: 847 passed; the single red is the pre-existing
-test_fresh_data_passes flake (signal path, out of scope; passes in
-isolation).
+Tests: 14 new (silence episodes, re-arm/re-alarm, never-written stream,
+restart cap, contained hook/beeper failures, disk hysteresis, fatal
+echo, real-recorder async loop, file-log lifecycle).
+Full suite: 862 passed, 0 failed.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>

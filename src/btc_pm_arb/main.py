@@ -47,7 +47,7 @@ import uuid
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable, Coroutine
 
 import structlog
 import uvicorn
@@ -91,7 +91,11 @@ from btc_pm_arb.feeds.discovery import MarketDiscovery, run_discovery_loop
 from btc_pm_arb.feeds.health import FeedHealthTracker
 from btc_pm_arb.feeds.kalshi import KalshiFeed
 from btc_pm_arb.feeds.polymarket import PolymarketFeed
-from btc_pm_arb.feeds.recorder import FrameRecorder
+from btc_pm_arb.feeds.recorder import (
+    FrameRecorder,
+    configure_recorder_file_log,
+)
+from btc_pm_arb.feeds.watchdog import RecorderWatchdog
 from btc_pm_arb.models import ArbitrageSignal, DataSource, OptionTick, PredictionMarketTick
 from btc_pm_arb.pricing.cache import ProbabilityCache
 from btc_pm_arb.pricing.digital_pricer import DigitalPricer
@@ -1502,11 +1506,50 @@ async def _polymarket_task(
     log.info("polymarket_task.stopped")
 
 
+# All six capture streams recorded under --record-feeds, watched by the
+# RecorderWatchdog (2026-06-10 silent-stop incident).
+_CAPTURE_STREAMS: tuple[str, ...] = (
+    "deribit", "kalshi", "polymarket", "spot", "chainlink", "pm5min",
+)
+
+
+def _supervised_task(
+    tg: asyncio.TaskGroup,
+    name: str,
+    factory: Callable[[], Coroutine[Any, Any, None]],
+) -> Callable[[], bool]:
+    """Create a named task and return a restart hook for the watchdog.
+
+    The hook re-creates the task from ``factory`` only when the previous
+    task has finished -- a live task is never duplicated (a stream can
+    be silent while its task is alive, e.g. upstream quiet; restarting
+    would double-connect).  Returns True when a restart was initiated.
+    """
+    holder: dict[str, asyncio.Task] = {}
+
+    def _start() -> None:
+        holder["task"] = tg.create_task(factory(), name=name)
+
+    def _restart() -> bool:
+        task = holder.get("task")
+        if task is not None and not task.done():
+            return False
+        try:
+            _start()
+        except RuntimeError:
+            # TaskGroup already winding down -- nothing to restart into.
+            return False
+        return True
+
+    _start()
+    return _restart
+
+
 def _start_aux_capture_tasks(
     tg: asyncio.TaskGroup,
     stop_event: asyncio.Event,
     recorder: FrameRecorder,
-) -> None:
+) -> dict[str, Callable[[], bool]]:
     """Start the capture-only auxiliary latency-analysis streams.
 
     Called ONLY in live mode under ``--record-feeds`` (``recorder`` non-None).
@@ -1517,6 +1560,9 @@ def _start_aux_capture_tasks(
     stream) so it can never raise into the TaskGroup or disturb the live feeds.
     The default capture (deribit / kalshi / polymarket) is byte-unchanged
     whether or not these run.
+
+    Returns the per-stream restart hooks for the RecorderWatchdog (a
+    self-disabled aux stream is the prime supervised-restart target).
     """
     spot = DeribitIndexCapture(recorder, url=settings.deribit_url)
     chainlink = ChainlinkRoundCapture(
@@ -1529,10 +1575,19 @@ def _start_aux_capture_tasks(
         gamma_url=settings.polymarket_gamma_url,
         clob_url=settings.polymarket_clob_url,
     )
-    tg.create_task(spot.run(stop_event), name="aux-spot")
-    tg.create_task(chainlink.run(stop_event), name="aux-chainlink")
-    tg.create_task(pm5min.run(stop_event), name="aux-pm5min")
+    restarters = {
+        "spot": _supervised_task(
+            tg, "aux-spot", lambda: spot.run(stop_event),
+        ),
+        "chainlink": _supervised_task(
+            tg, "aux-chainlink", lambda: chainlink.run(stop_event),
+        ),
+        "pm5min": _supervised_task(
+            tg, "aux-pm5min", lambda: pm5min.run(stop_event),
+        ),
+    }
     log.info("aux_capture.enabled", streams=["spot", "chainlink", "pm5min"])
+    return restarters
 
 
 async def _scan_task(agent: Agent, stop_event: asyncio.Event) -> None:
@@ -1764,7 +1819,14 @@ async def run(
         if not _record_feeds_preflight(record_dir):
             return 2
         recorder = FrameRecorder(record_dir, on_fatal=_on_recorder_fatal)
-        log.info("frame_recorder.enabled", base_dir=str(record_dir))
+        # Persistent evidence channel: the 2026-06-10 fatal WARNING went
+        # to stdout only and scrolled away; the file log survives.
+        configure_recorder_file_log(Path(settings.recorder_file_log_path))
+        log.info(
+            "frame_recorder.enabled",
+            base_dir=str(record_dir),
+            file_log=settings.recorder_file_log_path,
+        )
 
     # Build step 1 (Fork 3): construct the simulated-clock seam from the
     # mode.  Live delegates to wall-clock; replay is advanceable.  In replay
@@ -1820,23 +1882,47 @@ async def run(
 
     try:
         async with asyncio.TaskGroup() as tg:
-            tg.create_task(
-                _deribit_task(agent, stop_event, recorder=recorder),
-                name="deribit-feed",
-            )
-            tg.create_task(
-                _kalshi_task(agent, stop_event, recorder=recorder),
-                name="kalshi-feed",
-            )
-            tg.create_task(
-                _polymarket_task(agent, stop_event, recorder=recorder),
-                name="polymarket-feed",
-            )
+            # Feed tasks are registered through _supervised_task so the
+            # RecorderWatchdog (below, --record-feeds only) can restart a
+            # dead one.  Without the watchdog the hooks are simply unused.
+            restarters: dict[str, Callable[[], bool]] = {
+                "deribit": _supervised_task(
+                    tg, "deribit-feed",
+                    lambda: _deribit_task(agent, stop_event, recorder=recorder),
+                ),
+                "kalshi": _supervised_task(
+                    tg, "kalshi-feed",
+                    lambda: _kalshi_task(agent, stop_event, recorder=recorder),
+                ),
+                "polymarket": _supervised_task(
+                    tg, "polymarket-feed",
+                    lambda: _polymarket_task(agent, stop_event, recorder=recorder),
+                ),
+            }
             # Capture-only auxiliary streams (fast spot / Chainlink round /
             # PM 5-min odds) for offline latency analysis -- ONLY under
             # --record-feeds (recorder set), and they touch no trading path.
             if recorder is not None:
-                _start_aux_capture_tasks(tg, stop_event, recorder)
+                restarters.update(
+                    _start_aux_capture_tasks(tg, stop_event, recorder)
+                )
+                watchdog = RecorderWatchdog(
+                    recorder,
+                    record_dir,
+                    streams=_CAPTURE_STREAMS,
+                    silence_threshold_s=settings.recorder_watchdog_silence_s,
+                    check_interval_s=settings.recorder_watchdog_interval_s,
+                    disk_soft_free_bytes=int(
+                        settings.recorder_disk_soft_free_gb * 2**30
+                    ),
+                    restarters=restarters,
+                    max_restarts_per_stream=(
+                        settings.recorder_watchdog_max_restarts
+                    ),
+                )
+                tg.create_task(
+                    watchdog.run(stop_event), name="recorder-watchdog",
+                )
             tg.create_task(_scan_task(agent, stop_event), name="scan")
             tg.create_task(_order_refresh_task(agent, stop_event), name="order-refresh")
             tg.create_task(agent.settlement_monitor.run(stop_event), name="settlement")

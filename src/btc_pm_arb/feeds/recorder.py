@@ -76,7 +76,9 @@ from __future__ import annotations
 import base64
 import gzip
 import json
+import logging
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import IO, Callable
@@ -95,6 +97,62 @@ _DEFAULT_MAX_DAILY_BYTES: int = 5 * 2**30
 # Sentinel filename appended under ``base_dir`` when the recorder fails
 # fatally.  Operators (and the next diagnostic session) look here first.
 SENTINEL_RECORDER_FAILED: str = "RECORDER_FAILED"
+
+
+# ── Persistent file log (2026-06-10: the fatal WARNING was stdout-only and
+#    scrolled away unrecorded; the next failure must leave evidence) ──────────
+
+_FILE_LOGGER_NAME = "btc_pm_arb.recorder_file"
+
+
+def configure_recorder_file_log(path: Path | str) -> logging.Logger:
+    """Attach a persistent file handler for recorder/watchdog events.
+
+    Replaces any previously configured handler (idempotent across
+    repeated calls).  The logger does NOT propagate to the root logger
+    -- it is a dedicated evidence channel, independent of the stdout
+    structlog pipeline.  ASCII-only by construction.
+    """
+    lg = logging.getLogger(_FILE_LOGGER_NAME)
+    lg.setLevel(logging.INFO)
+    lg.propagate = False
+    reset_recorder_file_log()
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    handler = logging.FileHandler(
+        p, encoding="ascii", errors="replace", delay=True,
+    )
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(message)s")
+    )
+    lg.addHandler(handler)
+    return lg
+
+
+def reset_recorder_file_log() -> None:
+    """Close and detach all handlers from the recorder file logger."""
+    lg = logging.getLogger(_FILE_LOGGER_NAME)
+    for handler in list(lg.handlers):
+        try:
+            handler.close()
+        except Exception:
+            pass
+        lg.removeHandler(handler)
+
+
+def file_log(level: int, message: str) -> None:
+    """Best-effort write to the recorder file log (no-op if unconfigured).
+
+    Never raises: the file log is an alarm channel and must not become
+    a new failure source (e.g. when the disk itself is the problem).
+    """
+    lg = logging.getLogger(_FILE_LOGGER_NAME)
+    if not lg.handlers:
+        return
+    try:
+        lg.log(level, message)
+    except Exception:
+        pass
 
 
 class FrameRecorder:
@@ -129,6 +187,9 @@ class FrameRecorder:
         # (source.value, "YYYY-MM-DD") for which the over-budget WARNING
         # has already been emitted — prevents log spam.
         self._warned: set[tuple[str, str]] = set()
+        # source.value -> time.monotonic() of the last successful write.
+        # Read by the RecorderWatchdog to detect silently-dead streams.
+        self._last_write: dict[str, float] = {}
         self._disabled = False
         self._lock = threading.Lock()
 
@@ -183,8 +244,19 @@ class FrameRecorder:
                 handle = self._handle_for(source_value, ts)
                 handle.write(data)
                 self._track_daily(source_value, ts, len(data))
+                self._last_write[source_value] = time.monotonic()
         except (OSError, IOError) as exc:
             self._fail(reason="io_error", exc=exc)
+
+    def last_write_monotonic(self) -> dict[str, float]:
+        """Snapshot of per-stream ``time.monotonic()`` last-write stamps."""
+        with self._lock:
+            return dict(self._last_write)
+
+    @property
+    def fatal_reason(self) -> str | None:
+        """Non-None once the recorder has fatal-stopped (see :meth:`_fail`)."""
+        return self._fatal_reason
 
     def close(self) -> None:
         """Close all open file handles, banking buffered frames + trailers.
@@ -284,6 +356,11 @@ class FrameRecorder:
                 error_type=type(exc).__name__,
                 error=str(exc),
             )
+            file_log(
+                logging.CRITICAL,
+                "frame_recorder.fatal reason=%s error_type=%s error=%s"
+                % (reason, type(exc).__name__, str(exc).replace("\n", " ")),
+            )
             close_failures: list[str] = []
             for source_value, (path, h) in self._handles.items():
                 try:
@@ -296,6 +373,12 @@ class FrameRecorder:
                         path=str(path),
                         error_type=type(close_exc).__name__,
                         error=str(close_exc),
+                    )
+                    file_log(
+                        logging.CRITICAL,
+                        "frame_recorder.fatal_close_failed source=%s "
+                        "path=%s error=%s"
+                        % (source_value, path, str(close_exc).replace("\n", " ")),
                     )
             self._handles.clear()
         self._write_failed_sentinel(
