@@ -820,13 +820,14 @@ function TabOverview({ snap }) {
   const positions = snap?.positions || [];
   const signals = snap?.signals || [];
   const risk = snap?.risk_config || {};
+  const paperPerf = snap?.paper_performance || {};
 
   const unrealized = perf.unrealized_pnl ?? summary.unrealized_pnl ?? 0;
   const settled = perf.settled_pnl ?? 0;
   const winRate = perf.win_rate;
   const tradeCount = perf.trade_count ?? perf.total_trades;
-  const exposure = summary.total_exposure ?? perf.total_exposure ?? 0;
-  const maxExposure = risk.max_total_exposure_usd || 1;
+  const exposure = paperPerf.total_exposure_usd ?? 0;
+  const maxExposure = risk.max_global_exposure || 1;
   const exposurePct = exposure / maxExposure;
 
   const actionable = signals.filter(s => s && s.actionable && !s.filtered);
@@ -1239,56 +1240,26 @@ function TabPositions({ snap }) {
 }
 
 // ─── Tab: Controls ───────────────────────────────────────────────────────────
-const SLIDERS = [
-  { key: "max_position_per_contract_usd", label: "MAX PER CONTRACT", min: 100,  max: 2000,  step: 50,   fmt: v => fmtUsd(v, { digits: 0 }) },
-  { key: "max_total_exposure_usd",        label: "MAX TOTAL EXPOSURE", min: 1000, max: 20000, step: 500,  fmt: v => fmtUsd(v, { digits: 0 }) },
-  { key: "min_edge",                       label: "MIN EDGE",           min: 0.01, max: 0.10,  step: 0.005, fmt: v => fmtPct(v, 1) },
-  { key: "min_confidence",                 label: "MIN CONFIDENCE",     min: 0.10, max: 0.80,  step: 0.05,  fmt: v => fmtPct(v, 0) },
-  { key: "max_open_positions",             label: "MAX OPEN POSITIONS", min: 5,    max: 50,    step: 1,     fmt: v => `${Math.round(v)}` },
+// Risk caps are enforced by execution/risk_limits.py and configured via
+// RISK_* env vars only; the dashboard displays them read-only.
+const RISK_ROWS = [
+  { key: "max_position_per_market",  label: "MAX PER MARKET",      fmt: v => fmtUsd(v, { digits: 0 }) },
+  { key: "max_global_exposure",      label: "MAX GLOBAL EXPOSURE", fmt: v => fmtUsd(v, { digits: 0 }) },
+  { key: "max_daily_loss",           label: "MAX DAILY LOSS",      fmt: v => fmtUsd(v, { digits: 0 }) },
+  { key: "risk_blocks_current_run",  label: "BLOCK EVENTS (THIS RUN)", fmt: v => `${Math.round(v)}` },
 ];
-
-const SLIDER_DEFAULTS = {
-  max_position_per_contract_usd: 500,
-  max_total_exposure_usd: 5000,
-  min_edge: 0.02,
-  min_confidence: 0.5,
-  max_open_positions: 10,
-};
 
 function TabControls({ snap, showToast }) {
   const [tokenInput, setTokenInputState] = useState(getToken());
   const [hasToken, setHasToken] = useState(!!getToken());
   const [confirmLive, setConfirmLive] = useState(false);
   const [confirmToken, setConfirmToken] = useState("");
-  const [sliderVals, setSliderVals] = useState(SLIDER_DEFAULTS);
-  const initialLoaded = useRef(false);
-  const debounceTimers = useRef({});
-
-  useEffect(() => {
-    let cancelled = false;
-    fetch("/api/config")
-      .then(r => r.json())
-      .then(cfg => {
-        if (cancelled) return;
-        setSliderVals(prev => {
-          const next = { ...prev };
-          for (const s of SLIDERS) {
-            if (cfg[s.key] != null && !Number.isNaN(Number(cfg[s.key]))) {
-              next[s.key] = Number(cfg[s.key]);
-            }
-          }
-          return next;
-        });
-        initialLoaded.current = true;
-      })
-      .catch(() => {});
-    return () => { cancelled = true; };
-  }, []);
 
   const status = snap?.agent_status;
   const paused = status === "paused";
   const dryRun = status === "dry_run";
   const regime = snap?.volatility_regime || {};
+  const risk = snap?.risk_config || {};
 
   const saveToken = () => {
     setToken(tokenInput.trim());
@@ -1299,14 +1270,6 @@ function TabControls({ snap, showToast }) {
     setToken("");
     setTokenInputState("");
     setHasToken(false);
-  };
-
-  const onSlider = (key, value) => {
-    setSliderVals(prev => ({ ...prev, [key]: value }));
-    if (debounceTimers.current[key]) clearTimeout(debounceTimers.current[key]);
-    debounceTimers.current[key] = setTimeout(() => {
-      apiCall("/api/risk-config", { [key]: value }, showToast);
-    }, 300);
   };
 
   const togglePause = () => {
@@ -1408,21 +1371,16 @@ function TabControls({ snap, showToast }) {
       <div className="card">
         <div className="card-header">
           <div className="card-title">RISK LIMITS</div>
+          <Pill kind="blue">ENFORCED</Pill>
         </div>
-        {SLIDERS.map(s => (
-          <div className="slider-row" key={s.key}>
+        {RISK_ROWS.map(r => (
+          <div className="slider-row" key={r.key}>
             <div className="slider-head">
-              <span className="slider-label">{s.label}</span>
-              <span className="slider-value">{s.fmt(sliderVals[s.key])}</span>
+              <span className="slider-label">{r.label}</span>
+              <span className="slider-value">
+                {risk[r.key] != null ? r.fmt(Number(risk[r.key])) : "—"}
+              </span>
             </div>
-            <input
-              type="range"
-              min={s.min}
-              max={s.max}
-              step={s.step}
-              value={sliderVals[s.key]}
-              onChange={(e) => onSlider(s.key, Number(e.target.value))}
-            />
           </div>
         ))}
       </div>

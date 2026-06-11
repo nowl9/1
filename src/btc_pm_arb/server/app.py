@@ -8,7 +8,6 @@ GET  /api/config          current risk config (read-only, no auth)
 WS   /ws/snapshot         push full snapshot every 1.5 s
 POST /api/pause           pause execution
 POST /api/resume          resume execution
-POST /api/risk-config     update risk limits
 POST /api/mode            toggle dry-run / live (requires confirmation token)
 
 Static
@@ -36,7 +35,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from btc_pm_arb.server.state import SharedState
 
@@ -48,16 +47,6 @@ _STATIC_DIR = Path(__file__).parent / "static"
 
 
 # ── Request models ────────────────────────────────────────────────────────────
-
-class RiskConfigRequest(BaseModel):
-    max_position_per_contract_usd: float | None = None
-    max_total_exposure_usd: float | None = None
-    max_open_positions: int | None = None
-    max_correlated_exposure_usd: float | None = None
-    correlated_strike_band_pct: float | None = None
-    min_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
-    min_edge: float | None = Field(default=None, ge=0.0, le=1.0)
-
 
 class ModeRequest(BaseModel):
     live: bool
@@ -156,18 +145,6 @@ def create_app(shared_state: SharedState | None = None) -> FastAPI:
             s.paused = False
         logger.info("dashboard.agent_resumed")
         return {"status": "running"}
-
-    # ── POST /api/risk-config ─────────────────────────────────────────────────
-
-    @app.post("/api/risk-config", dependencies=[Depends(require_auth)])
-    async def update_risk_config(req: RiskConfigRequest) -> dict[str, Any]:
-        async with state.write() as s:
-            cfg = s.risk_config
-            updates = req.model_dump(exclude_none=True)
-            cfg.update(updates)
-            updated = dict(cfg)
-        logger.info("dashboard.risk_config_updated", **updated)
-        return {"status": "ok", "risk_config": updated}
 
     # ── POST /api/mode ────────────────────────────────────────────────────────
 

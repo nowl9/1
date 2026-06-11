@@ -72,7 +72,8 @@ class AgentState:
     # ── Performance ───────────────────────────────────────────────────────────
     performance: dict[str, Any] = field(default_factory=dict)
 
-    # ── Risk config (live mirror of RiskManager config) ───────────────────────
+    # ── Risk caps (live mirror of the enforcing RiskLimits layer, plus the
+    # current-run block-EVENT count from the funnel) ───────────────────────────
     risk_config: dict[str, Any] = field(default_factory=dict)
 
     # ── Round 8 Commit 3: Paper-trading panels ────────────────────────────────

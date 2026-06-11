@@ -6,7 +6,6 @@ Tests cover:
   - GET /api/status returns current agent state
   - WebSocket /ws/snapshot pushes JSON snapshot with all required keys
   - POST /api/pause and /api/resume toggle paused flag
-  - POST /api/risk-config validates and merges config updates
   - POST /api/mode rejects live mode with wrong token
   - Auth: control endpoints reject missing/wrong bearer token
   - SharedState snapshot serialization with enriched schema
@@ -85,17 +84,6 @@ def test_config_returns_dict(client):
     assert isinstance(body, dict)
 
 
-def test_config_reflects_risk_config_update(client):
-    """After updating risk config, GET /api/config should return updated values."""
-    client.post(
-        "/api/risk-config",
-        json={"min_confidence": 0.72},
-        headers=_auth(),
-    )
-    body = client.get("/api/config").json()
-    assert body["min_confidence"] == 0.72
-
-
 # ── GET /api/status ───────────────────────────────────────────────────────────
 
 def test_status_returns_200(client):
@@ -168,63 +156,6 @@ async def test_resume_clears_paused_flag(shared_state: SharedState, monkeypatch)
     client.post("/api/resume", headers=_auth())
     async with shared_state.read() as s:
         assert s.paused is False
-
-
-# ── POST /api/risk-config ─────────────────────────────────────────────────────
-
-def test_risk_config_update(client, shared_state):
-    resp = client.post(
-        "/api/risk-config",
-        json={"max_position_per_contract_usd": 750.0, "min_confidence": 0.55},
-        headers=_auth(),
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["risk_config"]["max_position_per_contract_usd"] == 750.0
-    assert body["risk_config"]["min_confidence"] == 0.55
-
-
-def test_risk_config_partial_update(client):
-    """Sending only one field should not wipe others."""
-    # First set two fields
-    client.post(
-        "/api/risk-config",
-        json={"max_total_exposure_usd": 8000.0, "min_confidence": 0.45},
-        headers=_auth(),
-    )
-    # Then update only one
-    resp = client.post(
-        "/api/risk-config",
-        json={"min_confidence": 0.50},
-        headers=_auth(),
-    )
-    body = resp.json()
-    assert body["risk_config"]["min_confidence"] == 0.50
-    assert body["risk_config"]["max_total_exposure_usd"] == 8000.0
-
-
-def test_risk_config_invalid_confidence_rejected(client):
-    resp = client.post(
-        "/api/risk-config",
-        json={"min_confidence": 1.5},   # > 1.0
-        headers=_auth(),
-    )
-    assert resp.status_code == 422
-
-
-def test_risk_config_requires_auth(client):
-    resp = client.post("/api/risk-config", json={"min_confidence": 0.5})
-    assert resp.status_code == 401
-
-
-def test_risk_config_min_edge_accepted(client):
-    resp = client.post(
-        "/api/risk-config",
-        json={"min_edge": 0.02},
-        headers=_auth(),
-    )
-    assert resp.status_code == 200
-    assert resp.json()["risk_config"]["min_edge"] == 0.02
 
 
 # ── POST /api/mode ────────────────────────────────────────────────────────────

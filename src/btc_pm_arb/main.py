@@ -1303,13 +1303,15 @@ class Agent:
             s.paper_performance = paper_perf
             s.signal_fired_skipped = funnel
 
-            # Risk config snapshot
-            cfg = self.risk.config
+            # Enforcing risk caps (execution/risk_limits.py).  The block
+            # count is the per-process funnel counter, which matches the
+            # per-run cap window; a persistent breach writes one block per
+            # scan tick, so it counts block EVENTS, not unique intents.
             s.risk_config = {
-                "max_position_per_contract_usd": cfg.max_position_per_contract_usd,
-                "max_total_exposure_usd": cfg.max_total_exposure_usd,
-                "max_open_positions": cfg.max_open_positions,
-                "min_confidence": cfg.min_confidence,
+                "max_position_per_market": self.risk_limits.max_position_per_market,
+                "max_global_exposure": self.risk_limits.max_global_exposure,
+                "max_daily_loss": self.risk_limits.max_daily_loss,
+                "risk_blocks_current_run": self._funnel["paper_orders_risk_blocked"],
             }
 
             # Latest BTC price
