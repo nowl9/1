@@ -544,6 +544,45 @@ def _meta_close_time(meta: dict) -> datetime | None:
     return dt
 
 
+def _derive_ask_depth(opposite_bid_levels: list) -> list[tuple[float, float]]:
+    """Derive executable ask-side depth from the OPPOSITE side's resting bids.
+
+    Complementary-pair pricing: a resting NO bid at price ``p`` for qty ``q``
+    IS an offer to sell YES at ``1 - p`` for the same qty -- so the YES ask
+    book is the NO bid book reflected through 1.0, and vice versa.  Returns
+    ``[(price, size_usd), ...]`` sorted ascending (cheapest-first): the exact
+    shape ``edge.fill_adjusted_price``, ``FillSimulator._evaluate_book_walk``
+    and the Polymarket replay re-attach all consume.  Contract count doubles
+    as the USD-notional proxy (one contract pays at most $1), matching
+    ``replay._book_levels``.  Malformed levels are skipped individually --
+    one bad level must not blank the whole book.
+
+    Post-March-2026 fixed-point shape ONLY (``[price_dollars_str, qty_str]``).
+    No pre-migration ``[price_cents, qty]`` frame exists anywhere on disk
+    (Phase 1 audit 2026-06-11: 28,773 of 28,773 recorded orderbook frames
+    across all four banked windows are ``orderbook_fp`` / ``*_dollars``), so
+    there is deliberately NO legacy branch -- do not add one speculatively.
+
+    Same-side resting-BID depth is deliberately NOT emitted: the tick's two
+    ``order_book_*`` fields are ask-side executable depth by convention (the
+    walkers lift cheapest-first), so mixing resting bids into them would
+    corrupt the walk, and carrying bids separately needs new model + ledger
+    fields -- deferred until a maker-side strategy exists to consume them.
+    """
+    out: list[tuple[float, float]] = []
+    for level in opposite_bid_levels or []:
+        try:
+            price = round(1.0 - float(level[0]), 4)
+            size = float(level[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if size <= 0.0:
+            continue
+        out.append((price, size))
+    out.sort(key=lambda lvl: lvl[0])
+    return out
+
+
 def _build_tick(ticker: str, meta: dict, book: dict) -> PredictionMarketTick | None:
     """Combine cached market metadata with a fresh orderbook into a tick.
 
@@ -552,6 +591,13 @@ def _build_tick(ticker: str, meta: dict, book: dict) -> PredictionMarketTick | N
     ``no_dollars`` keys; asks are derived from the opposite side
     (``yes_ask = 1.0 - best_no_bid``).  Returns ``None`` if the
     orderbook has no bids on either side (no quotes available).
+
+    Depth (2026-06-11 fix): the full executable ask-side book is forwarded
+    as ``order_book_yes`` / ``order_book_no`` via :func:`_derive_ask_depth`.
+    Before this, the levels were silently dropped at this aggregation point
+    -- every Kalshi tick carried empty depth lists, so the empty-book filter
+    blocked all Kalshi signals and the fill walkers walked empty books on
+    the only venue we execute on.
     """
     yes_levels = book.get("yes_dollars") or []
     no_levels = book.get("no_dollars") or []
@@ -590,5 +636,10 @@ def _build_tick(ticker: str, meta: dict, book: dict) -> PredictionMarketTick | N
         "no_bid_dollars": no_best_bid,
         "no_ask_dollars": no_best_ask,
         "close_time": meta.get("close_time"),
+        # Executable depth: buying YES lifts the NO bids (reflected through
+        # 1.0) and vice versa.  normalize_kalshi_tick passes these through
+        # onto the tick verbatim.
+        "order_book_yes": _derive_ask_depth(no_levels),
+        "order_book_no": _derive_ask_depth(yes_levels),
     }
     return normalize_kalshi_tick(raw)
