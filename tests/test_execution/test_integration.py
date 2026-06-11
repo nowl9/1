@@ -59,6 +59,14 @@ from btc_pm_arb.signals.matcher import ContractMatcher
 
 # ── Shared fixtures / helpers ─────────────────────────────────────────────────
 
+# _NOW stays wall-clock here (unlike test_signals/test_filters.py) because
+# the vol-surface tests below flow through VolSurface/DigitalPricer, which
+# read datetime.now() directly with no injection seam and need _EXPIRY in
+# the real future.  The SignalFilter calls, however, inject clock=lambda:
+# _NOW so the 300 s stale-data gate measures fixture age against the same
+# instant the fixtures were stamped with -- otherwise those assertions
+# depend on how much suite time elapsed since module import (the mechanism
+# behind the 2026-06-10 test_fresh_data_passes flake).
 _NOW = datetime.now(timezone.utc)
 _EXPIRY = _NOW + timedelta(days=14)
 _UNDERLYING = 100_000.0
@@ -244,7 +252,7 @@ def test_signal_filter_passes_clear_arb():
     tick = _pm_tick(yes_bid=0.40, yes_ask=0.44)
     match = matcher.match(tick, cache)
     edge = calc.compute(match)
-    signals = filt.filter([edge])
+    signals = filt.filter([edge], clock=lambda: _NOW)
     assert len(signals) == 1
     assert signals[0].trade_side == "buy_yes"
 
@@ -263,7 +271,7 @@ async def test_full_pipeline_order_placed():
     tick = _pm_tick(yes_bid=0.40, yes_ask=0.44)
     match = matcher.match(tick, cache)
     edge = calc.compute(match)
-    signals = filt.filter([edge])
+    signals = filt.filter([edge], clock=lambda: _NOW)
     assert signals
 
     sig = signals[0].model_copy(update={"confidence": 0.80})
@@ -426,7 +434,7 @@ async def test_signal_below_edge_threshold_not_placed():
     assert match is not None
 
     edge = calc.compute(match)
-    signals = filt.filter([edge])
+    signals = filt.filter([edge], clock=lambda: _NOW)
     # edge_yes_conservative = 0.46 - 0.47 = -0.01 → no positive edge
     assert signals == []
     # No orders should be in the manager

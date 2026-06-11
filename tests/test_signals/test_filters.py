@@ -9,6 +9,10 @@ Key scenarios:
   - Vol fit RMSE too high → rejected when surface provided.
   - Passing signals are sorted by adjusted_edge descending.
   - explains() returns None for passing edges and a reason string for rejected ones.
+
+Determinism (2026-06-10): every test here is hermetic against wall-clock
+drift -- _NOW is a pinned literal and the _pin_filter_clock fixture routes
+SignalFilter's clock seam through it.  See the notes at both definitions.
 """
 
 from __future__ import annotations
@@ -26,8 +30,46 @@ from btc_pm_arb.signals.matcher import MatchResult
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-_NOW = datetime.now(timezone.utc)
-_EXPIRY = _NOW + timedelta(days=27)   # ~27 days out (always in the future)
+# Pinned to a FIXED instant -- deliberately NOT datetime.now().  The previous
+# import-time `_NOW = datetime.now(timezone.utc)` was captured at pytest
+# COLLECTION (session t=0) while SignalFilter's staleness gate compared the
+# fixture timestamps to the wall clock at EXECUTION time, minutes later: on
+# full-suite runs slower than ~315 s, fixture age crossed the 300 s
+# max_data_age_seconds cutoff and test_fresh_data_passes (30 s fixture, the
+# tightest margin here) flaked with "options_data_age 301s > max 300.0s".
+# The _pin_filter_clock fixture below injects this same instant into the
+# filter's clock seam, so every age and days-to-expiry is exactly what the
+# test names claim, regardless of suite duration or machine load.  The date
+# is deliberately in the past: if a real wall-clock comparison ever sneaks
+# back into these tests, they fail loudly (age ~days), not flakily.
+_NOW = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+_EXPIRY = _NOW + timedelta(days=27)   # ~27 days out (relative to _NOW)
+
+
+@pytest.fixture(autouse=True)
+def _pin_filter_clock(monkeypatch):
+    """Freeze SignalFilter's wall clock at _NOW for every test in this module.
+
+    The fixture helpers below stamp tick/entry timestamps relative to _NOW;
+    production's _reject_stale_data and _reject_expiry_bounds compare those
+    stamps to the per-call ``clock=`` seam (filters._ctx_now), which falls
+    back to the real wall clock when unset.  Defaulting the seam to _NOW
+    makes the whole module hermetic.  A test can still override by passing
+    its own ``clock=`` explicitly (setdefault leaves explicit values alone).
+    """
+    orig_filter = SignalFilter.filter
+    orig_explains = SignalFilter.explains
+
+    def _filter_pinned(self, *args, **kwargs):
+        kwargs.setdefault("clock", lambda: _NOW)
+        return orig_filter(self, *args, **kwargs)
+
+    def _explains_pinned(self, *args, **kwargs):
+        kwargs.setdefault("clock", lambda: _NOW)
+        return orig_explains(self, *args, **kwargs)
+
+    monkeypatch.setattr(SignalFilter, "filter", _filter_pinned)
+    monkeypatch.setattr(SignalFilter, "explains", _explains_pinned)
 
 
 def _pm_tick(
@@ -559,3 +601,32 @@ def test_depth_gate_disabled_by_config():
     e = _edge_with_book(order_book_yes=[])
     filt = SignalFilter(FilterConfig(require_nonempty_book=False))
     assert len(filt.filter([e])) == 1
+
+
+# ── Clock seam ────────────────────────────────────────────────────────────────
+
+
+def test_ctx_now_falls_back_to_wall_clock():
+    """The seam's default branch (no injected clock) reads the real wall
+    clock.  Kept under explicit test because every other test in this
+    module now pins the seam via _pin_filter_clock, so nothing else
+    exercises the fallback."""
+    from btc_pm_arb.signals.filters import _ctx_now
+
+    before = datetime.now(timezone.utc)
+    got = _ctx_now({})
+    after = datetime.now(timezone.utc)
+    assert before <= got <= after
+
+
+def test_pin_filter_clock_respects_explicit_clock():
+    """The autouse pin uses setdefault: a test that passes its own clock=
+    still wins.  Guards the fixture's escape hatch."""
+    e = _edge(match=_match(), conservative_edge=0.10, adj_yes=0.10, mid_yes=0.15)
+    filt = SignalFilter()
+    # With the pinned clock (age 0) the edge passes...
+    assert len(filt.filter([e])) == 1
+    # ...but an explicit clock 600 s ahead makes the same fixture stale.
+    ahead = lambda: _NOW + timedelta(seconds=600)  # noqa: E731
+    assert filt.filter([e], clock=ahead) == []
+    assert "options_data_age" in filt.explains(e, clock=ahead)
