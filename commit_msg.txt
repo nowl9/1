@@ -1,22 +1,22 @@
-fix(main): C3 dashboard task honors stop_event -- --duration runs complete
+fix(main): C4 clean shutdown -- one Ctrl-C banks every gz with a trailer; SIGBREAK wired
 
-Second defect from the 2026-06-10 incident review: _dashboard_task
-awaited uvicorn server.serve() unconditionally (with uvicorn's own
-signal handling disabled), so serve() never returned, the TaskGroup
-never exited, --duration runs never completed, and NO run path ever
-reached recorder.close() -- the mechanism behind the final-hour gzip
-truncation on every long capture run and the --duration dead-end.
+Completes the shutdown chain for the 2026-06-10 capture-trust work:
+stop signal -> stop_event -> every task winds down (dashboard included
+since C3) -> run() finally -> recorder.close() flushes and closes every
+recording gzip with a valid trailer (close failures CRITICAL since C1).
+This retires the final-hour truncation defect: long runs previously
+ended in a force-kill because the run never exited, losing the last
+hour's buffered gzip tail.
 
-_dashboard_task now races serve() against stop_event.wait():
-* stop_event fires -> server.should_exit = True, 10 s bounded grace,
-  then hard cancel as a last resort; task returns and the TaskGroup
-  can exit into run()'s finally, where recorder.close() banks every
-  stream with valid gzip trailers.
-* serve() crashing (e.g. port taken) is logged and returns, as before
-  -- a dead dashboard neither wedges the group nor kills the run.
+main.py:
+* signal wiring factored into _install_stop_signals(stop_event); now
+  also registers SIGBREAK (Windows Ctrl-Break) alongside SIGINT and
+  SIGTERM.  Ctrl-Break follows the exact same clean-stop path as
+  Ctrl-C, and is what a supervisor (or the Phase-3 drill) can deliver
+  programmatically via GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT).
 
-Tests: 3 new with a stubbed uvicorn.Server (no socket): stop honored +
-should_exit set, crash path returns, duration->stop->dashboard-exit
-chain completes. Full suite: 865 passed, 0 failed.
+Tests: 3 new for the helper (Windows signal.signal fallback path,
+loop.add_signal_handler path, SIGBREAK -> stop_event).
+Full suite: 868 passed, 0 failed.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>

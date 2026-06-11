@@ -1817,6 +1817,39 @@ def _record_feeds_preflight(record_dir: Path) -> bool:
     return True
 
 
+# ── Stop-signal wiring (C4, 2026-06-10) ───────────────────────────────────────
+
+
+def _install_stop_signals(stop_event: asyncio.Event) -> None:
+    """Wire SIGINT / SIGTERM / SIGBREAK to ``stop_event``.
+
+    One Ctrl-C (or Ctrl-Break / kill) -> ``stop_event`` -> every task
+    winds down (the dashboard included, since C3) -> ``run()``'s finally
+    flushes and closes every recording gzip with a valid trailer.
+
+    SIGBREAK is Windows-only and is also what a supervisor can deliver
+    programmatically (``GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT)`` to
+    a process group), so shutdown drills can exercise the exact same
+    stop path as a console Ctrl-C.
+    """
+    loop = asyncio.get_running_loop()
+    sigs: list[signal.Signals] = [signal.SIGINT, signal.SIGTERM]
+    sigbreak = getattr(signal, "SIGBREAK", None)
+    if sigbreak is not None:
+        sigs.append(sigbreak)
+    for sig in sigs:
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except (NotImplementedError, RuntimeError):
+            # Windows: loop.add_signal_handler is not supported.
+            # signal.signal works for SIGINT / SIGBREAK; SIGTERM is
+            # best-effort.
+            try:
+                signal.signal(sig, lambda *_: stop_event.set())
+            except (ValueError, OSError):
+                pass
+
+
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 async def run(
@@ -1882,17 +1915,7 @@ async def run(
     agent = Agent(dry_run=dry_run, clock=clock)
     stop_event = asyncio.Event()
 
-    loop = asyncio.get_running_loop()
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        try:
-            loop.add_signal_handler(sig, stop_event.set)
-        except NotImplementedError:
-            # Windows: loop.add_signal_handler is not supported.
-            # signal.signal works for SIGINT; SIGTERM is best-effort.
-            try:
-                signal.signal(sig, lambda *_: stop_event.set())
-            except (ValueError, OSError):
-                pass
+    _install_stop_signals(stop_event)
 
     log.info(
         "agent.starting",
