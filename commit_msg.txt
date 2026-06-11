@@ -1,43 +1,27 @@
-test(signals): pin filter-test clock -- kill the test_fresh_data_passes flake class
+docs(lowvol): C2 maker-side feasibility diagnostic on the banked quiet windows
 
-Root cause (confirmed empirically at the exact boundary): test_filters.py
-captured `_NOW = datetime.now()` at pytest COLLECTION time (session t=0),
-while SignalFilter._reject_stale_data compares fixture timestamps to the
-wall clock at EXECUTION time (FilterConfig.max_data_age_seconds = 300 s).
-test_fresh_data_passes builds a 30 s-old fixture and runs ~84-88% of the
-way through the suite, so it fails iff suite-elapsed-at-execution > 270 s:
-the two observed failures were the ~315 s full runs; ~275-285 s runs and
-isolation (0.9 s) always passed.  A drift probe flipped the assertion at
-exactly 270/271 s with the predicted reason ("options_data_age 301s >
-max 300.0s").  State-leakage alternatives (settings singleton, structlog,
-class caches, tracker singletons) were investigated and ruled out --
-SignalFilter reads none of them.
+docs/diag_lowvol_maker_2026-06-11.md -- P2-P5 read-only characterization
+via a component harness (replay-mirroring decode + VolSurface/DigitalPricer/
+ProbabilityCache/ContractMatcher; no Agent, no ReplayReader, no paper_ledger
+writes; data/recordings opened read-only). Windows 0530/0601/0609 + 0611
+partials; frame counts cross-validate the overnight sweep exactly.
 
-Fix (test-side only; no production logic touched):
-* tests/test_signals/test_filters.py: _NOW is now a PINNED literal
-  (deliberately in the past -- any wall-clock comparison that sneaks back
-  in fails loudly, not flakily) and a module-wide autouse fixture routes
-  the production clock seam (filter()/explains() clock=, filters._ctx_now)
-  through it.  This de-arms the same bomb in the ~19 sibling PASS tests
-  (0 s fixtures, 300 s fuse) and the reason-flip case in
-  test_stale_pm_data_rejected, and covers future tests in the module.
-  Two new tests pin the seam's wall-clock fallback branch and the
-  fixture's explicit-clock escape hatch.
-* tests/test_execution/test_integration.py: the three SignalFilter call
-  sites inject clock=lambda: _NOW (same 300 s-class exposure on the two
-  PASS tests); _NOW itself stays wall-clock because the vol-surface tests
-  there flow through seam-less datetime.now() code and need _EXPIRY in
-  the real future.
+Findings: quiet books are tight-but-thin at the touch (median 0.6-1c spread,
+hundreds USD-proxy at touch, 5-20x within 1c -- the maker-side complement of
+the measured 16-18pp taker haircut); Kalshi formed ZERO matched terminal
+contracts in any window (maker fair-anchoring is Polymarket-only; feeds the
+terminal-Kalshi open question); fair-anchored quotes at fair+/-1..3c are
+ONE-SIDED (fair at/below best bid on ~65% of boundaries; 0 bid-side crosses
+in 18,904 pairs) and RARELY interact (upper bound 0.35-0.75 crosses/ct-hr,
+26/32 events from 0611); adverse-selection proxy shows zero pickoffs with
+markout ~= offset (n=32 events -- consistent with, not a bound on, low
+adverse selection). Epistemic header verbatim: no queue position, no fee
+model, no inventory dynamics; upper-bound feasibility evidence, not P&L;
+a maker build decision still requires the Stage 4 branch.
 
-Known same-class siblings left as-is (documented, margins not practically
-reachable): 7 tests in tests/test_pricing/test_realized_vol.py couple to
-RealizedVolTracker's 1 h query-time eviction window with ~87-118 min of
-suite-runtime slack; test_integration's vol-surface tests flip only when
-_EXPIRY (+14 d) passes.
-
-Verification: target files green (44 + 28); three sequential full-suite
-runs green: 874/876/876 passed -- the third took 322.45 s, SLOWER than
-the ~315 s runs that flaked before the fix, exercising the exact failure
-condition.
+All headline numbers independently recomputed (second implementation) and
+reproduced exactly, incl. one raw-frame end-to-end spot check. Docs only;
+zero src changes; probe scripts + datasets under gitignored outputs/ and
+analysis_out/.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
