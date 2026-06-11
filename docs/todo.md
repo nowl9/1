@@ -105,6 +105,38 @@ scope.
 
 ---
 
+## LOW-VOL TRACK (scoped 2026-06-11 -- thesis documented; no build committed)
+
+_The scorecard must not be all high-vol-dependent; the market is quiet most
+of the time. If Stage 4's Q1 read (the post-FOMC decision branch) stays
+negative, this track BECOMES the campaign; if positive, it diversifies it.
+Either branch needs it scoped. Maker-side feasibility evidence from the
+banked quiet windows: docs/diag_lowvol_maker_2026-06-11.md._
+
+- **LEAD: options-informed passive quoting (maker) on Kalshi.** EVIDENCE
+  CHAIN: the quiet windows measured a STRUCTURAL 16-18pp taker haircut --
+  the [1,3%) band collapsed to -13.5..-15.5% fill-adjusted across
+  0530/0601/0609, caused by the book-walker reaching past empty near-mid
+  into a 0.99 wall. That haircut is the resting maker's revenue, measured
+  from the taker's side. Corollary: the "redundant" quiet tape is this
+  strategy's PRIMARY dataset (its home regime). Risk profile: adverse
+  selection + inventory -- a NEW scorecard row, not a tweak to the taker
+  thesis. First build item IF activated: emit resting-bid depth fields
+  (deliberately not emitted today -- see the _derive_ask_depth docstring in
+  feeds/kalshi.py). Open question: Kalshi fee treatment for makers (no
+  rebates known).
+- **SECOND: barrier/range universe.** Measured excluded flow --
+  one_touch_barrier rejections appear in EVERY banked window (97/302/45 on
+  0530/0601/0609); possibly the ONLY executable Kalshi form per the
+  terminal-Kalshi open question above; needs genuine barrier pricing (big
+  lift).
+- **POST-ALWAYS-ON: breaking-news vol.** Ex-post rv_1h labeling of the
+  rolling tape; unscheduled vol may test the arb thesis BETTER than
+  scheduled prints (differential venue reaction speed, vs MMs
+  pre-positioned at known print times).
+
+---
+
 ## VENUE / TOOLING SCORECARD
 
 - **IBKR -- desk research CLOSED 2026-06-11.** No >=1 DTE BTC binaries on
@@ -134,7 +166,7 @@ scope.
   inside).
 - **Maker-quoting row:** resting-bid depth fields are deliberately not emitted
   (see the _derive_ask_depth docstring) -- first build item if this row is
-  ever activated.
+  ever activated. Now the LEAD candidate of the LOW-VOL TRACK above.
 - **Barrier/range row:** see the OPEN QUESTION above -- pending Stage 3, this
   row may PROMOTE to likely-the-only-executable-form-on-Kalshi.
 

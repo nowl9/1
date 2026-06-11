@@ -225,6 +225,11 @@ A thin result is NOT a failed campaign. It is the market answering the
 strategy's core question, cheaply, before you committed capital or more build
 effort to it.
 
+The thin/negative branch is pre-scoped: see the LOW-VOL TRACK section in
+docs/todo.md (lead: options-informed passive maker quoting on Kalshi --
+the measured 16-18pp taker haircut is the resting maker's revenue; upper-
+bound feasibility evidence in docs/diag_lowvol_maker_2026-06-11.md).
+
 ---
 
 ## Two data-fidelity notes (from the recorder-widening sample)
