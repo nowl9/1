@@ -1,22 +1,22 @@
-feat(main): C5 keep-awake -- SetThreadExecutionState held for the life of --record-feeds
+test(recorder): C6 promote 2026-06-10 fault-injection repro into the suite
 
-keepawake.py (new): keep_system_awake() context manager around
-ctypes.windll.kernel32.SetThreadExecutionState.
-* arms ES_CONTINUOUS | ES_SYSTEM_REQUIRED on entry, releases with
-  ES_CONTINUOUS on ANY exit path (normal return, exception, Ctrl-C);
-* per-thread state, so main() holds it on the main thread around
-  asyncio.run for live --record-feeds runs only (replay/plain runs
-  unaffected);
-* display sleep deliberately still allowed (no ES_DISPLAY_REQUIRED);
-* all failures logged + contained: keep-awake is a convenience, never
-  a reason to refuse or kill a capture run; off-Windows it is a no-op.
+Promotes the Phase-1 diagnostic harness (outputs/diag_repro_disable.py)
+into tests/test_feeds/test_recorder_fault_injection.py, pinning the
+full incident signature against the NEW graceful-stop-loud behavior:
 
-Context: the 2026-06-10 stop was ENOSPC, not sleep (event logs
-exonerated the OS), but sleep is the next-most-likely silent killer
-for overnight captures on a workstation.
+* six concurrent async streams; one injected ENOSPC (OSError errno 28,
+  write AND close raising) on the polymarket handle -- the exact field
+  trigger at 2026-06-10T08:01:25Z;
+* all six streams stop together; the five healthy streams bank their
+  buffered frames with VALID gzip trailers;
+* the fatal alarm fires: on_fatal exactly once, RECORDER_FAILED
+  sentinel names reason=io_error AND close_failures=polymarket (the
+  swallowed-close defect stays dead);
+* the RecorderWatchdog echoes exactly one kind=recorder_fatal alarm;
+* subsequent record() calls no-op without raising, files stay frozen,
+  the event loop stays alive, and a late close() (the 19:21 Ctrl-C
+  analogue) is a safe no-op that touches no file.
 
-Tests: 5 new (arm/release order, disabled inert, release on body
-exception, API-failure unarmed + no release, raising setter contained).
-Full suite: 873 passed, 0 failed.
+Full suite: 874 passed, 0 failed.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
