@@ -8,8 +8,6 @@ Scenarios covered
 
 2. Dry run mode: OrderManager logs but does not call executor submit().
 
-3. Risk limit rejection: position at cap → RiskManager.check() returns deny.
-
 4. Signal below edge threshold: SignalFilter rejects → OrderManager never called.
 
 5. Settlement outcome recording: settle() → SettlementRecord.outcome correct.
@@ -40,7 +38,6 @@ from btc_pm_arb.execution.orders import (
     PolymarketExecutor,
 )
 from btc_pm_arb.execution.positions import PositionTracker
-from btc_pm_arb.execution.risk import RiskConfig, RiskDecision, RiskManager
 from btc_pm_arb.execution.settlement import Outcome, SettlementMonitor
 from btc_pm_arb.models import (
     ArbitrageSignal,
@@ -264,8 +261,6 @@ async def test_full_pipeline_order_placed():
     matcher = ContractMatcher()
     calc = EdgeCalculator()
     filt = SignalFilter(FilterConfig(min_conservative_edge=0.05))
-    tracker = PositionTracker()
-    risk = RiskManager()
     order_mgr = OrderManager(dry_run=True)
 
     tick = _pm_tick(yes_bid=0.40, yes_ask=0.44)
@@ -275,11 +270,7 @@ async def test_full_pipeline_order_placed():
     assert signals
 
     sig = signals[0].model_copy(update={"confidence": 0.80})
-    proposed = risk.size_for_signal(sig, 200.0, tracker)
-    decision = risk.check(sig, proposed, tracker)
-    assert decision.allow
-
-    order = await order_mgr.place(sig, size_usd=proposed)
+    order = await order_mgr.place(sig, size_usd=200.0)
     assert order is not None
     assert order.state in {OrderState.PLACED, OrderState.FILLED}
 
@@ -351,72 +342,6 @@ async def test_dry_run_order_transitions_to_placed():
     assert order.state in {OrderState.PLACED, OrderState.FILLED}
     assert order.platform_order_id is not None
     await mgr.aclose()
-
-
-# ── Scenario 3: Risk limit rejection ─────────────────────────────────────────
-
-def test_risk_rejects_when_position_at_cap():
-    tracker = PositionTracker()
-    risk = RiskManager(RiskConfig(max_position_per_contract_usd=500.0))
-    sig = _arb_signal()
-
-    # Fill the cap
-    tracker._positions[(DataSource.KALSHI, "pm-btc-100000")] = _mock_position(notional=500.0)
-
-    decision = risk.check(sig, proposed_size_usd=100.0, tracker=tracker)
-    assert not decision.allow
-    assert "max_per_contract" in decision.reason or "position" in decision.reason
-
-
-def test_risk_rejects_when_total_exposure_exceeded():
-    tracker = PositionTracker()
-    risk = RiskManager(RiskConfig(max_total_exposure_usd=1_000.0))
-    sig = _arb_signal()
-
-    # Simulate $900 in existing positions
-    tracker._positions[(DataSource.POLYMARKET, "other-contract")] = _mock_position(notional=900.0)
-
-    decision = risk.check(sig, proposed_size_usd=200.0, tracker=tracker)
-    assert not decision.allow
-    assert "total_exposure" in decision.reason
-
-
-def test_risk_rejects_low_confidence():
-    tracker = PositionTracker()
-    risk = RiskManager(RiskConfig(min_confidence=0.60))
-    sig = _arb_signal(confidence=0.35)
-    decision = risk.check(sig, proposed_size_usd=100.0, tracker=tracker)
-    assert not decision.allow
-    assert "confidence" in decision.reason
-
-
-def test_risk_rejects_too_many_open_positions():
-    tracker = PositionTracker()
-    risk = RiskManager(RiskConfig(max_open_positions=2))
-    sig = _arb_signal()
-
-    for i in range(2):
-        tracker._positions[(DataSource.KALSHI, f"other-{i}")] = _mock_position(notional=100.0)
-
-    decision = risk.check(sig, proposed_size_usd=100.0, tracker=tracker)
-    assert not decision.allow
-    assert "open_positions" in decision.reason
-
-
-def test_risk_approves_clean_signal():
-    tracker = PositionTracker()
-    risk = RiskManager()
-    sig = _arb_signal(confidence=0.80)
-    decision = risk.check(sig, proposed_size_usd=100.0, tracker=tracker)
-    assert decision.allow
-
-
-def test_risk_size_for_signal_scales_by_confidence():
-    tracker = PositionTracker()
-    risk = RiskManager(RiskConfig(max_position_per_contract_usd=500.0))
-    sig = _arb_signal(confidence=0.50)
-    sized = risk.size_for_signal(sig, base_size_usd=200.0, tracker=tracker)
-    assert sized == pytest.approx(100.0)   # 200 * 0.5
 
 
 # ── Scenario 4: Signal below edge threshold ───────────────────────────────────
@@ -612,18 +537,6 @@ def test_confidence_scorer_produces_score():
 
 
 # ── Private helpers ───────────────────────────────────────────────────────────
-
-def _mock_position(notional: float, contract: str = "pm-btc-100000"):
-    from btc_pm_arb.execution.positions import Position
-    pos = Position(
-        platform=DataSource.KALSHI,
-        contract_id=contract,
-        side="yes",
-        filled_size=notional,
-        entry_price=0.45,
-    )
-    return pos
-
 
 def _make_filled_order(
     fill_price: float,

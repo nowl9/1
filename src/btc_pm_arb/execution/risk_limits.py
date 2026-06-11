@@ -100,9 +100,9 @@ class RiskLimits(BaseSettings):
     Defaults are sized against the fixed paper order size
     (``main._BASE_SIZE_USD`` = 200): 500 per market allows two full base
     orders plus a partial on one market; 5000 global matches the
-    precedent in the (dormant) execution/risk.py RiskConfig; 500 daily
-    loss stops a paper run after losing 2.5 base orders realized in one
-    UTC day.
+    precedent set by the retired execution/risk.py RiskConfig; 500
+    daily loss stops a paper run after losing 2.5 base orders realized
+    in one UTC day.
     """
 
     model_config = SettingsConfigDict(

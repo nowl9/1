@@ -16,7 +16,7 @@ Pipeline::
                                                     │
                                            ConfidenceScorer
                                                     │
-                                          RiskManager (pre-trade)
+                                          RiskLimits (pre-place, paper)
                                                     │
                                           OrderManager ──► positions / settlement
                                                     │
@@ -74,7 +74,6 @@ from btc_pm_arb.execution.paper_ledger import (
 from btc_pm_arb.execution.paper_positions import PaperPosition, PaperPositionTracker
 from btc_pm_arb.execution.paper_settlement import KalshiSettlementPoller
 from btc_pm_arb.execution.positions import PositionTracker
-from btc_pm_arb.execution.risk import RiskConfig, RiskManager
 from btc_pm_arb.execution.risk_limits import (
     RiskIntent,
     RiskLimits,
@@ -210,10 +209,6 @@ class Agent:
         ))
         self.confidence_scorer = ConfidenceScorer()
         self.tracker = PositionTracker()
-        self.risk = RiskManager(RiskConfig(
-            max_position_per_contract_usd=settings.max_position_usd,
-            max_total_exposure_usd=settings.max_total_exposure_usd,
-        ))
         # Round 8 Commit 2: dry_run_paper_mode=True suppresses
         # KalshiExecutor's optimistic auto-fill on refresh() so the paper
         # FillSimulator owns the FILLED transition instead.  See
@@ -1646,8 +1641,6 @@ async def _order_refresh_task(agent: Agent, stop_event: asyncio.Event) -> None:
             break
         try:
             await agent.order_mgr.refresh_all()
-            for o in agent.order_mgr.filled_orders():
-                agent.tracker.record_fill(o)
         except Exception as exc:
             log.error("order_refresh.error", error=str(exc))
 
@@ -1927,7 +1920,6 @@ async def run(
         run_id=agent.run_id,
         duration_s=duration_s,
         min_edge=settings.min_edge,
-        max_position_usd=settings.max_position_usd,
     )
 
     # Build step 5: replay swaps the live feed tasks (and the live scan /

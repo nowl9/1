@@ -69,8 +69,6 @@ class Settings(BaseSettings):
     min_edge: float = Field(default=0.01, ge=0.0, le=1.0)
     min_days_to_expiry: int = Field(default=1, ge=0)
     max_days_to_expiry: int = Field(default=90, ge=1)
-    max_position_usd: float = Field(default=1000.0, gt=0)
-    max_total_exposure_usd: float = Field(default=10000.0, gt=0)
     # Strike increment δ for digital pricer finite-difference approximation (USD)
     strike_delta: float = Field(default=500.0, gt=0)
 
