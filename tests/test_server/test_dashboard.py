@@ -84,6 +84,19 @@ def test_config_returns_dict(client):
     assert isinstance(body, dict)
 
 
+def test_risk_config_write_endpoint_removed(client):
+    """The risk surface is read-only: the retired dead-ended write
+    endpoint (POST /api/risk-config) must stay gone.  With no API route
+    the path falls through to the static mount, which answers POST with
+    405; 404 covers a future layout without the catch-all."""
+    resp = client.post(
+        "/api/risk-config",
+        json={"max_global_exposure": 1.0},
+        headers=_auth(),
+    )
+    assert resp.status_code in (404, 405)
+
+
 # ── GET /api/status ───────────────────────────────────────────────────────────
 
 def test_status_returns_200(client):

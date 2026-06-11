@@ -782,3 +782,59 @@ async def test_persistent_breach_blocks_once_per_intent(
     assert agent._funnel["paper_orders_risk_blocked"] == 2
     assert agent._funnel["paper_orders_placed"] == 0
     assert len(list(agent.paper_ledger.replay_orders())) == 1   # seed only
+
+
+# ==============================================================================
+# 5. Dashboard snapshot -- the risk card mirrors the ENFORCING caps
+# ==============================================================================
+
+
+@pytest.mark.asyncio
+async def test_dashboard_snapshot_shows_enforcing_caps(
+    monkeypatch, tmp_path: Path,
+):
+    """s.risk_config is RiskLimits truth: the three enforcing caps plus
+    the current-run block-event count -- and nothing from the retired
+    RiskManager snapshot (the stale 1000/10000 figures)."""
+    agent, _expiry = _seed_agent(monkeypatch, tmp_path)
+    agent.risk_limits = _limits()   # PAPER defaults: 500 / 5000 / 500
+    await agent._push_state_update()
+
+    async with agent.shared_state.read() as s:
+        snap = dict(s.risk_config)
+
+    assert snap == {
+        "max_position_per_market": 500.0,
+        "max_global_exposure": 5000.0,
+        "max_daily_loss": 500.0,
+        "risk_blocks_current_run": 0,
+    }
+    # Retirement contract, pinned explicitly: the dead-snapshot keys and
+    # the 1000/10000 figures must never reappear.
+    for retired in (
+        "max_position_per_contract_usd",
+        "max_total_exposure_usd",
+        "max_open_positions",
+        "min_confidence",
+    ):
+        assert retired not in snap
+    assert 1000.0 not in snap.values()
+    assert 10000.0 not in snap.values()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_snapshot_counts_block_events_this_run(
+    monkeypatch, tmp_path: Path,
+):
+    """The snapshot count is the per-process funnel counter: block
+    EVENTS (one per blocked scan tick), not unique intents, and the
+    caps mirror the live limits object rather than defaults."""
+    agent, expiry = _seed_agent(monkeypatch, tmp_path)
+    agent.risk_limits = _limits(per_market=100.0)   # blocks the 200 base
+    await _scan_once(agent, expiry)
+    assert agent._funnel["paper_orders_risk_blocked"] == 1
+
+    await agent._push_state_update()
+    async with agent.shared_state.read() as s:
+        assert s.risk_config["risk_blocks_current_run"] == 1
+        assert s.risk_config["max_position_per_market"] == 100.0
