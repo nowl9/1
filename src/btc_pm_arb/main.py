@@ -54,6 +54,7 @@ import uvicorn
 
 from btc_pm_arb.clock import SimulatedClock
 from btc_pm_arb.config import settings
+from btc_pm_arb.keepawake import keep_system_awake
 from btc_pm_arb.execution.benchmark_settlement import PaperBenchmarkSettler
 from btc_pm_arb.execution.fill_simulator import (
     BookSnapshot,
@@ -2078,15 +2079,20 @@ def main() -> None:
         record_dir = args.record_dir
     else:
         record_dir = None
-    exit_code = asyncio.run(
-        run(
-            dry_run=True,
-            record_dir=record_dir,
-            mode=args.mode,
-            duration_s=args.duration,
-            replay_date=args.replay_date,
+    # C5: pin the system awake for the life of a live capture run
+    # (per-thread state -- held on the main thread around asyncio.run,
+    # released on any exit path, including Ctrl-C and exceptions).
+    keep_awake = bool(args.record_feeds and args.mode != "replay")
+    with keep_system_awake(keep_awake):
+        exit_code = asyncio.run(
+            run(
+                dry_run=True,
+                record_dir=record_dir,
+                mode=args.mode,
+                duration_s=args.duration,
+                replay_date=args.replay_date,
+            )
         )
-    )
     if exit_code:
         sys.exit(exit_code)
 

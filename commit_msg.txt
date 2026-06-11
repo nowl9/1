@@ -1,22 +1,22 @@
-fix(main): C4 clean shutdown -- one Ctrl-C banks every gz with a trailer; SIGBREAK wired
+feat(main): C5 keep-awake -- SetThreadExecutionState held for the life of --record-feeds
 
-Completes the shutdown chain for the 2026-06-10 capture-trust work:
-stop signal -> stop_event -> every task winds down (dashboard included
-since C3) -> run() finally -> recorder.close() flushes and closes every
-recording gzip with a valid trailer (close failures CRITICAL since C1).
-This retires the final-hour truncation defect: long runs previously
-ended in a force-kill because the run never exited, losing the last
-hour's buffered gzip tail.
+keepawake.py (new): keep_system_awake() context manager around
+ctypes.windll.kernel32.SetThreadExecutionState.
+* arms ES_CONTINUOUS | ES_SYSTEM_REQUIRED on entry, releases with
+  ES_CONTINUOUS on ANY exit path (normal return, exception, Ctrl-C);
+* per-thread state, so main() holds it on the main thread around
+  asyncio.run for live --record-feeds runs only (replay/plain runs
+  unaffected);
+* display sleep deliberately still allowed (no ES_DISPLAY_REQUIRED);
+* all failures logged + contained: keep-awake is a convenience, never
+  a reason to refuse or kill a capture run; off-Windows it is a no-op.
 
-main.py:
-* signal wiring factored into _install_stop_signals(stop_event); now
-  also registers SIGBREAK (Windows Ctrl-Break) alongside SIGINT and
-  SIGTERM.  Ctrl-Break follows the exact same clean-stop path as
-  Ctrl-C, and is what a supervisor (or the Phase-3 drill) can deliver
-  programmatically via GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT).
+Context: the 2026-06-10 stop was ENOSPC, not sleep (event logs
+exonerated the OS), but sleep is the next-most-likely silent killer
+for overnight captures on a workstation.
 
-Tests: 3 new for the helper (Windows signal.signal fallback path,
-loop.add_signal_handler path, SIGBREAK -> stop_event).
-Full suite: 868 passed, 0 failed.
+Tests: 5 new (arm/release order, disabled inert, release on body
+exception, API-failure unarmed + no release, raising setter contained).
+Full suite: 873 passed, 0 failed.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
