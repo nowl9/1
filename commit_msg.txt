@@ -1,26 +1,21 @@
-docs(provenance): C1 bank competitive_analysis_2026-06-09 with verification annex
+docs(lowvol): C2 bank Kalshi maker-fee desk research on the maker LEAD row
 
-Closes the addendum2 Part D2 provenance gap: the 2026-06-09 competitive
-analysis lived untracked in "C:\Users\mgill\Downloads\clawd mds\prediction
-markets\" while the 06-10 handoff cited it as "3 patterns, all resolved"
-with no re-verification on record. The original file is copied here
-byte-preserved (SHA256 22324FF4EEF1BF384EB9576948DFE08716D7478E13E1420A
-4B9A704C22A8941B for the pre-annex content; filename normalized only,
-content untouched).
+Answers the LEAD row's standing open question ("Kalshi fee treatment for
+makers") with the official fee schedule (PDF eff. Feb 5 2026), added
+verbatim as a sub-bullet under the LOW-VOL TRACK maker row: maker fees
+exist only on the markets enumerated in the maker-fees section of
+kalshi.com/fee-schedule; where charged, roundup(0.0175 x C x P x (1-P))
+-- 0.44c/contract max at P=0.5, ~0.1c at the near-extreme prices where
+one-sided ask quoting would rest; execution-only (cancels free);
+settlement fee zero, so ask-side inventory exits via settlement at no
+fee.
 
-A VERIFICATION ANNEX (2026-06-11, master 094df6a) is appended below a
-clear delimiter. Enumeration found seven verifiable patterns/claims, not
-three: the three scoped /goal prompts (no-arb gate -> shipped as the
-deliberate SHADOW layer 7e2b894/c80bafa; risk-limit layer -> shipped
-6a838bf/4f13849 with the exact three caps at risk_limits.py:119/121/126;
-signal seam -> resolved by its own hard gate firing, 7108aeb, typed chain
-unflattened) plus four more (orthogonal mode axes structurally present;
-settlement/matcher seams present; SKIP items verifiably not adopted;
-/goal template shipped as .claude/commands/goal.md in af91336). All seven
-verified RESOLVED on master with path:line evidence. No findings; the
-gate-on-surprise did not fire.
+One RESIDUAL stays operator-side (2 min, browser): whether KXBTC* series
+appear in the maker-fees list on the JS-rendered fee-schedule page.
+Either outcome leaves the measured 16-18pp gross intact -- fees are not
+the maker row's risk; adverse selection is.
 
 Suite green after change: 880 passed (count unchanged; docs-only).
-Numstat: one new file under docs/, zero deletions elsewhere.
+Numstat: docs/todo.md only.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>

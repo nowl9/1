@@ -125,6 +125,17 @@ banked quiet windows: docs/diag_lowvol_maker_2026-06-11.md._
   (deliberately not emitted today -- see the _derive_ask_depth docstring in
   feeds/kalshi.py). Open question: Kalshi fee treatment for makers (no
   rebates known).
+  - Kalshi maker fee treatment (desk research 2026-06-11, official fee
+    schedule PDF eff. Feb 5 2026): maker fees exist only on markets listed
+    in the maker-fees section of kalshi.com/fee-schedule; where charged,
+    fee = roundup(0.0175 x C x P x (1-P)) -- max 0.44c/contract at P=0.5,
+    ~0.1c at the near-extreme prices where one-sided ask quoting would
+    rest; charged on execution only, cancels free; settlement fee ZERO
+    (ask-side inventory exits via settlement at no fee). RESIDUAL
+    (operator, 2 min, browser): confirm whether KXBTC* series appear in the
+    maker-fees list on the fee-schedule web page (JS-rendered). Either
+    outcome leaves the 16-18pp gross intact -- fees are not the maker
+    row's risk; adverse selection is.
 - **SECOND: barrier/range universe.** Measured excluded flow --
   one_touch_barrier rejections appear in EVERY banked window (97/302/45 on
   0530/0601/0609); possibly the ONLY executable Kalshi form per the
