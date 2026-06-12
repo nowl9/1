@@ -92,6 +92,10 @@ scope.
 - **DATED FOLLOW-UP ~2026-07-06:** re-probe KXBTCMAX100 (its Oct-01 close
   enters the 90d window). Manual todo, deliberately NOT scheduled as an
   autonomous task.
+- **DATED WATCH (check alongside the ~2026-07-06 item): Polymarket US.**
+  If Polymarket's US-regulated entity ever carries liquid BTC books, the
+  two-legged synthetic arb (YES one venue / NO the other) becomes US-legal
+  -- a structural unlock, not a strategy change. Watch only; no build.
 - **OPEN QUESTION (answer inside the Stage 3 goal, not before):** does ANY
   in-mandate (>=1 DTE) terminal Kalshi binary exist? Evidence pointing to no:
   Tier-1 series are all min/max (barrier) class; 0530's 53 Kalshi matches were
@@ -145,6 +149,54 @@ banked quiet windows: docs/diag_lowvol_maker_2026-06-11.md._
   rolling tape; unscheduled vol may test the arb thesis BETTER than
   scheduled prints (differential venue reaction speed, vs MMs
   pre-positioned at known print times).
+
+---
+
+## EXTERNAL-DOC TRIAGE (2026-06-11 -- maker-scalping analysis; all figures are unverified priors)
+
+_Source: an external scalping analysis with unverified citations. Every
+number below is a PRIOR our tape votes on, not a fact. The bias-footprint
+probe (docs/diag_bias_footprint_2026-06-11.md, same date) tests what our
+banked data can reach. Nothing here authorizes a build -- Stage 4 still
+gates all strategy work._
+
+- **CATEGORY EXPANSION candidate: maker on Sports/Entertainment.** Doc
+  claims a 2.23-4.79pp maker gap in Sports/Ent vs 0.17pp in Finance
+  (unverified). Our BTC maker diag measured exactly the thin-gap profile
+  the doc predicts for Finance -- if the doc is right, the maker revenue
+  is two categories over from where we quote. The recorder / replay /
+  maker-measurement infrastructure is category-agnostic (discovery config
+  change only), BUT the move abandons the options anchor -- no SVI fair
+  exists for sports -- so it is a DIFFERENT epistemic foundation
+  (book/flow-anchored, not model-anchored): a new row, not an extension
+  of the LEAD. Data-only first (record a sports/ent window, re-run the
+  maker diag on it), post-FOMC at the earliest.
+- **Longshot-fade: NOT a new row.** The doc's "fade YES longshots at
+  1-10c" (its Optimism Tax) is a falsifiable PRIOR on the existing
+  options-arb: our buy_no side IS the anchored version of that fade --
+  it fades YES only when the SVI fair says to, never unconditionally.
+  Probe P2 (bias-footprint diag) tests whether buy_no dominates buy_yes
+  in count and magnitude on our tape.
+- **NEW row: near-expiry favorite collection (the 0.99-wall incumbent).**
+  Doc claims near-expiry 90c+ favorites are maker-positive. We have
+  already photographed this trade from the OUTSIDE: the 0.99 wall our
+  book-walker dies against is the incumbent's resting footprint, measured
+  as the structural 16-18pp taker haircut. Excluded today by the DTE
+  floor (>=1 DTE) and discovery scope, by design. Probe P3 characterizes
+  the wall (price bands, expiry distance, persistence) and sizes the
+  incumbent. Record-only widening post-FOMC if ever; no execution path.
+- **OIB: candidate CONFIDENCE/TIMING dimension only.** Orderbook
+  imbalance as a ConfidenceScorer sixth input or an entry-timing gate --
+  NEVER a standalone direction signal. Stage-4-gated like everything
+  else; probe P4 tests raw predictiveness on our tape first.
+- **DECLINED: naked news scalping.** Our strategy IS the anchored version
+  (options-implied fair + freshness gates); the unanchored variant adds
+  risk, not information.
+- **DECLINED: latency quote-sniping.** The demoted double-latency thesis
+  in running shoes; venue matching-engine delays sit in the path and the
+  demotion decision stands.
+- **DATED WATCH: Polymarket US** -- entered under OPEN ITEMS next to the
+  ~2026-07-06 dated follow-up.
 
 ---
 

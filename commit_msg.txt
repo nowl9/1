@@ -1,21 +1,38 @@
-docs(lowvol): C2 bank Kalshi maker-fee desk research on the maker LEAD row
+docs(triage): C1 scorecard the external scalping doc's claims into todo
 
-Answers the LEAD row's standing open question ("Kalshi fee treatment for
-makers") with the official fee schedule (PDF eff. Feb 5 2026), added
-verbatim as a sub-bullet under the LOW-VOL TRACK maker row: maker fees
-exist only on the markets enumerated in the maker-fees section of
-kalshi.com/fee-schedule; where charged, roundup(0.0175 x C x P x (1-P))
--- 0.44c/contract max at P=0.5, ~0.1c at the near-extreme prices where
-one-sided ask quoting would rest; execution-only (cancels free);
-settlement fee zero, so ask-side inventory exits via settlement at no
-fee.
+Adds an EXTERNAL-DOC TRIAGE section to docs/todo.md from the
+bias-footprint goal. Every figure from the external analysis is carried
+as an unverified PRIOR, not a fact; the companion bias-footprint diag
+(C2 of this goal) tests what the banked tape can reach. Items:
 
-One RESIDUAL stays operator-side (2 min, browser): whether KXBTC* series
-appear in the maker-fees list on the JS-rendered fee-schedule page.
-Either outcome leaves the measured 16-18pp gross intact -- fees are not
-the maker row's risk; adverse selection is.
+- CATEGORY EXPANSION candidate: maker on Sports/Ent (doc: 2.23-4.79pp
+  maker gap there vs 0.17pp Finance). Infrastructure category-agnostic,
+  but abandons the options anchor -- different epistemic foundation, new
+  row, data-only first, post-FOMC.
+- Longshot-fade: NOT a new row -- a falsifiable prior on the existing
+  options-arb (buy_no IS the anchored fade); probe P2 tests it.
+- NEW row: near-expiry favorite collection -- the 0.99-wall incumbent,
+  already photographed from the outside as the 16-18pp taker haircut;
+  excluded by DTE floor + discovery scope; record-only widening
+  post-FOMC if ever; probe P3 sizes it.
+- OIB: candidate CONFIDENCE/TIMING dimension only (ConfidenceScorer
+  sixth input or entry-timing gate), never standalone direction;
+  Stage-4-gated; probe P4 tests predictiveness first.
+- DECLINED: naked news scalping (our strategy IS the anchored version);
+  latency quote-sniping (demoted double-latency in running shoes).
+- DATED WATCH: Polymarket US, filed under OPEN ITEMS beside the
+  ~2026-07-06 KXBTCMAX100 re-probe -- liquid US BTC books would make the
+  two-legged synthetic arb US-legal.
 
-Suite green after change: 880 passed (count unchanged; docs-only).
+C1b of the goal (fold competitive_analysis_2026-06-09.md into docs/ and
+re-verify its "3 patterns, all resolved" claim) was found ALREADY
+SATISFIED by cc23d74 on this branch: the file is banked byte-preserved
+(SHA256 in that commit body) with a VERIFICATION ANNEX dated 2026-06-11
+that enumerated seven patterns/claims (not three) and verified all seven
+RESOLVED on master with path:line evidence. Not redone here; no drift
+since (the annex is at docs/competitive_analysis_2026-06-09.md:261).
+
+Suite green after change: 880 passed (docs-only; count unchanged).
 Numstat: docs/todo.md only.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
