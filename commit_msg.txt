@@ -1,27 +1,26 @@
-docs(lowvol): C2 maker-side feasibility diagnostic on the banked quiet windows
+docs(provenance): C1 bank competitive_analysis_2026-06-09 with verification annex
 
-docs/diag_lowvol_maker_2026-06-11.md -- P2-P5 read-only characterization
-via a component harness (replay-mirroring decode + VolSurface/DigitalPricer/
-ProbabilityCache/ContractMatcher; no Agent, no ReplayReader, no paper_ledger
-writes; data/recordings opened read-only). Windows 0530/0601/0609 + 0611
-partials; frame counts cross-validate the overnight sweep exactly.
+Closes the addendum2 Part D2 provenance gap: the 2026-06-09 competitive
+analysis lived untracked in "C:\Users\mgill\Downloads\clawd mds\prediction
+markets\" while the 06-10 handoff cited it as "3 patterns, all resolved"
+with no re-verification on record. The original file is copied here
+byte-preserved (SHA256 22324FF4EEF1BF384EB9576948DFE08716D7478E13E1420A
+4B9A704C22A8941B for the pre-annex content; filename normalized only,
+content untouched).
 
-Findings: quiet books are tight-but-thin at the touch (median 0.6-1c spread,
-hundreds USD-proxy at touch, 5-20x within 1c -- the maker-side complement of
-the measured 16-18pp taker haircut); Kalshi formed ZERO matched terminal
-contracts in any window (maker fair-anchoring is Polymarket-only; feeds the
-terminal-Kalshi open question); fair-anchored quotes at fair+/-1..3c are
-ONE-SIDED (fair at/below best bid on ~65% of boundaries; 0 bid-side crosses
-in 18,904 pairs) and RARELY interact (upper bound 0.35-0.75 crosses/ct-hr,
-26/32 events from 0611); adverse-selection proxy shows zero pickoffs with
-markout ~= offset (n=32 events -- consistent with, not a bound on, low
-adverse selection). Epistemic header verbatim: no queue position, no fee
-model, no inventory dynamics; upper-bound feasibility evidence, not P&L;
-a maker build decision still requires the Stage 4 branch.
+A VERIFICATION ANNEX (2026-06-11, master 094df6a) is appended below a
+clear delimiter. Enumeration found seven verifiable patterns/claims, not
+three: the three scoped /goal prompts (no-arb gate -> shipped as the
+deliberate SHADOW layer 7e2b894/c80bafa; risk-limit layer -> shipped
+6a838bf/4f13849 with the exact three caps at risk_limits.py:119/121/126;
+signal seam -> resolved by its own hard gate firing, 7108aeb, typed chain
+unflattened) plus four more (orthogonal mode axes structurally present;
+settlement/matcher seams present; SKIP items verifiably not adopted;
+/goal template shipped as .claude/commands/goal.md in af91336). All seven
+verified RESOLVED on master with path:line evidence. No findings; the
+gate-on-surprise did not fire.
 
-All headline numbers independently recomputed (second implementation) and
-reproduced exactly, incl. one raw-frame end-to-end spot check. Docs only;
-zero src changes; probe scripts + datasets under gitignored outputs/ and
-analysis_out/.
+Suite green after change: 880 passed (count unchanged; docs-only).
+Numstat: one new file under docs/, zero deletions elsewhere.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
