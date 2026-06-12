@@ -92,6 +92,16 @@ scope.
 - **DATED FOLLOW-UP ~2026-07-06:** re-probe KXBTCMAX100 (its Oct-01 close
   enters the 90d window). Manual todo, deliberately NOT scheduled as an
   autonomous task.
+- **STALE ASSUMPTION FLAGGED 2026-06-11: Polymarket is no longer
+  fee-free.** Official PM docs (fetched 2026-06-11): crypto TAKER fee =
+  C x 0.07 x P x (1-P) (makers 0%, +20% crypto maker rebate), rolled out
+  Jan-Mar 2026. Our recorded taker leg at P=0.81 bears ~1.08c/contract,
+  ~35% of a 3c adjusted edge. The fill simulator records fees_usd = 0.0
+  unconditionally (execution/fill_simulator.py:384) -- every banked
+  fill-adjusted number is gross-of-fee and now optimistic on PM crypto
+  taker legs. NO src change this goal (out of scope); fold a venue fee
+  model into the Stage 4 / post-FOMC fill-economics work. Details:
+  docs/diag_bias_footprint_2026-06-11.md P5.
 - **DATED WATCH (check alongside the ~2026-07-06 item): Polymarket US.**
   If Polymarket's US-regulated entity ever carries liquid BTC books, the
   two-legged synthetic arb (YES one venue / NO the other) becomes US-legal
@@ -136,10 +146,14 @@ banked quiet windows: docs/diag_lowvol_maker_2026-06-11.md._
     ~0.1c at the near-extreme prices where one-sided ask quoting would
     rest; charged on execution only, cancels free; settlement fee ZERO
     (ask-side inventory exits via settlement at no fee). RESIDUAL
-    (operator, 2 min, browser): confirm whether KXBTC* series appear in the
-    maker-fees list on the fee-schedule web page (JS-rendered). Either
-    outcome leaves the 16-18pp gross intact -- fees are not the maker
-    row's risk; adverse selection is.
+    RESOLVED 2026-06-11 (bias-footprint P5, live API fee_type scan of
+    10,836 series): every core BTC price series -- KXBTCD, KXBTC,
+    KXBTC15M, KXBTCMAXW/M/Y, KXBTCMAX100 -- is plain quadratic, i.e.
+    maker fee ZERO today; only KXBTCMAX125/150 are maker-fee listed, so
+    flips are possible -- re-poll GET /series/fee_changes before any
+    go-live. Either way the 16-18pp gross stays intact -- fees are not
+    the maker row's risk; adverse selection is. See
+    docs/diag_bias_footprint_2026-06-11.md P5.
 - **SECOND: barrier/range universe.** Measured excluded flow --
   one_touch_barrier rejections appear in EVERY banked window (97/302/45 on
   0530/0601/0609); possibly the ONLY executable Kalshi form per the

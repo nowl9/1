@@ -1,38 +1,52 @@
-docs(triage): C1 scorecard the external scalping doc's claims into todo
+docs(diag): C2 bias-footprint report -- four probes vote on the doc's priors
 
-Adds an EXTERNAL-DOC TRIAGE section to docs/todo.md from the
-bias-footprint goal. Every figure from the external analysis is carried
-as an unverified PRIOR, not a fact; the companion bias-footprint diag
-(C2 of this goal) tests what the banked tape can reach. Items:
+Adds docs/diag_bias_footprint_2026-06-11.md: the external scalping doc's
+claims tested against the banked tape (read-only; harness reused, no
+second extraction; agent pipeline not run; recordings and ledger_archive
+untouched). Epistemic header: external figures are unverified priors;
+quiet-regime tape only; nulls are findings; Stage 4 still gates builds.
 
-- CATEGORY EXPANSION candidate: maker on Sports/Ent (doc: 2.23-4.79pp
-  maker gap there vs 0.17pp Finance). Infrastructure category-agnostic,
-  but abandons the options anchor -- different epistemic foundation, new
-  row, data-only first, post-FOMC.
-- Longshot-fade: NOT a new row -- a falsifiable prior on the existing
-  options-arb (buy_no IS the anchored fade); probe P2 tests it.
-- NEW row: near-expiry favorite collection -- the 0.99-wall incumbent,
-  already photographed from the outside as the 16-18pp taker haircut;
-  excluded by DTE floor + discovery scope; record-only widening
-  post-FOMC if ever; probe P3 sizes it.
-- OIB: candidate CONFIDENCE/TIMING dimension only (ConfidenceScorer
-  sixth input or entry-timing gate), never standalone direction;
-  Stage-4-gated; probe P4 tests predictiveness first.
-- DECLINED: naked news scalping (our strategy IS the anchored version);
-  latency quote-sniping (demoted double-latency in running shoes).
-- DATED WATCH: Polymarket US, filed under OPEN ITEMS beside the
-  ~2026-07-06 KXBTCMAX100 re-probe -- liquid US BTC books would make the
-  two-legged synthetic arb US-legal.
+P2 (Optimism Tax): PARTIAL TRANSFER. buy_no dominates buy_yes on both
+pre-registered axes -- 88.4% of positive-edge matched-terminal
+boundaries (5,722 vs 753), median 1.18pp vs 0.41pp, 94.5% of
+conservative_edge rejections (741/741 joined with EXACT edge matches --
+BasisAdjuster empirically a no-op on these tapes), 100% of the walked
+near-floor set -- BUT the premium peaks mid-curve (fair 0.50-0.80,
++4.5pp) and vanishes above 0.95: a broad one-sided YES premium, not
+longshot overbuying. Polymarket-only evidence; c3-0530 deduped
+byte-equivalent as pre-registered.
 
-C1b of the goal (fold competitive_analysis_2026-06-09.md into docs/ and
-re-verify its "3 patterns, all resolved" claim) was found ALREADY
-SATISFIED by cc23d74 on this branch: the file is banked byte-preserved
-(SHA256 in that commit body) with a VERIFICATION ANNEX dated 2026-06-11
-that enumerated seven patterns/claims (not three) and verified all seven
-RESOLVED on master with path:line evidence. Not redone here; no drift
-since (the annex is at docs/competitive_analysis_2026-06-09.md:261).
+P3 (0.99 wall): real, corner-pinned (57-87% of deep-side ask mass
+exactly in the 0.99 band), 7-17x near-touch depth on PM, median 93c
+from touch, expiry-INDISCRIMINATE, and persistent (94.6% of wall
+contracts never blink; one PM fixture spans all four windows). It is a
+deep-tick penny harvest -- the other side of the 16-18pp taker haircut
+-- not the doc's near-expiry favorite quoter. Near-touch 0.97+ quoting
+exists only on PM; zero on the Kalshi tape.
 
-Suite green after change: 880 passed (docs-only; count unchanged).
-Numstat: docs/todo.md only.
+P4 (OIB): fragile near-null. Weak PM-only 60s effect (hit ~0.57, rho
+~0.05-0.07, quintile spread <1 tick), decays/flips by 900s; the strong-
+looking Kalshi cells fail terminal-only robustness (one window, one
+product, few contracts). Honest deviation stated: rows carry 1c/2c
+bands, not the spec'd 1c/3c. At most a Stage-4-gated PM timing tiebreak.
+
+P5 (fees): RESIDUAL RESOLVED -- live API fee_type scan (10,836 series):
+all core KXBTC* series are plain quadratic, maker fee ZERO today (only
+KXBTCMAX125/150 are maker-listed); taker 0.07 / maker 0.0175 / S&P-
+Nasdaq half-rate / settlement zero all confirmed current. The doc's
+"taker fee eats ~1/3 of the 5c" only holds near P~0.39; at longshot
+prices the drag is 6.8-12.6% (C=100). SURPRISE: Polymarket is no longer
+fee-free -- crypto taker 0.07 quadratic since Jan-Mar 2026, ~1.08c/ct
+at our recorded 0.81 fill (~35% of a 3c edge); the fill simulator
+records fees_usd=0.0 unconditionally (fill_simulator.py:384), so banked
+fill-adjusted numbers are gross-of-fee. Flagged in todo OPEN ITEMS for
+the Stage 4 / post-FOMC fill-economics work; no src change (out of
+scope by goal).
+
+docs/todo.md companions: maker LEAD fee RESIDUAL marked resolved; STALE
+ASSUMPTION (PM fees) added to OPEN ITEMS.
+
+Suite green after change: 880 passed (tripwire; docs-only, count
+unchanged). Numstat: docs/ only plus commit_msg.txt.
 
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
