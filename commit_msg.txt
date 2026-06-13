@@ -1,52 +1,26 @@
-docs(diag): C2 bias-footprint report -- four probes vote on the doc's priors
+docs(diag): PM history census + settlement calibration (3yr Polymarket BTC)
 
-Adds docs/diag_bias_footprint_2026-06-11.md: the external scalping doc's
-claims tested against the banked tape (read-only; harness reused, no
-second extraction; agent pipeline not run; recordings and ledger_archive
-untouched). Epistemic header: external figures are unverified priors;
-quiet-regime tape only; nulls are findings; Stage 4 still gates builds.
+Adds docs/diag_pm_history_2026-06-13.md: sandboxed desk study over
+120,526 closed Bitcoin-tagged Polymarket markets (2023-06..2026-06-12),
+8,095 threshold binaries pulled at 5m via pmxt (8,666 calls, 0 errors;
+discovery degraded to Gamma REST -- pmxt closed-search self-DoSes its
+sidecar throttler).
 
-P2 (Optimism Tax): PARTIAL TRANSFER. buy_no dominates buy_yes on both
-pre-registered axes -- 88.4% of positive-edge matched-terminal
-boundaries (5,722 vs 753), median 1.18pp vs 0.41pp, 94.5% of
-conservative_edge rejections (741/741 joined with EXACT edge matches --
-BasisAdjuster empirically a no-op on these tapes), 100% of the walked
-near-floor set -- BUT the premium peaks mid-curve (fair 0.50-0.80,
-+4.5pp) and vanishes above 0.95: a broad one-sided YES premium, not
-longshot overbuying. Polymarket-only evidence; c3-0530 deduped
-byte-equivalent as pre-registered.
+P1 census: organic high-vol windows dwarf scheduled-macro ones ~30:1 at
+DTE>=7 (mean 274 organic vs 9 scheduled 30m buckets/month at 2.5c/15m
+over the last 12 full months); at DTE>=1 the tape saturates (75-93% of
+clock). Recorder harvest is capacity-bound, not event-bound. 1m
+refinement: 116/120 windows confirm; the 1.5c row is a lower bound.
 
-P3 (0.99 wall): real, corner-pinned (57-87% of deep-side ask mass
-exactly in the 0.99 band), 7-17x near-touch depth on PM, median 93c
-from touch, expiry-INDISCRIMINATE, and persistent (94.6% of wall
-contracts never blink; one PM fixture spans all four windows). It is a
-deep-tick penny harvest -- the other side of the 16-18pp taker haircut
--- not the doc's near-expiry favorite quoter. Near-touch 0.97+ quoting
-exists only on PM; zero on the Kalshi tape.
+P2 calibration (pre-registered): MARKET-WRONG at the mid level with a
+DTE qualifier -- priced 0.60-0.80 settles YES 2.3-3.1pp below price
+pooled (CI excludes price), -4.8pp at DTE 4-14, -10.6pp at DTE 15-42,
+calibrated (+2.4pp) at DTE 1-3. Matches the bias-footprint +4.5pp YES
+premium; decays into expiry. Placeholder-candle forensics (0.5/0.495
+flat seed runs) documented; the verdict zone is unaffected by the filter.
 
-P4 (OIB): fragile near-null. Weak PM-only 60s effect (hit ~0.57, rho
-~0.05-0.07, quintile spread <1 tick), decays/flips by 900s; the strong-
-looking Kalshi cells fail terminal-only robustness (one window, one
-product, few contracts). Honest deviation stated: rows carry 1c/2c
-bands, not the spec'd 1c/3c. At most a Stage-4-gated PM timing tiebreak.
+Also corrects the 06-11 probe's phantom 2026-05-06 FOMC date (actual:
+2026-04-29) and logs the new pmxt defect + candle chunk caps.
 
-P5 (fees): RESIDUAL RESOLVED -- live API fee_type scan (10,836 series):
-all core KXBTC* series are plain quadratic, maker fee ZERO today (only
-KXBTCMAX125/150 are maker-listed); taker 0.07 / maker 0.0175 / S&P-
-Nasdaq half-rate / settlement zero all confirmed current. The doc's
-"taker fee eats ~1/3 of the 5c" only holds near P~0.39; at longshot
-prices the drag is 6.8-12.6% (C=100). SURPRISE: Polymarket is no longer
-fee-free -- crypto taker 0.07 quadratic since Jan-Mar 2026, ~1.08c/ct
-at our recorded 0.81 fill (~35% of a 3c edge); the fill simulator
-records fees_usd=0.0 unconditionally (fill_simulator.py:384), so banked
-fill-adjusted numbers are gross-of-fee. Flagged in todo OPEN ITEMS for
-the Stage 4 / post-FOMC fill-economics work; no src change (out of
-scope by goal).
-
-docs/todo.md companions: maker LEAD fee RESIDUAL marked resolved; STALE
-ASSUMPTION (PM fees) added to OPEN ITEMS.
-
-Suite green after change: 880 passed (tripwire; docs-only, count
-unchanged). Numstat: docs/ only plus commit_msg.txt.
-
-Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+Sandboxed: no src changes; data/recordings untouched; artifacts
+gitignored under outputs/pm_history/. Suite: 880 passed.
