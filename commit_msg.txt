@@ -1,26 +1,45 @@
-docs(diag): PM history census + settlement calibration (3yr Polymarket BTC)
+docs(diag): Kalshi category probe -- maker-gap + calibration on the executable venue
 
-Adds docs/diag_pm_history_2026-06-13.md: sandboxed desk study over
-120,526 closed Bitcoin-tagged Polymarket markets (2023-06..2026-06-12),
-8,095 threshold binaries pulled at 5m via pmxt (8,666 calls, 0 errors;
-discovery degraded to Gamma REST -- pmxt closed-search self-DoSes its
-sidecar throttler).
+C1 sandboxed read-only probe of the Kalshi PROD trade tape
+(api.elections.kalshi.com); docs-only, no src changes. GET-only
+(markets/series/trades), no order/portfolio. Artifacts gitignored under
+outputs/kalshi_cat/. Recorder confirmed NOT running; probe completed
+before any capture. ~1,589 trade GETs, no 429 stop, no truncation.
 
-P1 census: organic high-vol windows dwarf scheduled-macro ones ~30:1 at
-DTE>=7 (mean 274 organic vs 9 scheduled 30m buckets/month at 2.5c/15m
-over the last 12 full months); at DTE>=1 the tape saturates (75-93% of
-clock). Recorder harvest is capacity-bound, not event-bound. 1m
-refinement: 116/120 windows confirm; the 1.5c row is a lower bound.
+Tests the external scalping doc's flagship +2.23..4.79pp Sports/Ent maker
+gap (the diag_bias_footprint_2026-06-11 UNTESTED row) and the YES-premium
+/calibration vs the Polymarket -3.1pp finding (diag_pm_history_2026-06-13),
+from Kalshi's own settled tape. Window 2026-03-15..06-13; SPORTS 375 mkts/
+220k tr, ENT 395/51k, FINANCE 394/327k (154 BTC); samples breadth-capped
+at 35 markets/series.
 
-P2 calibration (pre-registered): MARKET-WRONG at the mid level with a
-DTE qualifier -- priced 0.60-0.80 settles YES 2.3-3.1pp below price
-pooled (CI excludes price), -4.8pp at DTE 4-14, -10.6pp at DTE 15-42,
-calibrated (+2.4pp) at DTE 1-3. Matches the bias-footprint +4.5pp YES
-premium; decays into expiry. Placeholder-candle forensics (0.5/0.495
-flat seed runs) documented; the verdict zone is unaffected by the filter.
+P1 maker gap PARTIALLY TRANSFERS (per-trade, market-cluster 95% CI, gross
+of fees):
+- ENT +2.26pp [+0.73,+3.71] reproduces (low end of the doc's range) but is
+  FRAGILE (excl top-3 series -> +1.50 [-0.05,+3.10]) and is mechanically
+  -(gross taker loss), not maker skill (yes+no==1.0000 exactly).
+- SPORTS -0.35pp [-3.06,+2.27] FAILS -- a wash of large +/- series.
+- FINANCE +0.54pp [-0.09,+1.17] thin/NS, matching the doc's ~+0.17pp.
+- "Longshot-concentrated" REFUTED in direction: longshots are universally
+  overpriced (taker tax); the maker profit sits in the favorite zone it
+  holds.
 
-Also corrects the 06-11 probe's phantom 2026-05-06 FOMC date (actual:
-2026-04-29) and logs the new pmxt defect + candle chunk caps.
+P2 calibration: universal longshot YES-overpricing across all 3 groups.
+SPORTS 0.50-0.80 -15.7pp but fragile (game-event clustering -> [-32.6,
++11.2], crosses 0; true-favorite 0.70-0.80 calibrated). FINANCE/BTC +10pp
+is the RIGHT ARM of a symmetric under-confidence S-curve (mirror -10.1 vs
++10.6; all-price -0.83pp, calibrated) -- the Polymarket -3.1pp DOES NOT
+TRANSFER, and the sign-flip is a framing artifact. Barrier/path products
+separated per the caveat.
 
-Sandboxed: no src changes; data/recordings untouched; artifacts
-gitignored under outputs/pm_history/. Suite: 880 passed.
+Verification: 4 adversarial subagents independently reproduced every
+headline to <0.01pp; surfaced the maker==-taker identity, ENT fragility,
+the S-curve artifact, and the calibration cluster-unit fix (folded in).
+
+Census evidence, not edge evidence. Q1 (fill survival) untouched. The
+category-expansion row stays Stage-4-gated; nothing here authorizes a
+build.
+
+Report: docs/diag_kalshi_categories_2026-06-13.md
+
+Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>
