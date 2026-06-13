@@ -1,25 +1,31 @@
 # TODO -- BTC Prediction-Market Arb (campaign state + open items)
 
-_Last updated: 2026-06-11. Canonical home is now docs/todo.md in the nested repo
-(version-controlled); the loose copy in Downloads\clawd mds is a mirror as of this
-date and can be deleted at leisure. Previous update was 2026-05-31._
+_Last updated: 2026-06-13. Canonical home is now docs/todo.md in the nested repo
+(version-controlled); the loose copy in Downloads\clawd mds is a mirror as of
+2026-06-11 and can be deleted at leisure. Previous update was 2026-06-11._
 
 ---
 
 ## WHERE WE ARE (read this first)
 
 The arb recording campaign is mid-flight. Stages 0 and 1 are CLOSED; the
-instrument (recorder) is hardened and TRUSTED. Stage 2 -- the FOMC Jun 16-17
-capture -- is NEXT. Stage 3 (post-FOMC replay + analysis) answers Q1: does
-honest fill-adjusted edge clear a tradeable threshold, and how often, across
-regimes?
+instrument (recorder) is hardened and TRUSTED. A ROLLING CAPTURE is LIVE since
+2026-06-13 and runs through the FOMC Jun 16-17 print (organic high-vol windows
+expected on the tape pre-FOMC -- see the PM HISTORY census below). Stage 2 --
+the FOMC print -- happens INSIDE the rolling capture: Tuesday is a HEALTH
+CHECK on the running capture, not a fresh start. Stage 3 (post-FOMC replay +
+analysis) answers Q1: does honest fill-adjusted edge clear a tradeable
+threshold, and how often, across regimes?
 
 Strategy map, current: the options->PM digital arb edge (SVI surface vs
-terminal binaries) is the active thesis under measurement. The double-latency
-thesis is DEMOTED to a Data Streams concern -- its raw material (spot /
-chainlink / pm5min) is banked automatically in every capture window, but no
-build effort is committed. polykal directional remains a separate repo, out of
-scope.
+terminal binaries) is the active thesis under measurement. The ALWAYS-ON
+recorder is now the empirically-justified CORE of the data strategy (PM
+history census 2026-06-13: organic high-vol windows outnumber scheduled
+~30:1 at DTE>=7; the recorder is CAPACITY-bound, not event-bound). The
+double-latency thesis is DEMOTED to a Data Streams concern -- its raw
+material (spot / chainlink / pm5min) is banked automatically in every capture
+window, but no build effort is committed. polykal directional remains a
+separate repo, out of scope.
 
 ---
 
@@ -36,20 +42,40 @@ scope.
   (watchdog restart for task death, feed self-reconnect for network loss);
   clean shutdown; 6/6 trailers. Instrument TRUSTED. Note: deribit recovery
   lags by its backoff position (<=60s) post-outage.
-- **Stage 2 NEXT** -- FOMC Jun 16-17 capture. Monday 1h dress rehearsal;
-  capture starts Tuesday night; streams confirmed alive at the Wed 14:00 ET
-  print; regime labeled by hand. Expectation calibration from the probe
-  screening: regime is surprise-dependent -- a muted print is information, not
-  failure. Operational detail lives in docs/arb_campaign_runbook.md.
+- **Stage 2 IN FLIGHT** -- rolling capture LIVE since 2026-06-13, running
+  through the FOMC Jun 16-17 print (organic windows expected pre-FOMC).
+  Tuesday = HEALTH CHECK on the running capture, NOT a fresh start; Wednesday
+  unchanged: streams confirmed alive ~13:50 ET, regime labeled by hand,
+  single Ctrl-C hours post-print. Expectation calibration from the probe
+  screening: regime is surprise-dependent -- a muted print is information,
+  not failure (and per the PM history census the organic month replaces a
+  muted print ~30x over). Operational detail lives in
+  docs/arb_campaign_runbook.md.
 - **Stage 3 (post-FOMC)** -- replay + Q1. With the Kalshi depth fix being
   retroactive, the first window with terminal Kalshi matches makes Kalshi fill
   numbers real -- Q1 becomes answerable on BOTH venues, subject to the OPEN
-  QUESTION below.
+  QUESTION below. AMENDMENTS 2026-06-13: Phase 1 inventories ALL captured
+  windows since 06-13, not just the print; Phase 4 adds NET-OF-FEE columns
+  alongside gross (PM crypto taker 0.07 x C x P x (1-P), Kalshi current
+  schedule; gross preserved for quiet-baseline comparability); Phase 4
+  reports the Kalshi matched-terminal count explicitly.
 
 ---
 
-## LANDED SINCE LAST UPDATE (2026-05-31 -> 2026-06-11)
+## LANDED SINCE LAST UPDATE (2026-05-31 -> 2026-06-13)
 
+- **PM HISTORY census + settlement calibration COMPLETE 2026-06-13** (003238c,
+  docs/diag_pm_history_2026-06-13.md; 3yr Polymarket BTC binary history,
+  sandboxed desk study). P1: organic high-vol windows outnumber scheduled
+  ~30:1 at DTE>=7 (~274 vs ~9 thirty-minute buckets/month at 2.5c; the tape
+  saturates at DTE>=1) -- the always-on recorder is CAPACITY-bound, not
+  event-bound, and the always-on row PROMOTES to empirically-justified core
+  of the data strategy. P2: pre-registered verdict MARKET-WRONG with a DTE
+  qualifier: 0.60-0.80 contracts settle YES -3.1pp below price pooled,
+  -4.8pp at DTE 4-14, -10.6pp at DTE 15-42, calibrated at DTE 1-3.
+  Triangulates the bias-footprint +4.5pp YES premium and the maker-diag
+  ask-side crosses -- three probes, one tilt. Mid-level/gross only; Q1
+  (fill survival) is still THE open question.
 - **Kalshi depth FIXED** (6c2d5af / 8d5d5a7 / 8905a5e). RETROACTIVE: frames
   carry raw orderbook_fp bodies, so the fix applies to already-recorded data.
   _derive_ask_depth; 13 regression tests pinned on the real 0611 frame; the
@@ -159,10 +185,11 @@ banked quiet windows: docs/diag_lowvol_maker_2026-06-11.md._
   0530/0601/0609); possibly the ONLY executable Kalshi form per the
   terminal-Kalshi open question above; needs genuine barrier pricing (big
   lift).
-- **POST-ALWAYS-ON: breaking-news vol.** Ex-post rv_1h labeling of the
-  rolling tape; unscheduled vol may test the arb thesis BETTER than
-  scheduled prints (differential venue reaction speed, vs MMs
-  pre-positioned at known print times).
+- **BREAKING-NEWS VOL (always-on is now LIVE since 2026-06-13).** Ex-post
+  rv_1h labeling of the rolling tape; unscheduled vol may test the arb
+  thesis BETTER than scheduled prints (differential venue reaction speed,
+  vs MMs pre-positioned at known print times). The PM history census backs
+  the premise: organic windows outnumber scheduled ~30:1 at DTE>=7.
 
 ---
 
@@ -238,9 +265,11 @@ gates all strategy work._
   KXBTCW gone from catalog, the C4 don't-poll decision stands; no FOMC-week
   discovery gap (18 qualifying contracts, all Tier-1). FOMC screening result:
   the 2026-03-18 print repriced near-money Polymarket strikes 1.5-3.6c,
-  peaking by +5m, reconverging 19-35m; 2026-05-06 was muted ~1c with ~2.5h
-  reconvergence. Opportunity window = minutes (5s scan cadence comfortably
-  inside).
+  peaking by +5m, reconverging 19-35m. CORRECTION 2026-06-13: the probe's
+  "muted 2026-05-06 print" data point is VOID -- no May-2026 FOMC existed
+  (actual meeting 2026-04-29); 2026-05-06 was a non-event day. 2026-03-18
+  is the only real measured FOMC print. Opportunity window = minutes (5s
+  scan cadence comfortably inside).
 - **Maker-quoting row:** resting-bid depth fields are deliberately not emitted
   (see the _derive_ask_depth docstring) -- first build item if this row is
   ever activated. Now the LEAD candidate of the LOW-VOL TRACK above.
@@ -258,6 +287,9 @@ gates all strategy work._
   correctly-rejected losers, not missed signals.
 - data/recordings/ is READ-ONLY. The recorder/capture path is FROZEN
   mid-campaign.
+- NO pmxt/sandbox goals while a capture runs (Polymarket endpoint contention
+  with the recorder). Standing rule as of 2026-06-13; the rolling capture
+  counts.
 - Goals run sequentially; commit-gated builds; ASCII-only; commits via
   commit_msg.txt + git commit -F. (Baked into .claude/commands/goal.md.)
 
@@ -271,6 +303,11 @@ gates all strategy work._
   source. It does NOT survive reading the code: polykal contains no such
   gates, and the btc_pm_arb freshness/expiry/edge gates serve the options-arb
   thesis. Treat any latency strategy as fully greenfield.
+- 2026-06-13: there was no May-2026 FOMC meeting (the actual spring statement
+  was 2026-04-29; next is 2026-06-17). The pmxt probe's "muted 2026-05-06
+  print" read analyzed a non-event day and is VOID wherever cited. The only
+  real measured FOMC print is 2026-03-18 (1.5-3.6c, peak +5m, reconverge
+  19-35m). Source: docs/diag_pm_history_2026-06-13.md section 0.
 
 ---
 

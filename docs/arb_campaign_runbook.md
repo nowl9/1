@@ -10,20 +10,20 @@ _This is an operator checklist, not code. Runs on your Windows box against the
 deterministic replay pipeline already built. Repo root: the NESTED
 C:\Users\mgill\Downloads\1-main\1-main._
 
-_Last updated: 2026-06-11. Canonical home is now docs/arb_campaign_runbook.md
+_Last updated: 2026-06-13. Canonical home is now docs/arb_campaign_runbook.md
 in the nested repo (version-controlled); the loose copy in Downloads\clawd mds
-is a mirror as of this date and can be deleted at leisure._
+is a mirror as of 2026-06-11 and can be deleted at leisure._
 
 ---
 
-## Campaign stage status (2026-06-11)
+## Campaign stage status (2026-06-13)
 
 | Stage | What | Status |
 |---|---|---|
 | 0 | Recorder hardening | CLOSED -- CPI failure root-caused (ENOSPC -> silent _disable; disk starved by ambient use, not the recorder). Hardened: preflight >=20GB, watchdog, ENOSPC stop-loud, --duration fixed, clean Ctrl-C, keep-awake. Commits 36d649d..d8264a6 + ef71c6e. |
 | 1 | Live drill | CLOSED 2026-06-11 -- real outage detected at 122s on all six streams, full recovery, clean shutdown, 6/6 trailers. Instrument TRUSTED. |
-| 2 | FOMC Jun 16-17 capture | NEXT -- see "Stage 2: FOMC plan" below. |
-| 3 | Post-FOMC replay + Q1 | PENDING -- Q1 answerable on BOTH venues post-FOMC (Kalshi depth fix is retroactive), subject to the terminal-Kalshi open question. |
+| 2 | FOMC Jun 16-17 capture | IN FLIGHT -- rolling capture LIVE since 2026-06-13, running through the print; Tuesday = HEALTH CHECK on the running capture, not a fresh start. See "Stage 2: FOMC plan" below. |
+| 3 | Post-FOMC replay + Q1 | PENDING -- Q1 answerable on BOTH venues post-FOMC (Kalshi depth fix is retroactive), subject to the terminal-Kalshi open question. AMENDED 2026-06-13: Phase 1 inventories ALL captured windows since 06-13, not just the print; Phase 4 adds NET-OF-FEE columns alongside gross (PM crypto taker 0.07 x C x P x (1-P), Kalshi current schedule; gross preserved for quiet-baseline comparability) and reports the Kalshi matched-terminal count explicitly. |
 
 Both recovery paths have now been observed live: watchdog restart for task
 death, and feed self-reconnect for network loss. Operator note: deribit
@@ -69,25 +69,39 @@ highest-information set. 4 is the "is it ever efficient" check. 5 is optional.
 NFP and CPI windows were missed (recorder was not yet trustworthy); both are
 mooted by FOMC as the regime-3 source.
 
+Base rates (PM history census, docs/diag_pm_history_2026-06-13.md P1):
+organic high-vol windows outnumber scheduled ~30:1 at DTE>=7 (~274 vs ~9
+thirty-minute buckets/month at 2.5c; the tape saturates at DTE>=1). Regime-2
+windows arrive organically on a rolling tape -- the always-on recorder is
+CAPACITY-bound, not event-bound, and organic windows are expected on the tape
+pre-FOMC. A muted print is replaced ~30x over by the organic month.
+
 ---
 
 ## Stage 2: FOMC plan (Jun 16-17)
 
-- **Monday:** 1h dress rehearsal -- full capture start/stop cycle, confirm
-  trailers and stream tags.
-- **Tuesday night:** start the real capture and leave it running.
-- **Wednesday ~14:00 ET (print):** confirm all six streams alive at the print.
-- **Label the regime by hand** in the results table -- the recorder does not
-  tag regime, you do.
+UPDATED 2026-06-13: a rolling capture has been LIVE since 2026-06-13 and runs
+through the print. FOMC week is a health-check cadence on a RUNNING capture,
+not a cold start -- do NOT stop/restart the recorder to "prepare" for the
+print.
+
+- **Tuesday:** HEALTH CHECK on the running capture, NOT a fresh start --
+  process alive, disk headroom, all six streams current per the watchdog.
+- **Wednesday (print):** confirm all six streams alive ~13:50 ET; label the
+  regime by hand in the results table (the recorder does not tag regime,
+  you do); stop with a single Ctrl-C hours after the print.
 
 Expectation calibration (from the pmxt probe's FOMC screening,
 outputs/pmxt_probe_2026-06-11.md): the regime is surprise-dependent. The
 2026-03-18 print repriced near-money Polymarket strikes 1.5-3.6c, peaking by
-+5m and reconverging over 19-35m; the 2026-05-06 print was muted (~1c, ~2.5h
-reconvergence). Opportunity window = minutes, and the 5s scan cadence sits
-comfortably inside it. A muted print is information, not failure. (Caveat
-carried from the probe: candles are depth-blind and cannot answer Q1 --
-screening evidence, not edge evidence.)
++5m and reconverging over 19-35m. CORRECTION 2026-06-13: the probe's "muted
+2026-05-06 print" data point is VOID -- no May-2026 FOMC existed (actual
+meeting 2026-04-29); 2026-05-06 was a non-event day, and 2026-03-18 is the
+only real measured FOMC print. Opportunity window = minutes, and the 5s scan
+cadence sits comfortably inside it. A muted print is information, not failure
+-- and the organic month replaces a muted print ~30x over (PM history census
+P1). (Caveat carried from the probe: candles are depth-blind and cannot
+answer Q1 -- screening evidence, not edge evidence.)
 
 Disk budget: 74.4GB free as of 2026-06-11; FOMC 48h burn estimate ~17GB ->
 ~57GB floor. The preflight enforces >=20GB regardless, so a starved disk now
@@ -134,7 +148,8 @@ Guidance:
 
 Standing rule: data/recordings/ is READ-ONLY once written, and the
 recorder/capture code path is FROZEN until the campaign's capture windows are
-done.
+done. While a capture runs, NO pmxt/sandbox goals on this box (Polymarket
+endpoint contention with the recorder) -- the rolling capture counts.
 
 ---
 
@@ -167,7 +182,12 @@ What to read off each replay:
    orderbook_fp bodies), so the first window with terminal Kalshi matches
    makes the Kalshi fill numbers real. Watch whether Kalshi matches are
    terminal or 100% one_touch_barrier rejections (0530 was the latter) -- that
-   feeds the open question below.
+   feeds the open question below. Stage 3 Phase 4 reports the matched-terminal
+   count explicitly.
+6. NET-OF-FEE columns alongside gross (Stage 3 Phase 4 amendment,
+   2026-06-13): PM crypto taker fee 0.07 x C x P x (1-P), Kalshi current
+   schedule. Keep the gross columns -- they stay comparable to the
+   quiet-baseline windows measured gross.
 
 IMPORTANT: run the 1% floor with the PRODUCTION .env UNTOUCHED (the 1% is a
 FilterConfig data-collection floor, an override for measurement -- NOT a
